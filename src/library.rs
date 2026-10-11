@@ -1,7 +1,7 @@
 //! The library: which books exist, where reading progress is, and how new ones get imported.
 
 use std::{
-    collections::HashSet,
+    collections::{BTreeMap, HashSet},
     fs,
     path::{Path, PathBuf},
 };
@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     archive::{self, SourceKind},
     imaging,
+    layout::FitMode,
     util::{fnv1a, natural_cmp, now_secs},
 };
 
@@ -65,6 +66,9 @@ pub struct Book {
     pub added_at: u64,
     #[serde(default)]
     pub last_read: Option<u64>,
+    /// Vim-style marks: letter to zero-based page index.
+    #[serde(default)]
+    pub marks: BTreeMap<String, usize>,
 }
 
 impl Book {
@@ -81,10 +85,27 @@ impl Book {
     }
 }
 
+/// Reader preferences that carry over from book to book.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Settings {
+    /// Right-to-left reading order (manga).
+    pub rtl: bool,
+    pub fit: FitMode,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self { rtl: true, fit: FitMode::Page }
+    }
+}
+
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct Library {
     #[serde(default)]
     books: Vec<Book>,
+    #[serde(default)]
+    settings: Settings,
 }
 
 impl Library {
@@ -124,6 +145,14 @@ impl Library {
 
     pub fn books(&self) -> &[Book] {
         &self.books
+    }
+
+    pub fn settings(&self) -> &Settings {
+        &self.settings
+    }
+
+    pub fn settings_mut(&mut self) -> &mut Settings {
+        &mut self.settings
     }
 
     pub fn ids(&self) -> HashSet<String> {
@@ -314,6 +343,7 @@ fn build_book(path: &Path, kind: SourceKind, dirs: &DataDirs) -> Result<Book> {
         opened: false,
         added_at: now_secs(),
         last_read: None,
+        marks: BTreeMap::new(),
     })
 }
 
@@ -433,6 +463,7 @@ mod tests {
             opened: false,
             added_at: 1,
             last_read: None,
+            marks: BTreeMap::new(),
         };
         assert_eq!(book.progress(), 0.0);
         book.opened = true;
@@ -441,13 +472,32 @@ mod tests {
         book.current_page = 9;
         assert!(book.is_finished());
 
+        book.marks.insert("a".into(), 3);
         assert!(lib.add(book.clone()));
         assert!(!lib.add(book));
+        lib.settings_mut().rtl = false;
+        lib.settings_mut().fit = FitMode::Width;
         lib.save(&dirs).unwrap();
 
         let loaded = Library::load(&dirs).unwrap();
         assert_eq!(loaded.books().len(), 1);
         assert_eq!(loaded.get("abc").unwrap().current_page, 9);
+        assert_eq!(loaded.get("abc").unwrap().marks.get("a"), Some(&3));
+        assert!(!loaded.settings().rtl);
+        assert_eq!(loaded.settings().fit, FitMode::Width);
+    }
+
+    #[test]
+    fn old_library_files_without_settings_still_load() {
+        let tmp = temp_dir("compat");
+        let dirs = DataDirs::at(tmp.join("data")).unwrap();
+        let json = r#"{"books":[{"id":"x","title":"Old","path":"/tmp/old.cbz","kind":"Archive","page_count":5,"added_at":1}]}"#;
+        fs::write(dirs.library_file(), json).unwrap();
+        let loaded = Library::load(&dirs).unwrap();
+        assert_eq!(loaded.books().len(), 1);
+        assert!(loaded.settings().rtl);
+        assert_eq!(loaded.settings().fit, FitMode::Page);
+        assert!(loaded.get("x").unwrap().marks.is_empty());
     }
 
     #[test]

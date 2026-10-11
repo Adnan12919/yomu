@@ -1,6 +1,9 @@
-//! yomu core: everything that does not need a GUI (archives, decoding, library, import).
+//! yomu core: everything that does not need a GUI (archives, decoding, library, import,
+//! reader geometry and vim-style key handling).
 
 pub mod archive;
 pub mod imaging;
+pub mod layout;
 pub mod library;
 pub mod util;
+pub mod vim;

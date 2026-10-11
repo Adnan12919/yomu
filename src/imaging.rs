@@ -18,13 +18,21 @@ fn decode(bytes: &[u8]) -> Result<DynamicImage> {
     Ok(img)
 }
 
+/// A decoded page.
+pub struct Decoded {
+    /// Pixels in **BGRA** order, already scaled down to the requested size.
+    pub image: RgbaImage,
+    /// Dimensions of the original, unscaled image.
+    pub orig: (u32, u32),
+}
+
 /// Decode a page and scale it down (never up) so it fits inside `max_w` x `max_h`.
 ///
 /// Pre-scaling on the CPU with a good filter looks much sharper than letting the GPU
 /// minify a 3000px scan with plain bilinear sampling, and it keeps VRAM use low.
 ///
 /// The returned buffer is already **BGRA**, the channel order gpui expects.
-pub fn decode_fit_bgra(bytes: &[u8], max_w: u32, max_h: u32) -> Result<RgbaImage> {
+pub fn decode_fit_bgra(bytes: &[u8], max_w: u32, max_h: u32) -> Result<Decoded> {
     let img = decode(bytes)?;
     let (w, h) = (img.width(), img.height());
     let scale = (max_w as f32 / w as f32).min(max_h as f32 / h as f32);
@@ -41,7 +49,7 @@ pub fn decode_fit_bgra(bytes: &[u8], max_w: u32, max_h: u32) -> Result<RgbaImage
     for px in rgba.chunks_exact_mut(4) {
         px.swap(0, 2);
     }
-    Ok(rgba)
+    Ok(Decoded { image: rgba, orig: (w, h) })
 }
 
 /// Encode a JPEG thumbnail that fits inside `max_w` x `max_h`, keeping the aspect ratio.
@@ -73,15 +81,16 @@ mod tests {
     fn scales_down_and_swaps_to_bgra() {
         let bytes = png(400, 800, Rgba([10, 20, 30, 255]));
         let out = decode_fit_bgra(&bytes, 100, 100).unwrap();
-        assert_eq!(out.dimensions(), (50, 100));
-        assert_eq!(out.get_pixel(0, 0).0, [30, 20, 10, 255]);
+        assert_eq!(out.image.dimensions(), (50, 100));
+        assert_eq!(out.orig, (400, 800));
+        assert_eq!(out.image.get_pixel(0, 0).0, [30, 20, 10, 255]);
     }
 
     #[test]
     fn never_upscales() {
         let bytes = png(40, 60, Rgba([1, 2, 3, 255]));
         let out = decode_fit_bgra(&bytes, 4000, 4000).unwrap();
-        assert_eq!(out.dimensions(), (40, 60));
+        assert_eq!(out.image.dimensions(), (40, 60));
     }
 
     #[test]
