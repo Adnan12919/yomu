@@ -17,15 +17,17 @@ rendering is GPU-accelerated, and it talks to Wayland directly (no webview, no T
 
 ## Build and run (NixOS)
 
+With [devenv](https://devenv.sh) (`devenv.nix` and `devenv.yaml` are in the repo):
+
 ```sh
-git init && git add .      # flakes only see files that git tracks
-nix develop                # Rust toolchain + every native library gpui needs
+devenv shell               # Rust toolchain + every native library gpui needs
 cargo run --release
 ```
 
-Or without entering the shell: `nix run .` (builds the packaged, wrapped binary).
-
-With direnv: `direnv allow` (the `.envrc` is already there).
+- `devenv test` runs the whole test suite; with direnv, `direnv allow` loads the shell automatically
+  (the `.envrc` is already there).
+- `nix develop` still works if you prefer it (same toolchain, same libraries), and `nix run .` builds and runs
+  the packaged, wrapped binary. Flakes only see files that git tracks, so run `git init && git add .` first.
 
 NixOS prerequisites, if you do not have them already:
 
@@ -33,6 +35,43 @@ NixOS prerequisites, if you do not have them already:
 hardware.graphics.enable = true;          # Vulkan drivers (/run/opengl-driver)
 xdg.portal.enable = true;                 # the Add files / Add folder dialogs use the portal
 xdg.portal.extraPortals = [ pkgs.xdg-desktop-portal-gtk ];   # or the GNOME portal
+```
+
+## Installing yomu on NixOS
+
+The package definition is `nix/package.nix`; the flake exposes it as `packages.<system>.default` and as an overlay.
+It is built with nixpkgs' own Rust (the project needs 1.89 or newer; nixos-unstable has 1.98 at the time of writing),
+wraps the binary so it finds Wayland and Vulkan, and installs a desktop entry.
+
+**With a flake-based system configuration (recommended).** Add yomu as an input of your system flake:
+
+```nix
+inputs.yomu = {
+  url = "git+file:///home/you/Projects/yomu";   # or github:you/yomu once it is pushed
+  inputs.nixpkgs.follows = "nixpkgs";
+};
+```
+
+then, in one of your NixOS modules (`inputs` must be passed through `specialArgs`):
+
+```nix
+{ inputs, pkgs, ... }: {
+  nixpkgs.overlays = [ inputs.yomu.overlays.default ];
+  environment.systemPackages = [ pkgs.yomu ];      # or home.packages with Home Manager
+}
+```
+
+Without the overlay, use the package directly:
+`environment.systemPackages = [ inputs.yomu.packages.${pkgs.stdenv.hostPlatform.system}.default ];`
+
+Commit (or at least `git add`) your changes in the yomu repository, then `nix flake update yomu` in the system flake
+and rebuild. Try it first without installing: `nix run git+file:///home/you/Projects/yomu`.
+
+**Without flakes**, point `callPackage` at the file (an absolute path, so this does not work in a pure flake
+evaluation):
+
+```nix
+environment.systemPackages = [ (pkgs.callPackage /home/you/Projects/yomu/nix/package.nix { }) ];
 ```
 
 ## Keys
@@ -181,6 +220,7 @@ The code is split so that everything except the window lives in the library crat
 - `src/vim.rs` turns keys into actions: counts, `gg`/`zw`/`ma` sequences and the `:` command line
 - `src/menu.rs` decides which context-menu actions apply to a book, plus confirmations and the Properties rows
 - `src/selection.rs` holds the multi-select rules (toggle, range, select all)
+- `nix/package.nix` is the Nix package; `devenv.nix` / `devenv.yaml` and `flake.nix` are the dev environments
 - `src/library.rs` is the library model, JSON persistence, and the import pipeline
 - `src/main.rs` is the gpui UI
 

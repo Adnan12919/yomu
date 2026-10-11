@@ -11,84 +11,47 @@
   };
 
   outputs = { self, nixpkgs, flake-utils, rust-overlay }:
-    flake-utils.lib.eachSystem [ "x86_64-linux" "aarch64-linux" ] (system:
+    {
+      # For a NixOS system flake: nixpkgs.overlays = [ inputs.yomu.overlays.default ];
+      # then `pkgs.yomu` is available.
+      overlays.default = final: _prev: {
+        yomu = final.callPackage ./nix/package.nix { };
+      };
+    }
+    // flake-utils.lib.eachSystem [ "x86_64-linux" "aarch64-linux" ] (system:
       let
         pkgs = import nixpkgs {
           inherit system;
           overlays = [ (import rust-overlay) ];
         };
-        inherit (pkgs) lib;
 
-        # gpui needs a recent compiler (edition 2024), so use rust-overlay's latest stable.
+        # gpui needs a recent compiler (edition 2024), so the dev shell uses rust-overlay's latest
+        # stable, the same toolchain devenv.nix uses.
         rustToolchain = pkgs.rust-bin.stable.latest.default.override {
           extensions = [ "rust-src" ];
         };
-        rustPlatform = pkgs.makeRustPlatform {
-          cargo = rustToolchain;
-          rustc = rustToolchain;
-        };
 
-        # Libraries gpui opens at runtime (via dlopen) and links against at build time.
-        runtimeLibs = with pkgs; [
-          wayland
-          libxkbcommon
-          vulkan-loader
-          libGL
-          fontconfig
-          freetype
-          # X11 fallback, only used if there is no Wayland session
-          libxcb
-          libx11
-          libxcursor
-          libxi
-          libxrandr
-        ];
-        runtimeLibPath = lib.makeLibraryPath runtimeLibs;
-
-        nativeBuildInputs = with pkgs; [
-          pkg-config
-          cmake
-        ];
+        yomu = pkgs.callPackage ./nix/package.nix { };
       in
       {
-        packages.default = rustPlatform.buildRustPackage {
-          pname = "yomu";
-          version = "0.1.0";
-          src = lib.cleanSource ./.;
-          cargoLock.lockFile = ./Cargo.lock;
-          # The UI tests need gpui's test platform; run them with `cargo test` in the dev shell.
-          doCheck = false;
-
-          nativeBuildInputs = nativeBuildInputs ++ [ pkgs.makeWrapper ];
-          buildInputs = runtimeLibs;
-
-          postInstall = ''
-            install -Dm644 packaging/yomu.desktop $out/share/applications/yomu.desktop
-          '';
-          postFixup = ''
-            wrapProgram $out/bin/yomu --prefix LD_LIBRARY_PATH : ${runtimeLibPath}
-          '';
-
-          meta = {
-            description = "Minimal, GPU-accelerated, Wayland-native manga reader";
-            mainProgram = "yomu";
-            platforms = lib.platforms.linux;
-          };
+        packages = {
+          default = yomu;
+          inherit yomu;
         };
 
-        apps.default = flake-utils.lib.mkApp { drv = self.packages.${system}.default; };
+        apps.default = flake-utils.lib.mkApp { drv = yomu; };
 
+        # `nix develop` still works; `devenv shell` is the main way (see devenv.nix).
         devShells.default = pkgs.mkShell {
-          inherit nativeBuildInputs;
-          buildInputs = [ rustToolchain ] ++ runtimeLibs;
+          inputsFrom = [ yomu ];
+          packages = [ rustToolchain ];
 
           # Without this, wgpu/blade cannot find libvulkan / libwayland at runtime on NixOS.
-          LD_LIBRARY_PATH = runtimeLibPath;
+          LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath yomu.buildInputs;
           RUST_SRC_PATH = "${rustToolchain}/lib/rustlib/src/rust/library";
 
           shellHook = ''
             echo "yomu dev shell: $(rustc --version)"
-            echo "  cargo run --release   build and start the reader"
           '';
         };
       });
