@@ -24,6 +24,9 @@ dirs = "6"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif"] }
 zip = { version = "2", default-features = false, features = ["deflate"] }
 
+[dev-dependencies]
+gpui = { version = "0.2.2", features = ["test-support"] }
+
 [profile.release]
 lto = "thin"
 codegen-units = 4

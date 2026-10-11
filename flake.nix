@@ -56,6 +56,8 @@
           version = "0.1.0";
           src = lib.cleanSource ./.;
           cargoLock.lockFile = ./Cargo.lock;
+          # The UI tests need gpui's test platform; run them with `cargo test` in the dev shell.
+          doCheck = false;
 
           nativeBuildInputs = nativeBuildInputs ++ [ pkgs.makeWrapper ];
           buildInputs = runtimeLibs;

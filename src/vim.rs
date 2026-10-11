@@ -46,6 +46,7 @@ pub enum Action {
     ToggleInfo,
     ToggleHelp,
     ToggleFullscreen,
+    OpenSettings,
     CloseBook,
     QuitApp,
     /// Something to tell the user (for example a bad command).
@@ -325,6 +326,7 @@ pub fn parse_command(line: &str) -> Vec<Action> {
         ("info", _) => vec![Action::ToggleInfo],
         ("help" | "h", _) => vec![Action::ToggleHelp],
         ("fullscreen" | "fs", _) => vec![Action::ToggleFullscreen],
+        ("settings" | "set" | "preferences" | "prefs", _) => vec![Action::OpenSettings],
         ("mark", Some(key)) => match single_char(key) {
             Some(c) if c.is_alphabetic() => vec![Action::SetMark(c)],
             _ => bad(),
@@ -486,6 +488,7 @@ mod tests {
         assert_eq!(parse_command("ltr"), vec![Action::SetDirection { rtl: false }]);
         assert_eq!(parse_command("$"), vec![Action::LastPage]);
         assert_eq!(parse_command("mark b"), vec![Action::SetMark('b')]);
+        assert_eq!(parse_command("settings"), vec![Action::OpenSettings]);
         assert!(matches!(parse_command("bogus").as_slice(), [Action::Message(_)]));
         assert!(matches!(parse_command("fit sideways").as_slice(), [Action::Message(_)]));
         assert!(matches!(parse_command("zoom lots").as_slice(), [Action::Message(_)]));

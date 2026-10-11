@@ -71,7 +71,48 @@ pub struct Book {
     pub marks: BTreeMap<String, usize>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadStatus {
+    Unread,
+    InProgress,
+    Finished,
+}
+
 impl Book {
+    pub fn status(&self) -> ReadStatus {
+        if self.is_finished() {
+            ReadStatus::Finished
+        } else if self.opened && self.current_page > 0 {
+            ReadStatus::InProgress
+        } else {
+            ReadStatus::Unread
+        }
+    }
+
+    /// True if there is reading progress that resetting or removing would throw away.
+    pub fn has_progress(&self) -> bool {
+        self.status() != ReadStatus::Unread
+    }
+
+    pub fn reset_progress(&mut self) {
+        self.current_page = 0;
+        self.opened = false;
+        self.last_read = None;
+    }
+
+    pub fn mark_read(&mut self) {
+        self.opened = true;
+        self.current_page = self.page_count.saturating_sub(1);
+        self.last_read = Some(now_secs());
+    }
+
+    /// Put the reading position back on the first page, ready to be opened.
+    pub fn start_over(&mut self) {
+        self.opened = true;
+        self.current_page = 0;
+        self.last_read = Some(now_secs());
+    }
+
     /// Reading progress in `0.0..=1.0`.
     pub fn progress(&self) -> f32 {
         if !self.opened || self.page_count == 0 {
@@ -85,26 +126,76 @@ impl Book {
     }
 }
 
-/// Reader preferences that carry over from book to book.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+/// Lowest background opacity the settings allow. Below this the window becomes hard to see.
+pub const OPACITY_MIN: f32 = 0.3;
+pub const OPACITY_MAX: f32 = 1.0;
+
+/// Clamp to the allowed range and round to a whole percent. Non-finite values fall back to opaque.
+pub fn clamp_opacity(value: f32) -> f32 {
+    if !value.is_finite() {
+        return OPACITY_MAX;
+    }
+    (value.clamp(OPACITY_MIN, OPACITY_MAX) * 100.0).round() / 100.0
+}
+
+/// Preferences that carry over from book to book and between launches.
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Settings {
     /// Right-to-left reading order (manga).
     pub rtl: bool,
     pub fit: FitMode,
+    /// Opacity of the window background, `OPACITY_MIN..=OPACITY_MAX`. Page images, covers and
+    /// text always stay fully opaque; only the background behind them becomes see-through.
+    pub opacity: f32,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { rtl: true, fit: FitMode::Page }
+        Self { rtl: true, fit: FitMode::Page, opacity: OPACITY_MAX }
     }
+}
+
+impl Settings {
+    pub fn set_opacity(&mut self, value: f32) {
+        self.opacity = clamp_opacity(value);
+    }
+
+    /// Read settings leniently: any missing, mistyped or out-of-range field falls back to its
+    /// default (or is clamped) instead of making the whole library file unreadable.
+    pub fn from_value(value: &serde_json::Value) -> Self {
+        let mut settings = Self::default();
+        let Some(object) = value.as_object() else {
+            return settings;
+        };
+        if let Some(rtl) = object.get("rtl").and_then(|v| v.as_bool()) {
+            settings.rtl = rtl;
+        }
+        if let Some(fit) = object
+            .get("fit")
+            .and_then(|v| serde_json::from_value::<FitMode>(v.clone()).ok())
+        {
+            settings.fit = fit;
+        }
+        if let Some(opacity) = object.get("opacity").and_then(|v| v.as_f64()) {
+            settings.set_opacity(opacity as f32);
+        }
+        settings
+    }
+}
+
+fn lenient_settings<'de, D>(deserializer: D) -> Result<Settings, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(Settings::from_value(&value))
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct Library {
     #[serde(default)]
     books: Vec<Book>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_settings")]
     settings: Settings,
 }
 
@@ -498,6 +589,107 @@ mod tests {
         assert!(loaded.settings().rtl);
         assert_eq!(loaded.settings().fit, FitMode::Page);
         assert!(loaded.get("x").unwrap().marks.is_empty());
+    }
+
+    fn sample_book() -> Book {
+        Book {
+            id: "b".into(),
+            title: "Sample".into(),
+            path: PathBuf::from("/tmp/sample.cbz"),
+            kind: SourceKind::Archive,
+            page_count: 10,
+            current_page: 0,
+            opened: false,
+            added_at: 1,
+            last_read: None,
+            marks: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn read_status_and_progress_changes() {
+        let mut book = sample_book();
+        assert_eq!(book.status(), ReadStatus::Unread);
+        assert!(!book.has_progress());
+
+        // Opening a book without turning a page is still "unread"
+        book.opened = true;
+        assert_eq!(book.status(), ReadStatus::Unread);
+
+        book.current_page = 4;
+        assert_eq!(book.status(), ReadStatus::InProgress);
+        assert!(book.has_progress());
+
+        book.mark_read();
+        assert_eq!(book.status(), ReadStatus::Finished);
+        assert_eq!(book.current_page, 9);
+        assert!((book.progress() - 1.0).abs() < 1e-6);
+
+        book.reset_progress();
+        assert_eq!(book.status(), ReadStatus::Unread);
+        assert_eq!(book.progress(), 0.0);
+        assert!(book.last_read.is_none());
+
+        book.current_page = 6;
+        book.opened = true;
+        book.start_over();
+        assert_eq!(book.current_page, 0);
+        assert!(book.opened);
+    }
+
+    #[test]
+    fn reset_keeps_marks() {
+        let mut book = sample_book();
+        book.marks.insert("a".into(), 3);
+        book.mark_read();
+        book.reset_progress();
+        assert_eq!(book.marks.get("a"), Some(&3));
+    }
+
+    #[test]
+    fn opacity_is_clamped_and_rounded() {
+        assert_eq!(clamp_opacity(2.0), OPACITY_MAX);
+        assert_eq!(clamp_opacity(0.0), OPACITY_MIN);
+        assert_eq!(clamp_opacity(-1.0), OPACITY_MIN);
+        assert_eq!(clamp_opacity(f32::NAN), OPACITY_MAX);
+        assert_eq!(clamp_opacity(0.8049), 0.80);
+        assert_eq!(Settings::default().opacity, OPACITY_MAX);
+    }
+
+    #[test]
+    fn invalid_stored_settings_fall_back_instead_of_breaking_the_library() {
+        let tmp = temp_dir("badsettings");
+        let dirs = DataDirs::at(tmp.join("data")).unwrap();
+        let json = r#"{"books":[],"settings":{"rtl":"yes","fit":"Sideways","opacity":"lots"}}"#;
+        fs::write(dirs.library_file(), json).unwrap();
+        let loaded = Library::load(&dirs).unwrap();
+        assert_eq!(*loaded.settings(), Settings::default());
+        assert!(!dirs.library_file().with_extension("json.corrupt").exists());
+
+        let json = r#"{"books":[],"settings":{"rtl":false,"fit":"Width","opacity":7.5}}"#;
+        fs::write(dirs.library_file(), json).unwrap();
+        let loaded = Library::load(&dirs).unwrap();
+        assert!(!loaded.settings().rtl);
+        assert_eq!(loaded.settings().fit, FitMode::Width);
+        assert_eq!(loaded.settings().opacity, OPACITY_MAX);
+
+        let json = r#"{"books":[],"settings":{"opacity":0.1}}"#;
+        fs::write(dirs.library_file(), json).unwrap();
+        assert_eq!(Library::load(&dirs).unwrap().settings().opacity, OPACITY_MIN);
+
+        let json = r#"{"books":[],"settings":[1,2,3]}"#;
+        fs::write(dirs.library_file(), json).unwrap();
+        assert_eq!(*Library::load(&dirs).unwrap().settings(), Settings::default());
+    }
+
+    #[test]
+    fn opacity_persists_across_save_and_load() {
+        let tmp = temp_dir("opacity");
+        let dirs = DataDirs::at(tmp.join("data")).unwrap();
+        let mut lib = Library::default();
+        lib.settings_mut().set_opacity(0.65);
+        lib.save(&dirs).unwrap();
+        assert_eq!(Library::load(&dirs).unwrap().settings().opacity, 0.65);
     }
 
     #[test]
