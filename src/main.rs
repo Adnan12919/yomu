@@ -25,6 +25,7 @@ use yomu::{
     layout::{self, Arrive, FitMode, Viewport},
     library::{self, Book, DataDirs, Library, OPACITY_MAX, OPACITY_MIN, Settings},
     menu::{self, BookAction, Entry, Item},
+    selection::Selection,
     util::now_secs,
     vim::{self, Action, Amount, Dir, Vim},
 };
@@ -186,6 +187,7 @@ struct BookMenu {
 
 enum ConfirmAction {
     Book(BookAction, String),
+    RemoveSelected,
     ResetSettings,
 }
 
@@ -236,6 +238,8 @@ struct Yomu {
     importing: bool,
     overlay: Option<Overlay>,
     overlay_closed_at: Option<Instant>,
+    /// Books picked for bulk actions in the library.
+    selection: Selection,
     slider: Slider,
     /// Which background appearance the window currently has (`None` before the first frame).
     applied_opaque: Option<bool>,
@@ -266,6 +270,7 @@ impl Yomu {
             importing: false,
             overlay: None,
             overlay_closed_at: None,
+            selection: Selection::new(),
             slider: Slider { bounds: Rc::new(Cell::new(None)), dragging: false },
             applied_opaque: None,
         }
@@ -377,6 +382,20 @@ impl Yomu {
 
     /// Run a menu action, asking first if it would throw away progress.
     fn run_book_action(&mut self, action: BookAction, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        // Bulk actions work on the selection, not on the book that was right-clicked.
+        match action {
+            BookAction::RemoveSelected => {
+                self.request_remove_selected(cx);
+                return;
+            }
+            BookAction::ClearSelection => {
+                self.dismiss();
+                self.selection.clear();
+                cx.notify();
+                return;
+            }
+            _ => {}
+        }
         let Some(book) = self.library.get(id).cloned() else {
             self.dismiss();
             cx.notify();
@@ -442,6 +461,8 @@ impl Yomu {
                 }
             }
             BookAction::Remove => self.remove_book(id, cx),
+            // Handled in `run_book_action`; they never reach here.
+            BookAction::RemoveSelected | BookAction::ClearSelection => {}
         }
         cx.notify();
     }
@@ -453,6 +474,7 @@ impl Yomu {
         self.overlay_closed_at = Some(Instant::now());
         match dialog.action {
             ConfirmAction::Book(action, id) => self.perform_book_action(action, &id, window, cx),
+            ConfirmAction::RemoveSelected => self.remove_selected(cx),
             ConfirmAction::ResetSettings => self.reset_settings(cx),
         }
     }
@@ -662,8 +684,114 @@ impl Yomu {
             return;
         };
         self.library.remove(id, &self.dirs);
+        self.prune_selection();
         self.save_library();
         self.show_toast(format!("Removed “{title}” from the library"), cx);
+    }
+
+    // ------------------------------------------------------------------------------------
+    // Selection and bulk removal
+    // ------------------------------------------------------------------------------------
+
+    /// Book ids in library order.
+    fn library_order(&self) -> Vec<String> {
+        self.library.books().iter().map(|book| book.id.clone()).collect()
+    }
+
+    fn selected_ids(&self) -> Vec<String> {
+        self.selection.in_order(&self.library_order())
+    }
+
+    fn prune_selection(&mut self) {
+        let existing = self.library.ids();
+        self.selection.retain_existing(&existing);
+    }
+
+    /// A click on a book card with the given modifiers. Returns `false` if it is a plain click
+    /// that should open the book instead.
+    fn select_click(&mut self, id: &str, ctrl: bool, shift: bool, cx: &mut Context<Self>) -> bool {
+        let order = self.library_order();
+        let handled = self.selection.click(&order, id, ctrl, shift);
+        if handled {
+            cx.notify();
+        }
+        handled
+    }
+
+    /// Right-click on a book: a book inside a multi-book selection gets the bulk menu; anywhere
+    /// else the selection is dropped (like a file manager) and the book gets its own menu.
+    fn open_context_menu(&mut self, id: &str, position: Point<Pixels>, cx: &mut Context<Self>) {
+        if self.selection.contains(id) && self.selection.len() > 1 {
+            self.overlay = Some(Overlay::Menu(BookMenu {
+                book_id: id.to_string(),
+                entries: menu::selection_menu(self.selection.len()),
+                position,
+                selected: None,
+            }));
+            cx.notify();
+        } else {
+            self.selection.clear();
+            self.open_book_menu(id, position, cx);
+        }
+    }
+
+    /// Remove every selected book from the library, asking first only if progress or marks
+    /// would be lost. The comic files are never touched.
+    fn request_remove_selected(&mut self, cx: &mut Context<Self>) {
+        let ids = self.selected_ids();
+        if ids.is_empty() {
+            return;
+        }
+        let confirmation = {
+            let books: Vec<&Book> = ids.iter().filter_map(|id| self.library.get(id)).collect();
+            menu::bulk_remove_confirmation(&books)
+        };
+        match confirmation {
+            Some(confirmation) => {
+                self.overlay = Some(Overlay::Confirm(ConfirmDialog {
+                    title: confirmation.title.into(),
+                    message: confirmation.message.into(),
+                    confirm_label: confirmation.confirm_label,
+                    action: ConfirmAction::RemoveSelected,
+                }));
+                cx.notify();
+            }
+            None => self.remove_selected(cx),
+        }
+    }
+
+    fn remove_selected(&mut self, cx: &mut Context<Self>) {
+        self.dismiss();
+        let ids = self.selected_ids();
+        for id in &ids {
+            self.library.remove(id, &self.dirs);
+        }
+        self.selection.clear();
+        self.save_library();
+        let message = if ids.len() == 1 {
+            "Removed 1 book from the library".to_string()
+        } else {
+            format!("Removed {} books from the library", ids.len())
+        };
+        self.show_toast(message, cx);
+    }
+
+    fn on_library_key(&mut self, token: &str, cx: &mut Context<Self>) {
+        match token {
+            "C-a" => {
+                let order = self.library_order();
+                self.selection.select_all(&order);
+                cx.notify();
+            }
+            "escape" => {
+                if !self.selection.is_empty() {
+                    self.selection.clear();
+                    cx.notify();
+                }
+            }
+            "delete" => self.request_remove_selected(cx),
+            _ => {}
+        }
     }
 
     // ------------------------------------------------------------------------------------
@@ -679,6 +807,7 @@ impl Yomu {
             return;
         }
 
+        self.selection.clear();
         window.set_window_title(&book.title);
         window.focus(&self.focus_handle);
 
@@ -1044,6 +1173,7 @@ impl Yomu {
             return;
         }
         let Some(reader) = self.reader.as_mut() else {
+            self.on_library_key(&token, cx);
             return;
         };
 
@@ -1636,6 +1766,76 @@ impl Yomu {
             self.toast.clone()
         };
 
+        let selected = self.selection.len();
+        let subtitle = if selected > 0 {
+            format!("{selected} of {count} selected")
+        } else {
+            format!("{count} {}", if count == 1 { "book" } else { "books" })
+        };
+
+        let right = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_3()
+            .children(status.map(|text| {
+                div()
+                    .max_w(px(520.))
+                    .text_sm()
+                    .text_color(rgb(MUTED))
+                    .truncate()
+                    .child(text)
+            }));
+        // While books are selected the header offers what you can do with the selection instead
+        // of importing and settings; Esc or Cancel goes back.
+        let right = if selected > 0 {
+            let right = if selected < count {
+                right.child(button(
+                    "select-all",
+                    "Select all",
+                    cx.listener(|this, _: &ClickEvent, _, cx| {
+                        let order = this.library_order();
+                        this.selection.select_all(&order);
+                        cx.notify();
+                    }),
+                ))
+            } else {
+                right
+            };
+            right
+                .child(button_colored(
+                    "select-remove",
+                    "Remove",
+                    ACCENT,
+                    cx.listener(|this, _: &ClickEvent, _, cx| this.request_remove_selected(cx)),
+                ))
+                .child(button(
+                    "select-cancel",
+                    "Cancel",
+                    cx.listener(|this, _: &ClickEvent, _, cx| {
+                        this.selection.clear();
+                        cx.notify();
+                    }),
+                ))
+        } else {
+            right
+                .child(button(
+                    "add-files",
+                    "Add files",
+                    cx.listener(|this, _: &ClickEvent, _, cx| this.import_dialog(false, cx)),
+                ))
+                .child(button(
+                    "add-folder",
+                    "Add folder",
+                    cx.listener(|this, _: &ClickEvent, _, cx| this.import_dialog(true, cx)),
+                ))
+                .child(button(
+                    "settings",
+                    "Settings",
+                    cx.listener(|this, _: &ClickEvent, _, cx| this.open_settings(cx)),
+                ))
+        };
+
         let header = div()
             .flex()
             .flex_row()
@@ -1657,43 +1857,9 @@ impl Yomu {
                             .text_color(rgb(TEXT))
                             .child("yomu"),
                     )
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(rgb(MUTED))
-                            .child(format!("{count} {}", if count == 1 { "book" } else { "books" })),
-                    ),
+                    .child(div().text_sm().text_color(rgb(MUTED)).child(subtitle)),
             )
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_3()
-                    .children(status.map(|text| {
-                        div()
-                            .max_w(px(520.))
-                            .text_sm()
-                            .text_color(rgb(MUTED))
-                            .truncate()
-                            .child(text)
-                    }))
-                    .child(button(
-                        "add-files",
-                        "Add files",
-                        cx.listener(|this, _: &ClickEvent, _, cx| this.import_dialog(false, cx)),
-                    ))
-                    .child(button(
-                        "add-folder",
-                        "Add folder",
-                        cx.listener(|this, _: &ClickEvent, _, cx| this.import_dialog(true, cx)),
-                    ))
-                    .child(button(
-                        "settings",
-                        "Settings",
-                        cx.listener(|this, _: &ClickEvent, _, cx| this.open_settings(cx)),
-                    )),
-            );
+            .child(right);
 
         let body = if books.is_empty() {
             div()
@@ -1761,19 +1927,32 @@ impl Yomu {
             format!("{} pages", book.page_count)
         };
 
+        let selected = self.selection.contains(&book.id);
         let cover = div()
+            .relative()
             .w(px(CARD_W))
             .h(px(CARD_H))
             .flex_none()
             .rounded_md()
             .overflow_hidden()
             .bg(rgb(SURFACE))
+            .border_2()
+            .border_color(if selected { rgb(ACCENT) } else { rgb(SURFACE) })
             .child(
                 img(self.dirs.cover(&book.id))
                     .w_full()
                     .h_full()
                     .object_fit(ObjectFit::Cover),
-            );
+            )
+            .children(selected.then(|| {
+                // A tint over the cover so a selected book reads as selected at a glance.
+                div()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .size_full()
+                    .bg(rgba(0xe2725b38))
+            }));
 
         let progress_bar = div()
             .h(px(3.))
@@ -1798,8 +1977,14 @@ impl Yomu {
             .cursor_pointer()
             .hover(|style| style.opacity(0.88))
             // `on_click` only ever fires for the left button, so right-clicking never opens a book.
-            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+            .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                 if this.overlay_recently_closed() {
+                    return;
+                }
+                // Ctrl/Shift-click, or any click while books are selected, edits the selection;
+                // only a plain click on an unselected library opens the book.
+                let modifiers = event.modifiers();
+                if this.select_click(&open_id, modifiers.control, modifiers.shift, cx) {
                     return;
                 }
                 this.open_book(&open_id, window, cx);
@@ -1807,7 +1992,7 @@ impl Yomu {
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                    this.open_book_menu(&menu_id, event.position, cx);
+                    this.open_context_menu(&menu_id, event.position, cx);
                 }),
             )
             .child(cover)
@@ -2146,18 +2331,31 @@ fn button(
     label: &'static str,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
-    div()
+    button_colored(id, label, TEXT, on_click)
+}
+
+/// A header button with a custom text colour (the accent for destructive actions).
+fn button_colored(
+    id: &'static str,
+    label: &'static str,
+    color: u32,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    let base = div()
         .id(id)
         .px_3()
         .py_1()
         .rounded_md()
         .bg(rgb(SURFACE))
         .text_sm()
-        .text_color(rgb(TEXT))
+        .text_color(rgb(color))
         .cursor_pointer()
         .hover(|style| style.bg(rgb(SURFACE_HI)))
         .on_click(on_click)
-        .child(label)
+        .child(label);
+    #[cfg(test)]
+    let base = base.debug_selector(|| id.into());
+    base
 }
 
 fn main() {
@@ -2837,5 +3035,227 @@ mod tests {
         assert_eq!(view.read_with(cx, |this, _| this.library.books().len()), 3);
         assert_eq!(opacity(&view, cx), OPACITY_MAX);
         assert_eq!(view.read_with(cx, |this, _| this.library.settings().clone()), Settings::default());
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Multiple selection and bulk removal
+    // ---------------------------------------------------------------------------------------
+
+    fn click_with(cx: &mut VisualTestContext, at: Point<Pixels>, modifiers: Modifiers) {
+        cx.simulate_mouse_down(at, MouseButton::Left, modifiers);
+        cx.simulate_mouse_up(at, MouseButton::Left, modifiers);
+    }
+
+    fn ctrl_click(cx: &mut VisualTestContext, index: usize) {
+        click_with(cx, card(index), Modifiers::control());
+    }
+
+    fn selected(view: &Entity<Yomu>, cx: &mut VisualTestContext) -> Vec<String> {
+        view.read_with(cx, |this, _| this.selected_ids())
+    }
+
+    fn book_count(view: &Entity<Yomu>, cx: &mut VisualTestContext) -> usize {
+        view.read_with(cx, |this, _| this.library.books().len())
+    }
+
+    #[gpui::test]
+    fn ctrl_click_selects_without_opening_and_plain_clicks_then_toggle(cx: &mut TestAppContext) {
+        let fx = fixture("selectclick");
+        let (view, cx) = launch(&fx, cx);
+
+        ctrl_click(cx, 0);
+        assert_eq!(selected(&view, cx), vec![fx.ids[0].clone()]);
+        assert_eq!(reading(&view, cx), None, "ctrl+click never opens a book");
+
+        // selection mode: a plain click adds, and clicking a selected book removes it
+        click(cx, card(2), MouseButton::Left);
+        assert_eq!(selected(&view, cx), vec![fx.ids[0].clone(), fx.ids[2].clone()]);
+        assert_eq!(reading(&view, cx), None);
+        click(cx, card(0), MouseButton::Left);
+        assert_eq!(selected(&view, cx), vec![fx.ids[2].clone()]);
+
+        // deselecting the last one leaves selection mode: a plain click opens again
+        click(cx, card(2), MouseButton::Left);
+        assert!(selected(&view, cx).is_empty());
+        click(cx, card(1), MouseButton::Left);
+        assert_eq!(reading(&view, cx), Some(0));
+        assert!(selected(&view, cx).is_empty());
+    }
+
+    #[gpui::test]
+    fn shift_click_selects_a_range(cx: &mut TestAppContext) {
+        let fx = fixture("shiftclick");
+        let (view, cx) = launch(&fx, cx);
+
+        ctrl_click(cx, 0);
+        click_with(cx, card(2), Modifiers::shift());
+        assert_eq!(selected(&view, cx), fx.ids);
+        assert_eq!(reading(&view, cx), None);
+    }
+
+    #[gpui::test]
+    fn select_all_and_escape(cx: &mut TestAppContext) {
+        let fx = fixture("selectall");
+        let (view, cx) = launch(&fx, cx);
+
+        cx.simulate_keystrokes("ctrl-a");
+        assert_eq!(selected(&view, cx), fx.ids);
+        cx.simulate_keystrokes("escape");
+        assert!(selected(&view, cx).is_empty());
+        assert_eq!(reading(&view, cx), None, "escape in the library does nothing else");
+    }
+
+    #[gpui::test]
+    fn delete_removes_the_selection_at_once_when_nothing_is_lost(cx: &mut TestAppContext) {
+        let fx = fixture("bulkdelete");
+        let (view, cx) = launch(&fx, cx);
+
+        ctrl_click(cx, 0);
+        ctrl_click(cx, 1);
+        cx.simulate_keystrokes("delete");
+        assert_eq!(overlay_kind(&view, cx), "none", "no confirmation: nothing would be lost");
+        assert_eq!(book_count(&view, cx), 1);
+        assert!(selected(&view, cx).is_empty());
+        let on_disk = Library::load(&fx.dirs).unwrap();
+        assert_eq!(on_disk.books().len(), 1, "saved once, for the whole batch");
+        assert_eq!(on_disk.books()[0].id, fx.ids[2]);
+        assert!(fx.files.iter().all(|file| file.exists()), "comic files are never deleted");
+        assert!(!fx.dirs.cover(&fx.ids[0]).exists() && !fx.dirs.cover(&fx.ids[1]).exists());
+        let toast = view.read_with(cx, |this, _| this.toast.clone().map(|t| t.to_string()));
+        assert_eq!(toast.as_deref(), Some("Removed 2 books from the library"));
+    }
+
+    #[gpui::test]
+    fn bulk_removal_asks_first_when_progress_would_be_lost(cx: &mut TestAppContext) {
+        let fx = fixture("bulkconfirm");
+        let (view, cx) = launch(&fx, cx);
+        set_progress(&view, cx, &fx.ids[1], 3);
+
+        cx.simulate_keystrokes("ctrl-a");
+        cx.simulate_keystrokes("delete");
+        assert_eq!(overlay_kind(&view, cx), "confirm");
+        assert_eq!(book_count(&view, cx), 3, "nothing is removed before confirming");
+
+        // cancelling keeps both the books and the selection
+        cx.simulate_keystrokes("escape");
+        assert_eq!(overlay_kind(&view, cx), "none");
+        assert_eq!(book_count(&view, cx), 3);
+        assert_eq!(selected(&view, cx).len(), 3);
+
+        cx.simulate_keystrokes("delete");
+        cx.simulate_keystrokes("enter");
+        assert_eq!(book_count(&view, cx), 0);
+        assert!(selected(&view, cx).is_empty());
+        assert!(fx.files.iter().all(|file| file.exists()));
+        assert_eq!(Library::load(&fx.dirs).unwrap().books().len(), 0);
+    }
+
+    #[gpui::test]
+    fn delete_with_nothing_selected_does_nothing(cx: &mut TestAppContext) {
+        let fx = fixture("deletenothing");
+        let (view, cx) = launch(&fx, cx);
+        cx.simulate_keystrokes("delete");
+        assert_eq!(book_count(&view, cx), 3);
+        assert_eq!(overlay_kind(&view, cx), "none");
+    }
+
+    #[gpui::test]
+    fn header_buttons_manage_the_selection(cx: &mut TestAppContext) {
+        let fx = fixture("headerbuttons");
+        let (view, cx) = launch(&fx, cx);
+        // (gpui keeps the last painted bounds of every selector, so only "has it ever appeared"
+        // can be checked for these, not "has it disappeared")
+        assert!(cx.debug_bounds("select-remove").is_none(), "no selection controls until needed");
+        assert!(cx.debug_bounds("add-files").is_some());
+
+        ctrl_click(cx, 0);
+        let select_all = cx.debug_bounds("select-all").expect("the header offers Select all");
+        click(cx, select_all.center(), MouseButton::Left);
+        assert_eq!(selected(&view, cx), fx.ids);
+
+        let cancel = cx.debug_bounds("select-cancel").unwrap();
+        click(cx, cancel.center(), MouseButton::Left);
+        assert!(selected(&view, cx).is_empty());
+
+        ctrl_click(cx, 0);
+        ctrl_click(cx, 1);
+        let remove = cx.debug_bounds("select-remove").unwrap();
+        click(cx, remove.center(), MouseButton::Left);
+        assert_eq!(book_count(&view, cx), 1);
+        assert!(selected(&view, cx).is_empty());
+    }
+
+    #[gpui::test]
+    fn right_click_on_a_selected_book_offers_bulk_actions(cx: &mut TestAppContext) {
+        let fx = fixture("bulkmenu");
+        let (view, cx) = launch(&fx, cx);
+
+        ctrl_click(cx, 0);
+        ctrl_click(cx, 1);
+        click(cx, card(1), MouseButton::Right);
+        assert_eq!(overlay_kind(&view, cx), "menu");
+        assert_eq!(
+            menu_labels(&view, cx),
+            vec!["Clear Selection".to_string(), "Remove 2 Books from Library".to_string()]
+        );
+        assert_eq!(selected(&view, cx).len(), 2, "opening the menu keeps the selection");
+
+        cx.simulate_keystrokes("down enter");
+        assert!(selected(&view, cx).is_empty());
+        assert_eq!(book_count(&view, cx), 3);
+
+        // (clicks right after a menu closes are ignored on purpose)
+        std::thread::sleep(Duration::from_millis(350));
+        ctrl_click(cx, 0);
+        ctrl_click(cx, 2);
+        click(cx, card(2), MouseButton::Right);
+        cx.simulate_keystrokes("end enter");
+        assert_eq!(book_count(&view, cx), 1);
+        assert_eq!(Library::load(&fx.dirs).unwrap().books()[0].id, fx.ids[1]);
+    }
+
+    #[gpui::test]
+    fn right_click_on_an_unselected_book_drops_the_selection(cx: &mut TestAppContext) {
+        let fx = fixture("rightunselected");
+        let (view, cx) = launch(&fx, cx);
+
+        ctrl_click(cx, 0);
+        ctrl_click(cx, 1);
+        click(cx, card(2), MouseButton::Right);
+        assert!(selected(&view, cx).is_empty());
+        assert_eq!(menu_labels(&view, cx)[0], "Start Reading", "the normal single-book menu");
+
+        // a single selected book also gets the normal menu, not a "1 book" bulk menu
+        close(&view, cx);
+        std::thread::sleep(Duration::from_millis(350));
+        ctrl_click(cx, 0);
+        click(cx, card(0), MouseButton::Right);
+        assert_eq!(menu_labels(&view, cx)[0], "Start Reading");
+    }
+
+    #[gpui::test]
+    fn removing_one_book_updates_the_selection_and_opening_clears_it(cx: &mut TestAppContext) {
+        let fx = fixture("pruneselection");
+        let (view, cx) = launch(&fx, cx);
+
+        ctrl_click(cx, 0);
+        ctrl_click(cx, 1);
+        act(&view, cx, &fx.ids[0], BookAction::Remove);
+        assert_eq!(selected(&view, cx), vec![fx.ids[1].clone()], "the removed book left the selection");
+
+        act(&view, cx, &fx.ids[1], BookAction::Open);
+        assert_eq!(reading(&view, cx), Some(0));
+        assert!(selected(&view, cx).is_empty(), "opening a book clears the selection");
+    }
+
+    #[gpui::test]
+    fn selection_keys_do_not_leak_into_the_reader(cx: &mut TestAppContext) {
+        let fx = fixture("readerkeys");
+        let (view, cx) = launch(&fx, cx);
+        act(&view, cx, &fx.ids[0], BookAction::Open);
+        cx.simulate_keystrokes("ctrl-a");
+        assert!(selected(&view, cx).is_empty(), "Ctrl+A only selects in the library");
+        cx.simulate_keystrokes("delete");
+        assert_eq!(book_count(&view, cx), 3);
     }
 }

@@ -7,6 +7,7 @@ rendering is GPU-accelerated, and it talks to Wayland directly (no webview, no T
 - Import CBZ/ZIP archives or folders of images (files, folders, or drag and drop)
 - Chrome-free reader: one page, a 2 px progress line at the bottom edge, nothing else until you ask
 - Right-click menu on books (resume, mark read/unread, reset progress, open file location, properties, remove)
+- Multiple selection (Ctrl/Shift-click, Ctrl+A) for removing many books at once
 - Settings panel with a live background-opacity slider (`Ctrl+,`)
 - Fit page / width / height / original size, zoom in and out, pan by dragging
 - Vim motions (counts, `gg`, `G`, marks, `:` commands) next to the normal keys
@@ -46,6 +47,8 @@ Ctrl+wheel) work too. Press `?` in the reader for a cheat sheet.
 |-----|--------|
 | Click a book | Open it where you left off |
 | Right-click a book | Context menu (see below) |
+| `Ctrl`+click, `Shift`+click | Select books (see below) |
+| `Ctrl+A`, `Delete`, `Esc` | Select all, remove the selection, clear the selection |
 | `Ctrl+O` / `Ctrl+Shift+O` | Add files / Add folder |
 | `Ctrl+,` or the **Settings** button | Settings (works in the reader too) |
 
@@ -99,6 +102,18 @@ Counts work on motions: `5j` scrolls five steps, `3J` skips three pages. Marks a
 
 In right-to-left mode `Left` and `h` go forward, like turning a printed manga. The fit mode and
 reading direction are remembered between books.
+
+## Selecting several books
+
+- **Ctrl+click** toggles a book. **Shift+click** selects the range from the last book you clicked.
+- Once anything is selected, plain clicks toggle books instead of opening them, so you can just keep clicking.
+  Deselect the last one (or press `Esc` / **Cancel**) and clicking opens books again.
+- While books are selected the header shows `N of M selected` with **Select all**, **Remove** and **Cancel**
+  in place of the import and settings buttons. `Ctrl+A` selects everything and `Delete` removes the selection.
+- Right-click a selected book for a small bulk menu (**Clear Selection**, **Remove N Books from Library**).
+  Right-clicking a book that is not selected drops the selection and shows that book's normal menu.
+- Removal only forgets the books; the comic files are never deleted. It asks first only if some of the selected
+  books have progress or marks that would be lost, and it saves once for the whole batch.
 
 ## Context menu
 
@@ -165,6 +180,7 @@ The code is split so that everything except the window lives in the library crat
 - `src/layout.rs` is the fit-mode, zoom and pan math
 - `src/vim.rs` turns keys into actions: counts, `gg`/`zw`/`ma` sequences and the `:` command line
 - `src/menu.rs` decides which context-menu actions apply to a book, plus confirmations and the Properties rows
+- `src/selection.rs` holds the multi-select rules (toggle, range, select all)
 - `src/library.rs` is the library model, JSON persistence, and the import pipeline
 - `src/main.rs` is the gpui UI
 

@@ -21,6 +21,10 @@ pub enum BookAction {
     Properties,
     /// Remove from the library. The comic file itself is never touched.
     Remove,
+    /// Remove every selected book from the library (files are never touched).
+    RemoveSelected,
+    /// Deselect everything.
+    ClearSelection,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -86,6 +90,24 @@ pub fn book_menu(book: &Book, file_exists: bool) -> Vec<Entry> {
     entries
 }
 
+fn plural_books(count: usize) -> String {
+    if count == 1 { "1 Book".to_string() } else { format!("{count} Books") }
+}
+
+/// The menu for right-clicking a book that is part of a multi-book selection.
+pub fn selection_menu(count: usize) -> Vec<Entry> {
+    vec![
+        item(BookAction::ClearSelection, "Clear Selection", true),
+        Entry::Separator,
+        Entry::Item(Item {
+            action: BookAction::RemoveSelected,
+            label: format!("Remove {} from Library", plural_books(count)),
+            enabled: true,
+            danger: true,
+        }),
+    ]
+}
+
 /// Move the highlight to the next (or previous) enabled item, wrapping around. With no current
 /// selection, going forward picks the first item and going back picks the last.
 pub fn step(entries: &[Entry], current: Option<usize>, forward: bool) -> Option<usize> {
@@ -135,6 +157,29 @@ pub fn confirmation(action: BookAction, book: &Book) -> Option<Confirmation> {
         }),
         _ => None,
     }
+}
+
+/// Whether removing several books at once needs an "are you sure?": only if some of them have
+/// progress or marks that would be lost, same rule as removing one book.
+pub fn bulk_remove_confirmation(books: &[&Book]) -> Option<Confirmation> {
+    let at_risk = books
+        .iter()
+        .filter(|book| book.has_progress() || !book.marks.is_empty())
+        .count();
+    if at_risk == 0 {
+        return None;
+    }
+    let total = books.len();
+    let which = if at_risk == total {
+        if total == 1 { "your progress and marks for it".to_string() } else { "your progress and marks for them".to_string() }
+    } else {
+        format!("your progress and marks for {at_risk} of them")
+    };
+    Some(Confirmation {
+        title: format!("Remove {} from library?", plural_books(total).to_lowercase()),
+        message: format!("This will lose {which}. The files themselves are not deleted."),
+        confirm_label: "Remove",
+    })
 }
 
 /// Label and value rows for the Properties dialog. Only information that is actually known.
@@ -339,6 +384,46 @@ mod tests {
         }
         let message = confirmation(BookAction::Remove, &reading).unwrap().message;
         assert!(message.contains("not deleted"));
+    }
+
+    #[test]
+    fn selection_menu_offers_only_bulk_actions() {
+        let entries = selection_menu(3);
+        assert_eq!(actions(&entries), vec![BookAction::ClearSelection, BookAction::RemoveSelected]);
+        match &entries[2] {
+            Entry::Item(item) => {
+                assert_eq!(item.label, "Remove 3 Books from Library");
+                assert!(item.danger);
+            }
+            Entry::Separator => unreachable!(),
+        }
+        match &selection_menu(1)[2] {
+            Entry::Item(item) => assert_eq!(item.label, "Remove 1 Book from Library"),
+            Entry::Separator => unreachable!(),
+        }
+        // keyboard navigation works on it too
+        assert_eq!(step(&entries, None, true), Some(0));
+        assert_eq!(step(&entries, Some(0), true), Some(2));
+    }
+
+    #[test]
+    fn bulk_removal_asks_only_when_something_would_be_lost() {
+        let unread = book(ReadStatus::Unread);
+        let reading = book(ReadStatus::InProgress);
+        let mut marked = book(ReadStatus::Unread);
+        marked.marks.insert("a".into(), 1);
+
+        assert!(bulk_remove_confirmation(&[]).is_none());
+        assert!(bulk_remove_confirmation(&[&unread, &unread]).is_none());
+
+        let some = bulk_remove_confirmation(&[&unread, &reading, &marked]).unwrap();
+        assert_eq!(some.title, "Remove 3 books from library?");
+        assert!(some.message.contains("2 of them"), "{}", some.message);
+        assert!(some.message.contains("not deleted"));
+
+        let all = bulk_remove_confirmation(&[&reading, &marked]).unwrap();
+        assert!(all.message.contains("for them"), "{}", all.message);
+        assert_eq!(all.confirm_label, "Remove");
     }
 
     #[test]

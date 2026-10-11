@@ -6,5 +6,6 @@ pub mod imaging;
 pub mod layout;
 pub mod library;
 pub mod menu;
+pub mod selection;
 pub mod util;
 pub mod vim;
