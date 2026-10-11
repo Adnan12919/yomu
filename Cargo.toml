@@ -1,0 +1,51 @@
+[package]
+name = "yomu"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+description = "A minimal, GPU-accelerated, Wayland-native manga reader with a library"
+license = "MIT"
+
+[lib]
+name = "yomu"
+path = "src/lib.rs"
+
+[[bin]]
+name = "yomu"
+path = "src/main.rs"
+
+[dependencies]
+gpui = "0.2.2"
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+dirs = "6"
+# Pure-Rust decoders only: no C libraries get linked for image or archive handling.
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif"] }
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 4
+strip = true
+
+# Image decoding is painfully slow at opt-level 0, so optimise just those crates in dev builds.
+[profile.dev.package.image]
+opt-level = 3
+[profile.dev.package.zune-jpeg]
+opt-level = 3
+[profile.dev.package.png]
+opt-level = 3
+[profile.dev.package.fdeflate]
+opt-level = 3
+[profile.dev.package.miniz_oxide]
+opt-level = 3
+[profile.dev.package.flate2]
+opt-level = 3
+[profile.dev.package.image-webp]
+opt-level = 3
+
+# xattr 0.2.3 (pulled in by gpui -> zed-async-tar) fails to compile against libc >= 0.2.183
+# because ENOATTR disappeared on Linux. This vendored copy fixes that single constant.
+[patch.crates-io]
+xattr = { path = "vendor/xattr" }
