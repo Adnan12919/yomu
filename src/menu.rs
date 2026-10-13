@@ -43,7 +43,12 @@ pub enum Entry {
 }
 
 fn item(action: BookAction, label: &str, enabled: bool) -> Entry {
-    Entry::Item(Item { action, label: label.to_string(), enabled, danger: false })
+    Entry::Item(Item {
+        action,
+        label: label.to_string(),
+        enabled,
+        danger: false,
+    })
 }
 
 /// The entries for `book`. Only actions that make sense for its reading status are included, so
@@ -57,10 +62,18 @@ pub fn book_menu(book: &Book, file_exists: bool) -> Vec<Entry> {
         ReadStatus::Unread => entries.push(item(BookAction::Open, "Start Reading", file_exists)),
         ReadStatus::InProgress => {
             entries.push(item(BookAction::Open, "Resume Reading", file_exists));
-            entries.push(item(BookAction::StartOver, "Start from Beginning", file_exists));
+            entries.push(item(
+                BookAction::StartOver,
+                "Start from Beginning",
+                file_exists,
+            ));
         }
         ReadStatus::Finished => {
-            entries.push(item(BookAction::StartOver, "Start from Beginning", file_exists));
+            entries.push(item(
+                BookAction::StartOver,
+                "Start from Beginning",
+                file_exists,
+            ));
         }
     }
     entries.push(Entry::Separator);
@@ -77,7 +90,11 @@ pub fn book_menu(book: &Book, file_exists: bool) -> Vec<Entry> {
     }
     entries.push(Entry::Separator);
 
-    entries.push(item(BookAction::RevealFile, "Open File Location", file_exists));
+    entries.push(item(
+        BookAction::RevealFile,
+        "Open File Location",
+        file_exists,
+    ));
     entries.push(item(BookAction::Properties, "Properties", true));
     entries.push(Entry::Separator);
 
@@ -91,7 +108,11 @@ pub fn book_menu(book: &Book, file_exists: bool) -> Vec<Entry> {
 }
 
 fn plural_books(count: usize) -> String {
-    if count == 1 { "1 Book".to_string() } else { format!("{count} Books") }
+    if count == 1 {
+        "1 Book".to_string()
+    } else {
+        format!("{count} Books")
+    }
 }
 
 /// The menu for right-clicking a book that is part of a multi-book selection.
@@ -171,12 +192,19 @@ pub fn bulk_remove_confirmation(books: &[&Book]) -> Option<Confirmation> {
     }
     let total = books.len();
     let which = if at_risk == total {
-        if total == 1 { "your progress and marks for it".to_string() } else { "your progress and marks for them".to_string() }
+        if total == 1 {
+            "your progress and marks for it".to_string()
+        } else {
+            "your progress and marks for them".to_string()
+        }
     } else {
         format!("your progress and marks for {at_risk} of them")
     };
     Some(Confirmation {
-        title: format!("Remove {} from library?", plural_books(total).to_lowercase()),
+        title: format!(
+            "Remove {} from library?",
+            plural_books(total).to_lowercase()
+        ),
         message: format!("This will lose {which}. The files themselves are not deleted."),
         confirm_label: "Remove",
     })
@@ -190,14 +218,22 @@ pub fn properties(book: &Book) -> Vec<(String, String)> {
     let location = book.path.display().to_string();
     rows.push((
         "Location".to_string(),
-        if exists { location } else { format!("{location} (missing)") },
+        if exists {
+            location
+        } else {
+            format!("{location} (missing)")
+        },
     ));
 
     let format = match book.kind {
         SourceKind::Folder => "Image folder",
         SourceKind::Archive => {
             let lower = book.path.to_string_lossy().to_ascii_lowercase();
-            if lower.ends_with(".zip") { "ZIP archive" } else { "CBZ archive" }
+            if lower.ends_with(".zip") {
+                "ZIP archive"
+            } else {
+                "CBZ archive"
+            }
         }
     };
     rows.push(("Format".to_string(), format.to_string()));
@@ -215,10 +251,11 @@ pub fn properties(book: &Book) -> Vec<(String, String)> {
     };
     rows.push(("Progress".to_string(), progress));
 
-    if book.kind == SourceKind::Archive && exists {
-        if let Ok(meta) = fs::metadata(&book.path) {
-            rows.push(("Size".to_string(), format_size(meta.len())));
-        }
+    if book.kind == SourceKind::Archive
+        && exists
+        && let Ok(meta) = fs::metadata(&book.path)
+    {
+        rows.push(("Size".to_string(), format_size(meta.len())));
     }
 
     if !book.marks.is_empty() {
@@ -290,7 +327,15 @@ mod tests {
         );
         assert_eq!(
             actions(&book_menu(&book(ReadStatus::InProgress), true)),
-            vec![Open, StartOver, MarkRead, ResetProgress, RevealFile, Properties, Remove]
+            vec![
+                Open,
+                StartOver,
+                MarkRead,
+                ResetProgress,
+                RevealFile,
+                Properties,
+                Remove
+            ]
         );
         assert_eq!(
             actions(&book_menu(&book(ReadStatus::Finished), true)),
@@ -311,13 +356,19 @@ mod tests {
 
     #[test]
     fn separators_never_lead_trail_or_double_up() {
-        for status in [ReadStatus::Unread, ReadStatus::InProgress, ReadStatus::Finished] {
+        for status in [
+            ReadStatus::Unread,
+            ReadStatus::InProgress,
+            ReadStatus::Finished,
+        ] {
             let entries = book_menu(&book(status), true);
             assert!(matches!(entries.first(), Some(Entry::Item(_))));
             assert!(matches!(entries.last(), Some(Entry::Item(_))));
-            assert!(entries
-                .windows(2)
-                .all(|pair| !(pair[0] == Entry::Separator && pair[1] == Entry::Separator)));
+            assert!(
+                entries
+                    .windows(2)
+                    .all(|pair| !(pair[0] == Entry::Separator && pair[1] == Entry::Separator))
+            );
         }
     }
 
@@ -352,7 +403,11 @@ mod tests {
         assert_eq!(step(&entries, None, true), Some(2));
         assert_eq!(step(&entries, Some(2), true), Some(5));
         assert_eq!(step(&entries, Some(5), true), Some(7));
-        assert_eq!(step(&entries, Some(7), true), Some(2), "wraps to the first enabled item");
+        assert_eq!(
+            step(&entries, Some(7), true),
+            Some(2),
+            "wraps to the first enabled item"
+        );
         assert_eq!(step(&entries, None, false), Some(7));
         assert_eq!(step(&entries, Some(2), false), Some(7));
         assert_eq!(step(&entries, Some(5), false), Some(2));
@@ -389,7 +444,10 @@ mod tests {
     #[test]
     fn selection_menu_offers_only_bulk_actions() {
         let entries = selection_menu(3);
-        assert_eq!(actions(&entries), vec![BookAction::ClearSelection, BookAction::RemoveSelected]);
+        assert_eq!(
+            actions(&entries),
+            vec![BookAction::ClearSelection, BookAction::RemoveSelected]
+        );
         match &entries[2] {
             Entry::Item(item) => {
                 assert_eq!(item.label, "Remove 3 Books from Library");

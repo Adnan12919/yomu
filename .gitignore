@@ -1,9 +1,7 @@
 /target
 /result
 .direnv/
-
-# Devenv
 .devenv*
 devenv.local.nix
 devenv.local.yaml
-
+.pre-commit-config.yaml

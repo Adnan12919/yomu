@@ -60,7 +60,11 @@ pub struct Viewport {
 }
 
 impl Viewport {
-    pub const EMPTY: Viewport = Viewport { width: 0.0, height: 0.0, scale: 1.0 };
+    pub const EMPTY: Viewport = Viewport {
+        width: 0.0,
+        height: 0.0,
+        scale: 1.0,
+    };
 }
 
 /// Where to put the scroll position after a page turn.
@@ -90,7 +94,10 @@ pub fn display_size(fit: FitMode, zoom: f32, orig: (f32, f32), vp: &Viewport) ->
 
 /// Furthest the page can be scrolled on each axis.
 pub fn max_offset(display: (f32, f32), vp: &Viewport) -> (f32, f32) {
-    ((display.0 - vp.width).max(0.0), (display.1 - vp.height).max(0.0))
+    (
+        (display.0 - vp.width).max(0.0),
+        (display.1 - vp.height).max(0.0),
+    )
 }
 
 pub fn clamp_offset(off: (f32, f32), display: (f32, f32), vp: &Viewport) -> (f32, f32) {
@@ -107,7 +114,10 @@ pub fn origin(off: (f32, f32), display: (f32, f32), vp: &Viewport) -> (f32, f32)
             -off.clamp(0.0, display - view)
         }
     }
-    (axis(off.0, display.0, vp.width), axis(off.1, display.1, vp.height))
+    (
+        axis(off.0, display.0, vp.width),
+        axis(off.1, display.1, vp.height),
+    )
 }
 
 /// The offset that keeps the image point under `anchor` (viewport coordinates) fixed while the
@@ -119,7 +129,11 @@ pub fn zoom_anchor_offset(
     anchor: (f32, f32),
 ) -> (f32, f32) {
     fn axis(old_origin: f32, old_display: f32, new_display: f32, anchor: f32) -> f32 {
-        let fraction = if old_display > 0.0 { (anchor - old_origin) / old_display } else { 0.5 };
+        let fraction = if old_display > 0.0 {
+            (anchor - old_origin) / old_display
+        } else {
+            0.5
+        };
         -(anchor - fraction * new_display)
     }
     (
@@ -152,7 +166,11 @@ pub fn tier_for(long_side_px: f32) -> u32 {
 mod tests {
     use super::*;
 
-    const VP: Viewport = Viewport { width: 800.0, height: 600.0, scale: 1.0 };
+    const VP: Viewport = Viewport {
+        width: 800.0,
+        height: 600.0,
+        scale: 1.0,
+    };
 
     fn close(a: (f32, f32), b: (f32, f32)) -> bool {
         (a.0 - b.0).abs() < 0.01 && (a.1 - b.1).abs() < 0.01
@@ -161,18 +179,36 @@ mod tests {
     #[test]
     fn fit_modes_pick_the_right_scale() {
         let orig = (1000.0, 2000.0);
-        assert!(close(display_size(FitMode::Page, 1.0, orig, &VP), (300.0, 600.0)));
-        assert!(close(display_size(FitMode::Width, 1.0, orig, &VP), (800.0, 1600.0)));
-        assert!(close(display_size(FitMode::Height, 1.0, orig, &VP), (300.0, 600.0)));
+        assert!(close(
+            display_size(FitMode::Page, 1.0, orig, &VP),
+            (300.0, 600.0)
+        ));
+        assert!(close(
+            display_size(FitMode::Width, 1.0, orig, &VP),
+            (800.0, 1600.0)
+        ));
+        assert!(close(
+            display_size(FitMode::Height, 1.0, orig, &VP),
+            (300.0, 600.0)
+        ));
         let hidpi = Viewport { scale: 2.0, ..VP };
-        assert!(close(display_size(FitMode::Original, 1.0, orig, &hidpi), (500.0, 1000.0)));
+        assert!(close(
+            display_size(FitMode::Original, 1.0, orig, &hidpi),
+            (500.0, 1000.0)
+        ));
     }
 
     #[test]
     fn wide_page_fits_differently() {
         let orig = (3000.0, 1000.0);
-        assert!(close(display_size(FitMode::Page, 1.0, orig, &VP), (800.0, 266.666)));
-        assert!(close(display_size(FitMode::Height, 1.0, orig, &VP), (1800.0, 600.0)));
+        assert!(close(
+            display_size(FitMode::Page, 1.0, orig, &VP),
+            (800.0, 266.666)
+        ));
+        assert!(close(
+            display_size(FitMode::Height, 1.0, orig, &VP),
+            (1800.0, 600.0)
+        ));
     }
 
     #[test]
@@ -184,11 +220,20 @@ mod tests {
     #[test]
     fn small_pages_are_centred_large_pages_scroll() {
         assert!(close(origin((0.0, 0.0), (300.0, 600.0), &VP), (250.0, 0.0)));
-        assert!(close(origin((0.0, 100.0), (800.0, 1600.0), &VP), (0.0, -100.0)));
+        assert!(close(
+            origin((0.0, 100.0), (800.0, 1600.0), &VP),
+            (0.0, -100.0)
+        ));
         // an offset beyond the end is clamped
-        assert!(close(origin((0.0, 5000.0), (800.0, 1600.0), &VP), (0.0, -1000.0)));
+        assert!(close(
+            origin((0.0, 5000.0), (800.0, 1600.0), &VP),
+            (0.0, -1000.0)
+        ));
         assert!(close(max_offset((800.0, 1600.0), &VP), (0.0, 1000.0)));
-        assert!(close(clamp_offset((50.0, -9.0), (800.0, 1600.0), &VP), (0.0, 0.0)));
+        assert!(close(
+            clamp_offset((50.0, -9.0), (800.0, 1600.0), &VP),
+            (0.0, 0.0)
+        ));
     }
 
     #[test]
@@ -197,7 +242,10 @@ mod tests {
         let off = (0.0, 400.0);
         let old_origin = origin(off, old_display, &VP);
         let anchor = (200.0, 150.0);
-        let image_point = ((anchor.0 - old_origin.0) / old_display.0, (anchor.1 - old_origin.1) / old_display.1);
+        let image_point = (
+            (anchor.0 - old_origin.0) / old_display.0,
+            (anchor.1 - old_origin.1) / old_display.1,
+        );
 
         let new_display = (1600.0, 3200.0);
         let new_off = zoom_anchor_offset(old_origin, old_display, new_display, anchor);
@@ -206,7 +254,10 @@ mod tests {
             (anchor.0 - new_origin.0) / new_display.0,
             (anchor.1 - new_origin.1) / new_display.1,
         );
-        assert!((image_point.1 - after.1).abs() < 1e-4, "{image_point:?} vs {after:?}");
+        assert!(
+            (image_point.1 - after.1).abs() < 1e-4,
+            "{image_point:?} vs {after:?}"
+        );
     }
 
     #[test]

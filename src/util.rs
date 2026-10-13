@@ -118,14 +118,20 @@ mod tests {
     fn sorts_numbers_naturally() {
         let mut names = vec!["p10.jpg", "p2.jpg", "p1.jpg", "p02.jpg", "P3.jpg"];
         names.sort_by(|a, b| natural_cmp(a, b));
-        assert_eq!(names, vec!["p1.jpg", "p2.jpg", "p02.jpg", "P3.jpg", "p10.jpg"]);
+        assert_eq!(
+            names,
+            vec!["p1.jpg", "p2.jpg", "p02.jpg", "P3.jpg", "p10.jpg"]
+        );
     }
 
     #[test]
     fn folders_group_before_pages() {
         let mut names = vec!["ch2/001.png", "ch10/001.png", "ch1/010.png", "ch1/002.png"];
         names.sort_by(|a, b| natural_cmp(a, b));
-        assert_eq!(names, vec!["ch1/002.png", "ch1/010.png", "ch2/001.png", "ch10/001.png"]);
+        assert_eq!(
+            names,
+            vec!["ch1/002.png", "ch1/010.png", "ch2/001.png", "ch10/001.png"]
+        );
     }
 
     #[test]

@@ -21,7 +21,11 @@ pub enum Amount {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Action {
     /// Scroll the page; turns the page when it cannot scroll any further.
-    Scroll { dir: Dir, amount: Amount, count: usize },
+    Scroll {
+        dir: Dir,
+        amount: Amount,
+        count: usize,
+    },
     NextPage(usize),
     PrevPage(usize),
     /// 1-based page number.
@@ -42,7 +46,11 @@ pub enum Action {
     JumpMark(char),
     JumpBack,
     ToggleDirection,
-    SetDirection { rtl: bool },
+    SetDirection {
+        rtl: bool,
+    },
+    /// `None` toggles.
+    SetAnimations(Option<bool>),
     ToggleInfo,
     ToggleHelp,
     ToggleFullscreen,
@@ -250,7 +258,11 @@ impl Vim {
                 parse_command(&line)
             }
             "backspace" => {
-                let empty = self.cmd.as_mut().map(|buf| buf.pop().is_none()).unwrap_or(true);
+                let empty = self
+                    .cmd
+                    .as_mut()
+                    .map(|buf| buf.pop().is_none())
+                    .unwrap_or(true);
                 if empty {
                     self.cmd = None;
                 }
@@ -269,10 +281,10 @@ impl Vim {
                 vec![]
             }
             other => {
-                if single_char(other).is_some() {
-                    if let Some(buf) = self.cmd.as_mut() {
-                        buf.push_str(other);
-                    }
+                if single_char(other).is_some()
+                    && let Some(buf) = self.cmd.as_mut()
+                {
+                    buf.push_str(other);
                 }
                 vec![]
             }
@@ -314,12 +326,16 @@ pub fn parse_command(line: &str) -> Vec<Action> {
         ("fit", None) => vec![Action::CycleFit],
         ("fit", Some(mode)) => match parse_fit(mode) {
             Some(fit) => vec![Action::Fit(fit)],
-            None => vec![Action::Message(format!("Unknown fit mode: {mode} (page, width, height, original)"))],
+            None => vec![Action::Message(format!(
+                "Unknown fit mode: {mode} (page, width, height, original)"
+            ))],
         },
         ("zoom" | "z", None | Some("reset")) => vec![Action::ZoomReset],
         ("zoom" | "z", Some(value)) => match value.trim_end_matches('%').parse::<f32>() {
             Ok(percent) if percent > 0.0 => vec![Action::ZoomSet(percent / 100.0)],
-            _ => vec![Action::Message(format!("Bad zoom: {value} (use a percentage like 150)"))],
+            _ => vec![Action::Message(format!(
+                "Bad zoom: {value} (use a percentage like 150)"
+            ))],
         },
         ("rtl", _) => vec![Action::SetDirection { rtl: true }],
         ("ltr", _) => vec![Action::SetDirection { rtl: false }],
@@ -327,6 +343,13 @@ pub fn parse_command(line: &str) -> Vec<Action> {
         ("help" | "h", _) => vec![Action::ToggleHelp],
         ("fullscreen" | "fs", _) => vec![Action::ToggleFullscreen],
         ("settings" | "set" | "preferences" | "prefs", _) => vec![Action::OpenSettings],
+        ("animate" | "animations" | "anim", None) => vec![Action::SetAnimations(None)],
+        ("animate" | "animations" | "anim", Some("on" | "true" | "1" | "yes")) => {
+            vec![Action::SetAnimations(Some(true))]
+        }
+        ("animate" | "animations" | "anim", Some("off" | "false" | "0" | "no")) => {
+            vec![Action::SetAnimations(Some(false))]
+        }
         ("mark", Some(key)) => match single_char(key) {
             Some(c) if c.is_alphabetic() => vec![Action::SetMark(c)],
             _ => bad(),
@@ -380,11 +403,19 @@ mod tests {
         let mut vim = Vim::new();
         assert_eq!(
             feed_all(&mut vim, &["5", "j"]),
-            vec![Action::Scroll { dir: Dir::Down, amount: Amount::Line, count: 5 }]
+            vec![Action::Scroll {
+                dir: Dir::Down,
+                amount: Amount::Line,
+                count: 5
+            }]
         );
         assert_eq!(
             feed_all(&mut vim, &["1", "0", "k"]),
-            vec![Action::Scroll { dir: Dir::Up, amount: Amount::Line, count: 10 }]
+            vec![Action::Scroll {
+                dir: Dir::Up,
+                amount: Amount::Line,
+                count: 10
+            }]
         );
     }
 
@@ -403,21 +434,45 @@ mod tests {
         let mut vim = Vim::new();
         assert_eq!(feed_all(&mut vim, &["g", "g"]), vec![Action::FirstPage]);
         assert_eq!(feed_all(&mut vim, &["G"]), vec![Action::LastPage]);
-        assert_eq!(feed_all(&mut vim, &["1", "2", "G"]), vec![Action::GotoPage(12)]);
-        assert_eq!(feed_all(&mut vim, &["7", "g", "g"]), vec![Action::GotoPage(7)]);
+        assert_eq!(
+            feed_all(&mut vim, &["1", "2", "G"]),
+            vec![Action::GotoPage(12)]
+        );
+        assert_eq!(
+            feed_all(&mut vim, &["7", "g", "g"]),
+            vec![Action::GotoPage(7)]
+        );
     }
 
     #[test]
     fn view_commands_under_z() {
         let mut vim = Vim::new();
-        assert_eq!(feed_all(&mut vim, &["z", "w"]), vec![Action::Fit(FitMode::Width)]);
-        assert_eq!(feed_all(&mut vim, &["z", "h"]), vec![Action::Fit(FitMode::Height)]);
-        assert_eq!(feed_all(&mut vim, &["z", "p"]), vec![Action::Fit(FitMode::Page)]);
-        assert_eq!(feed_all(&mut vim, &["z", "1"]), vec![Action::Fit(FitMode::Original)]);
+        assert_eq!(
+            feed_all(&mut vim, &["z", "w"]),
+            vec![Action::Fit(FitMode::Width)]
+        );
+        assert_eq!(
+            feed_all(&mut vim, &["z", "h"]),
+            vec![Action::Fit(FitMode::Height)]
+        );
+        assert_eq!(
+            feed_all(&mut vim, &["z", "p"]),
+            vec![Action::Fit(FitMode::Page)]
+        );
+        assert_eq!(
+            feed_all(&mut vim, &["z", "1"]),
+            vec![Action::Fit(FitMode::Original)]
+        );
         assert_eq!(feed_all(&mut vim, &["z", "i"]), vec![Action::ZoomIn(1)]);
-        assert_eq!(feed_all(&mut vim, &["3", "z", "o"]), vec![Action::ZoomOut(3)]);
+        assert_eq!(
+            feed_all(&mut vim, &["3", "z", "o"]),
+            vec![Action::ZoomOut(3)]
+        );
         assert_eq!(feed_all(&mut vim, &["a"]), vec![Action::Fit(FitMode::Page)]);
-        assert_eq!(feed_all(&mut vim, &["s"]), vec![Action::Fit(FitMode::Width)]);
+        assert_eq!(
+            feed_all(&mut vim, &["s"]),
+            vec![Action::Fit(FitMode::Width)]
+        );
         assert_eq!(feed_all(&mut vim, &["+"]), vec![Action::ZoomIn(1)]);
         assert_eq!(feed_all(&mut vim, &["-"]), vec![Action::ZoomOut(1)]);
     }
@@ -479,19 +534,50 @@ mod tests {
     fn parse_commands() {
         assert_eq!(parse_command("q"), vec![Action::CloseBook]);
         assert_eq!(parse_command("qa"), vec![Action::QuitApp]);
-        assert_eq!(parse_command("fit height"), vec![Action::Fit(FitMode::Height)]);
+        assert_eq!(
+            parse_command("fit height"),
+            vec![Action::Fit(FitMode::Height)]
+        );
         assert_eq!(parse_command("fit"), vec![Action::CycleFit]);
         assert_eq!(parse_command("zoom 150"), vec![Action::ZoomSet(1.5)]);
         assert_eq!(parse_command("zoom 80%"), vec![Action::ZoomSet(0.8)]);
         assert_eq!(parse_command("zoom"), vec![Action::ZoomReset]);
-        assert_eq!(parse_command("rtl"), vec![Action::SetDirection { rtl: true }]);
-        assert_eq!(parse_command("ltr"), vec![Action::SetDirection { rtl: false }]);
+        assert_eq!(
+            parse_command("rtl"),
+            vec![Action::SetDirection { rtl: true }]
+        );
+        assert_eq!(
+            parse_command("ltr"),
+            vec![Action::SetDirection { rtl: false }]
+        );
         assert_eq!(parse_command("$"), vec![Action::LastPage]);
         assert_eq!(parse_command("mark b"), vec![Action::SetMark('b')]);
         assert_eq!(parse_command("settings"), vec![Action::OpenSettings]);
-        assert!(matches!(parse_command("bogus").as_slice(), [Action::Message(_)]));
-        assert!(matches!(parse_command("fit sideways").as_slice(), [Action::Message(_)]));
-        assert!(matches!(parse_command("zoom lots").as_slice(), [Action::Message(_)]));
+        assert_eq!(parse_command("animate"), vec![Action::SetAnimations(None)]);
+        assert_eq!(
+            parse_command("animate off"),
+            vec![Action::SetAnimations(Some(false))]
+        );
+        assert_eq!(
+            parse_command("animations on"),
+            vec![Action::SetAnimations(Some(true))]
+        );
+        assert!(matches!(
+            parse_command("animate maybe").as_slice(),
+            [Action::Message(_)]
+        ));
+        assert!(matches!(
+            parse_command("bogus").as_slice(),
+            [Action::Message(_)]
+        ));
+        assert!(matches!(
+            parse_command("fit sideways").as_slice(),
+            [Action::Message(_)]
+        ));
+        assert!(matches!(
+            parse_command("zoom lots").as_slice(),
+            [Action::Message(_)]
+        ));
         assert!(parse_command("   ").is_empty());
     }
 

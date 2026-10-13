@@ -1,7 +1,11 @@
 //! Decoding and resizing. Nothing here depends on gpui, so it can run on any thread.
 
-use anyhow::{Result, bail};
-use image::{DynamicImage, RgbaImage, imageops::FilterType};
+use anyhow::{Context, Result, bail};
+use fast_image_resize::{
+    FilterType as ResizeFilter, PixelType, ResizeAlg, ResizeOptions, Resizer,
+    images::Image as FirImage,
+};
+use image::{DynamicImage, RgbaImage};
 
 /// Longest side of a stored cover thumbnail, in pixels.
 pub const COVER_MAX_W: u32 = 400;
@@ -35,28 +39,63 @@ pub struct Decoded {
 pub fn decode_fit_bgra(bytes: &[u8], max_w: u32, max_h: u32) -> Result<Decoded> {
     let img = decode(bytes)?;
     let (w, h) = (img.width(), img.height());
+    let alpha = img.color().has_alpha();
     let scale = (max_w as f32 / w as f32).min(max_h as f32 / h as f32);
 
-    let img = if scale < 1.0 {
+    let mut rgba = img.into_rgba8();
+    if scale < 1.0 {
         let nw = ((w as f32 * scale).round() as u32).max(1);
         let nh = ((h as f32 * scale).round() as u32).max(1);
-        img.resize_exact(nw, nh, FilterType::CatmullRom)
-    } else {
-        img
-    };
-
-    let mut rgba = img.into_rgba8();
+        rgba = resize_rgba(rgba, nw, nh, ResizeFilter::CatmullRom, alpha)?;
+    }
     for px in rgba.chunks_exact_mut(4) {
         px.swap(0, 2);
     }
-    Ok(Decoded { image: rgba, orig: (w, h) })
+    Ok(Decoded {
+        image: rgba,
+        orig: (w, h),
+    })
+}
+
+/// Resize to exactly `nw` x `nh` with a SIMD convolution filter.
+///
+/// This is the slowest step of showing a large scan (several times the JPEG decode itself with the
+/// `image` crate's resize), so it uses `fast_image_resize`, which does the same filtering several
+/// times faster. Alpha is only premultiplied when the image actually has transparency.
+fn resize_rgba(
+    rgba: RgbaImage,
+    nw: u32,
+    nh: u32,
+    filter: ResizeFilter,
+    alpha: bool,
+) -> Result<RgbaImage> {
+    let (w, h) = rgba.dimensions();
+    let src = FirImage::from_vec_u8(w, h, rgba.into_raw(), PixelType::U8x4)?;
+    let mut dst = FirImage::new(nw, nh, PixelType::U8x4);
+    let mut options = ResizeOptions::new().resize_alg(ResizeAlg::Convolution(filter));
+    options.mul_div_alpha = alpha;
+    Resizer::new().resize(&src, &mut dst, &options)?;
+    RgbaImage::from_raw(nw, nh, dst.into_vec()).context("resized buffer has the wrong size")
 }
 
 /// Encode a JPEG thumbnail that fits inside `max_w` x `max_h`, keeping the aspect ratio.
 pub fn make_cover_jpeg(bytes: &[u8], max_w: u32, max_h: u32) -> Result<Vec<u8>> {
     let img = decode(bytes)?;
-    let thumb = img.resize(max_w, max_h, FilterType::Lanczos3);
-    let rgb = DynamicImage::ImageRgb8(thumb.to_rgb8());
+    let (w, h) = (img.width(), img.height());
+    let alpha = img.color().has_alpha();
+    // Fit inside the box, keep the aspect ratio, never enlarge.
+    let scale = (max_w as f32 / w as f32)
+        .min(max_h as f32 / h as f32)
+        .min(1.0);
+    let nw = ((w as f32 * scale).round() as u32).max(1);
+    let nh = ((h as f32 * scale).round() as u32).max(1);
+    let thumb = if (nw, nh) == (w, h) {
+        img.into_rgba8()
+    } else {
+        resize_rgba(img.into_rgba8(), nw, nh, ResizeFilter::Lanczos3, alpha)?
+    };
+    let rgb = DynamicImage::ImageRgba8(thumb).to_rgb8();
+    let rgb = DynamicImage::ImageRgb8(rgb);
 
     let mut out = Vec::new();
     let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 88);
@@ -84,6 +123,83 @@ mod tests {
         assert_eq!(out.image.dimensions(), (50, 100));
         assert_eq!(out.orig, (400, 800));
         assert_eq!(out.image.get_pixel(0, 0).0, [30, 20, 10, 255]);
+    }
+
+    #[test]
+    fn resize_matches_the_image_crates_catmull_rom_closely() {
+        // a smooth gradient with some structure; both implementations must agree
+        let source = image::RgbImage::from_fn(900, 1350, |x, y| {
+            let stripes = if (x / 30 + y / 45) % 2 == 0 { 20 } else { 0 };
+            image::Rgb([
+                (x / 4) as u8,
+                (y / 6) as u8,
+                ((x + y) / 9) as u8 / 2 + stripes,
+            ])
+        });
+        let reference = DynamicImage::ImageRgb8(source.clone())
+            .resize_exact(300, 450, image::imageops::FilterType::CatmullRom)
+            .to_rgb8();
+        let fast = resize_rgba(
+            DynamicImage::ImageRgb8(source).into_rgba8(),
+            300,
+            450,
+            ResizeFilter::CatmullRom,
+            false,
+        )
+        .unwrap();
+        assert_eq!(fast.dimensions(), (300, 450));
+
+        let total: u64 = fast
+            .pixels()
+            .zip(reference.pixels())
+            .flat_map(|(a, b)| a.0[..3].iter().zip(b.0.iter()))
+            .map(|(a, b)| u64::from(a.abs_diff(*b)))
+            .sum();
+        let mean = total as f64 / (300.0 * 450.0 * 3.0);
+        assert!(mean < 1.5, "mean absolute difference {mean}");
+    }
+
+    #[test]
+    fn scaling_fits_the_box_and_keeps_the_aspect_ratio_for_awkward_sizes() {
+        for (w, h, max) in [
+            (1000, 1500, 500),
+            (999, 1501, 700),
+            (1200, 800, 640),
+            (3000, 4500, 1024),
+        ] {
+            let out = decode_fit_bgra(&png(w, h, Rgba([9, 8, 7, 255])), max, max).unwrap();
+            let (dw, dh) = out.image.dimensions();
+            assert!(dw <= max && dh <= max, "{w}x{h} -> {dw}x{dh}");
+            assert!(dw == max || dh == max, "uses the full box: {dw}x{dh}");
+            let (a, b) = (w as f32 / h as f32, dw as f32 / dh as f32);
+            assert!((a - b).abs() / a < 0.01, "aspect {a} vs {b}");
+            assert_eq!(out.orig, (w, h));
+        }
+    }
+
+    #[test]
+    fn transparency_survives_scaling() {
+        let bytes = png(400, 400, Rgba([200, 100, 50, 128]));
+        let out = decode_fit_bgra(&bytes, 100, 100).unwrap();
+        let px = out.image.get_pixel(50, 50).0;
+        assert!((i32::from(px[3]) - 128).abs() <= 1, "alpha {px:?}");
+        // BGRA order: blue and red swapped
+        assert!(
+            (i32::from(px[0]) - 50).abs() <= 2 && (i32::from(px[2]) - 200).abs() <= 2,
+            "{px:?}"
+        );
+    }
+
+    #[test]
+    fn small_covers_are_not_enlarged() {
+        let jpg = make_cover_jpeg(
+            &png(100, 150, Rgba([1, 2, 3, 255])),
+            COVER_MAX_W,
+            COVER_MAX_H,
+        )
+        .unwrap();
+        let back = image::load_from_memory(&jpg).unwrap();
+        assert_eq!((back.width(), back.height()), (100, 150));
     }
 
     #[test]

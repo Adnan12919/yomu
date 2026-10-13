@@ -138,12 +138,21 @@ pub fn clamp_opacity(value: f32) -> f32 {
     (value.clamp(OPACITY_MIN, OPACITY_MAX) * 100.0).round() / 100.0
 }
 
+/// Version of the library file format. Bumped when a stored default changes meaning.
+///
+/// * 1 (and files without a version): reading direction defaulted to right-to-left.
+/// * 2: reading direction defaults to left-to-right (Western comics); right-to-left is a preference.
+pub const LIBRARY_VERSION: u32 = 2;
+
 /// Preferences that carry over from book to book and between launches.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Settings {
-    /// Right-to-left reading order (manga).
+    /// Right-to-left reading order (manga). Off by default: pages run left to right.
     pub rtl: bool,
     pub fit: FitMode,
+    /// Slide between pages and glide when scrolling. Reduced-motion preferences of the desktop
+    /// switch this off regardless of the stored value.
+    pub animate: bool,
     /// Opacity of the window background, `OPACITY_MIN..=OPACITY_MAX`. Page images, covers and
     /// text always stay fully opaque; only the background behind them becomes see-through.
     pub opacity: f32,
@@ -151,7 +160,12 @@ pub struct Settings {
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { rtl: true, fit: FitMode::Page, opacity: OPACITY_MAX }
+        Self {
+            rtl: false,
+            fit: FitMode::Page,
+            animate: true,
+            opacity: OPACITY_MAX,
+        }
     }
 }
 
@@ -169,6 +183,9 @@ impl Settings {
         };
         if let Some(rtl) = object.get("rtl").and_then(|v| v.as_bool()) {
             settings.rtl = rtl;
+        }
+        if let Some(animate) = object.get("animate").and_then(|v| v.as_bool()) {
+            settings.animate = animate;
         }
         if let Some(fit) = object
             .get("fit")
@@ -191,15 +208,40 @@ where
     Ok(Settings::from_value(&value))
 }
 
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Library {
+    /// File format version; files from before versioning read as 0.
+    #[serde(default)]
+    version: u32,
     #[serde(default)]
     books: Vec<Book>,
     #[serde(default, deserialize_with = "lenient_settings")]
     settings: Settings,
 }
 
+impl Default for Library {
+    fn default() -> Self {
+        Self {
+            version: LIBRARY_VERSION,
+            books: Vec::new(),
+            settings: Settings::default(),
+        }
+    }
+}
+
 impl Library {
+    /// Bring a library written by an older version up to date.
+    fn migrate(&mut self) {
+        if self.version < 2 {
+            // Reading direction used to default to right-to-left and that default was written
+            // into every library file, so a stored `true` cannot be told apart from a deliberate
+            // choice. Move everyone to the new left-to-right default; manga readers switch it
+            // back once with `r` and it sticks from then on.
+            self.settings.rtl = false;
+        }
+        self.version = LIBRARY_VERSION;
+    }
+
     pub fn load(dirs: &DataDirs) -> Result<Self> {
         let file = dirs.library_file();
         let text = match fs::read_to_string(&file) {
@@ -209,6 +251,7 @@ impl Library {
         };
         match serde_json::from_str::<Library>(&text) {
             Ok(mut lib) => {
+                lib.migrate();
                 lib.sort();
                 Ok(lib)
             }
@@ -325,7 +368,11 @@ enum Candidate {
 /// and every folder that directly contains images becomes a book too.
 ///
 /// Slow (decodes a cover per book), so call it from a background thread.
-pub fn import_paths(paths: &[PathBuf], dirs: &DataDirs, existing: &HashSet<String>) -> ImportReport {
+pub fn import_paths(
+    paths: &[PathBuf],
+    dirs: &DataDirs,
+    existing: &HashSet<String>,
+) -> ImportReport {
     let mut report = ImportReport::default();
     let mut candidates = Vec::new();
 
@@ -413,7 +460,8 @@ fn build_book(path: &Path, kind: SourceKind, dirs: &DataDirs) -> Result<Book> {
         let Ok(bytes) = archive::read_page(path, kind, name) else {
             continue;
         };
-        if let Ok(jpeg) = imaging::make_cover_jpeg(&bytes, imaging::COVER_MAX_W, imaging::COVER_MAX_H)
+        if let Ok(jpeg) =
+            imaging::make_cover_jpeg(&bytes, imaging::COVER_MAX_W, imaging::COVER_MAX_H)
         {
             fs::write(dirs.cover(&id), jpeg).context("writing cover")?;
             cover_written = true;
@@ -460,7 +508,11 @@ fn title_for(path: &Path) -> String {
     };
     let cleaned = raw.replace('_', " ");
     let cleaned = cleaned.trim();
-    if cleaned.is_empty() { raw } else { cleaned.to_string() }
+    if cleaned.is_empty() {
+        raw
+    } else {
+        cleaned.to_string()
+    }
 }
 
 #[cfg(test)]
@@ -500,9 +552,12 @@ mod tests {
         let tmp = temp_dir("cbz");
         let dirs = DataDirs::at(tmp.join("data")).unwrap();
         let cbz = tmp.join("Blue_Period_v01.cbz");
-        write_cbz(&cbz, &["10.png", "2.png", "1.png", "__MACOSX/._1.png", "notes.txt"]);
+        write_cbz(
+            &cbz,
+            &["10.png", "2.png", "1.png", "__MACOSX/._1.png", "notes.txt"],
+        );
 
-        let report = import_paths(&[cbz.clone()], &dirs, &HashSet::new());
+        let report = import_paths(std::slice::from_ref(&cbz), &dirs, &HashSet::new());
         assert!(report.errors.is_empty(), "{:?}", report.errors);
         assert_eq!(report.added.len(), 1);
 
@@ -516,7 +571,11 @@ mod tests {
         let bytes = archive::read_page(&book.path, book.kind, &pages[0]).unwrap();
         assert!(!bytes.is_empty());
 
-        let again = import_paths(&[cbz], &dirs, &report.added.iter().map(|b| b.id.clone()).collect());
+        let again = import_paths(
+            &[cbz],
+            &dirs,
+            &report.added.iter().map(|b| b.id.clone()).collect(),
+        );
         assert_eq!(again.skipped, 1);
         assert!(again.added.is_empty());
     }
@@ -566,7 +625,8 @@ mod tests {
         book.marks.insert("a".into(), 3);
         assert!(lib.add(book.clone()));
         assert!(!lib.add(book));
-        lib.settings_mut().rtl = false;
+        lib.settings_mut().rtl = true;
+        lib.settings_mut().animate = false;
         lib.settings_mut().fit = FitMode::Width;
         lib.save(&dirs).unwrap();
 
@@ -574,7 +634,11 @@ mod tests {
         assert_eq!(loaded.books().len(), 1);
         assert_eq!(loaded.get("abc").unwrap().current_page, 9);
         assert_eq!(loaded.get("abc").unwrap().marks.get("a"), Some(&3));
-        assert!(!loaded.settings().rtl);
+        assert!(
+            loaded.settings().rtl,
+            "a deliberate right-to-left choice is kept"
+        );
+        assert!(!loaded.settings().animate);
         assert_eq!(loaded.settings().fit, FitMode::Width);
     }
 
@@ -586,7 +650,8 @@ mod tests {
         fs::write(dirs.library_file(), json).unwrap();
         let loaded = Library::load(&dirs).unwrap();
         assert_eq!(loaded.books().len(), 1);
-        assert!(loaded.settings().rtl);
+        assert!(!loaded.settings().rtl, "left to right is the default");
+        assert!(loaded.settings().animate);
         assert_eq!(loaded.settings().fit, FitMode::Page);
         assert!(loaded.get("x").unwrap().marks.is_empty());
     }
@@ -666,20 +731,56 @@ mod tests {
         assert_eq!(*loaded.settings(), Settings::default());
         assert!(!dirs.library_file().with_extension("json.corrupt").exists());
 
-        let json = r#"{"books":[],"settings":{"rtl":false,"fit":"Width","opacity":7.5}}"#;
+        let json = r#"{"version":2,"books":[],"settings":{"rtl":true,"animate":"yes","fit":"Width","opacity":7.5}}"#;
         fs::write(dirs.library_file(), json).unwrap();
         let loaded = Library::load(&dirs).unwrap();
-        assert!(!loaded.settings().rtl);
+        assert!(loaded.settings().rtl);
+        assert!(
+            loaded.settings().animate,
+            "a mistyped value falls back to the default"
+        );
         assert_eq!(loaded.settings().fit, FitMode::Width);
         assert_eq!(loaded.settings().opacity, OPACITY_MAX);
 
         let json = r#"{"books":[],"settings":{"opacity":0.1}}"#;
         fs::write(dirs.library_file(), json).unwrap();
-        assert_eq!(Library::load(&dirs).unwrap().settings().opacity, OPACITY_MIN);
+        assert_eq!(
+            Library::load(&dirs).unwrap().settings().opacity,
+            OPACITY_MIN
+        );
 
         let json = r#"{"books":[],"settings":[1,2,3]}"#;
         fs::write(dirs.library_file(), json).unwrap();
-        assert_eq!(*Library::load(&dirs).unwrap().settings(), Settings::default());
+        assert_eq!(
+            *Library::load(&dirs).unwrap().settings(),
+            Settings::default()
+        );
+    }
+
+    #[test]
+    fn reading_direction_default_moves_to_left_to_right_once() {
+        let tmp = temp_dir("direction");
+        let dirs = DataDirs::at(tmp.join("data")).unwrap();
+
+        // a file written by the old version: right-to-left was stored as the default
+        let old = r#"{"books":[],"settings":{"rtl":true,"fit":"Page","opacity":1.0}}"#;
+        fs::write(dirs.library_file(), old).unwrap();
+        let mut lib = Library::load(&dirs).unwrap();
+        assert!(!lib.settings().rtl, "migrated to the left-to-right default");
+
+        // choosing right-to-left afterwards is saved with the new version and survives reloads
+        lib.settings_mut().rtl = true;
+        lib.save(&dirs).unwrap();
+        let text = fs::read_to_string(dirs.library_file()).unwrap();
+        assert!(text.contains(&format!("\"version\": {LIBRARY_VERSION}")));
+        assert!(Library::load(&dirs).unwrap().settings().rtl);
+        assert!(Library::load(&dirs).unwrap().settings().rtl);
+
+        // a brand new library starts at the current version with left-to-right
+        let fresh = Library::default();
+        assert!(!fresh.settings().rtl);
+        fresh.save(&dirs).unwrap();
+        assert!(!Library::load(&dirs).unwrap().settings().rtl);
     }
 
     #[test]

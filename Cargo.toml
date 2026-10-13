@@ -1,6 +1,6 @@
 [package]
 name = "yomu"
-version = "0.1.0"
+version = "26.10.0"
 edition = "2024"
 rust-version = "1.89"
 description = "A minimal, GPU-accelerated, Wayland-native manga reader with a library"
@@ -20,6 +20,9 @@ anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 dirs = "6"
+# SIMD resampling for page and cover scaling (pure Rust, no C code): several times faster than the
+# image crate's resize, which was the slowest step of showing a large page.
+fast_image_resize = { version = "6", default-features = false, features = ["std"] }
 # Pure-Rust decoders only: no C libraries get linked for image or archive handling.
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif"] }
 zip = { version = "2", default-features = false, features = ["deflate"] }
@@ -33,6 +36,8 @@ codegen-units = 4
 strip = true
 
 # Image decoding is painfully slow at opt-level 0, so optimise just those crates in dev builds.
+[profile.dev.package.yomu]
+opt-level = 2
 [profile.dev.package.image]
 opt-level = 3
 [profile.dev.package.zune-jpeg]
@@ -52,3 +57,5 @@ opt-level = 3
 # because ENOATTR disappeared on Linux. This vendored copy fixes that single constant.
 [patch.crates-io]
 xattr = { path = "vendor/xattr" }
+# Drops the archived proc-macro-error2 from the dependency tree (see vendor/stacksafe-macro/Cargo.toml).
+stacksafe-macro = { path = "vendor/stacksafe-macro" }

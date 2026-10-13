@@ -39,7 +39,11 @@ impl Selection {
 
     /// Selected ids in library order (so bulk actions and messages are deterministic).
     pub fn in_order(&self, order: &[String]) -> Vec<String> {
-        order.iter().filter(|id| self.ids.contains(*id)).cloned().collect()
+        order
+            .iter()
+            .filter(|id| self.ids.contains(*id))
+            .cloned()
+            .collect()
     }
 
     pub fn toggle(&mut self, id: &str) {
@@ -108,7 +112,10 @@ mod tests {
     use super::*;
 
     fn order() -> Vec<String> {
-        ["a", "b", "c", "d", "e"].iter().map(|s| s.to_string()).collect()
+        ["a", "b", "c", "d", "e"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
     }
 
     fn selected(selection: &Selection) -> Vec<String> {
@@ -118,10 +125,16 @@ mod tests {
     #[test]
     fn plain_click_opens_until_something_is_selected() {
         let mut selection = Selection::new();
-        assert!(!selection.click(&order(), "b", false, false), "plain click opens");
+        assert!(
+            !selection.click(&order(), "b", false, false),
+            "plain click opens"
+        );
         assert!(selection.is_empty());
 
-        assert!(selection.click(&order(), "b", true, false), "ctrl+click selects");
+        assert!(
+            selection.click(&order(), "b", true, false),
+            "ctrl+click selects"
+        );
         assert_eq!(selected(&selection), vec!["b"]);
 
         // selection mode: plain clicks now toggle
@@ -130,8 +143,14 @@ mod tests {
         assert!(selection.click(&order(), "b", false, false));
         assert_eq!(selected(&selection), vec!["d"]);
         assert!(selection.click(&order(), "d", false, false));
-        assert!(selection.is_empty(), "deselecting the last book leaves selection mode");
-        assert!(!selection.click(&order(), "a", false, false), "plain click opens again");
+        assert!(
+            selection.is_empty(),
+            "deselecting the last book leaves selection mode"
+        );
+        assert!(
+            !selection.click(&order(), "a", false, false),
+            "plain click opens again"
+        );
     }
 
     #[test]
@@ -173,7 +192,11 @@ mod tests {
         selection.clear();
         assert!(selection.is_empty());
         selection.select_range(&order(), "c", false);
-        assert_eq!(selected(&selection), vec!["c"], "the anchor was cleared too");
+        assert_eq!(
+            selected(&selection),
+            vec!["c"],
+            "the anchor was cleared too"
+        );
     }
 
     #[test]
@@ -202,6 +225,9 @@ mod tests {
         let mut selection = Selection::new();
         selection.toggle("b");
         selection.select_range(&order(), "zzz", false);
-        assert!(selection.is_empty(), "a range to a book that does not exist selects nothing");
+        assert!(
+            selection.is_empty(),
+            "a range to a book that does not exist selects nothing"
+        );
     }
 }

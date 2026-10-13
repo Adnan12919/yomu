@@ -11,10 +11,10 @@ use std::{
 
 use anyhow::Result;
 use gpui::{
-    AnyElement, App, Application, Bounds, ClickEvent, Context, Corner, ExternalPaths,
-    FocusHandle, FontWeight, KeyBinding, KeyDownEvent, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, ObjectFit, PathPromptOptions, Pixels, Point, RenderImage, Rgba,
-    ScrollDelta, ScrollWheelEvent, SharedString, TitlebarOptions, Window, WindowBackgroundAppearance,
+    AnyElement, App, Application, Bounds, ClickEvent, Context, Corner, ExternalPaths, FocusHandle,
+    FontWeight, KeyBinding, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, ObjectFit, PathPromptOptions, Pixels, Point, RenderImage, Rgba, ScrollDelta,
+    ScrollWheelEvent, SharedString, TitlebarOptions, Window, WindowBackgroundAppearance,
     WindowBounds, WindowOptions, actions, anchored, canvas, deferred, div, img, prelude::*, px,
     relative, rgb, rgba, size,
 };
@@ -25,12 +25,23 @@ use yomu::{
     layout::{self, Arrive, FitMode, Viewport},
     library::{self, Book, DataDirs, Library, OPACITY_MAX, OPACITY_MIN, Settings},
     menu::{self, BookAction, Entry, Item},
+    motion::{self, PageTransition},
+    pagecache,
     selection::Selection,
     util::now_secs,
     vim::{self, Action, Amount, Dir, Vim},
 };
 
-actions!(yomu, [ToggleFullscreen, ImportFiles, ImportFolder, OpenSettings, Quit]);
+actions!(
+    yomu,
+    [
+        ToggleFullscreen,
+        ImportFiles,
+        ImportFolder,
+        OpenSettings,
+        Quit
+    ]
+);
 
 // Palette
 const BG: u32 = 0x0f0f11;
@@ -47,8 +58,8 @@ const CARD_H: f32 = 270.0;
 
 /// How far `j`/`k`/`h`/`l` scroll, in logical pixels.
 const LINE_STEP: f32 = 64.0;
-/// A wheel notch is reported as this many pixels.
-const WHEEL_LINE: f32 = 48.0;
+/// A wheel notch scrolls this many pixels (and is one zoom step with Ctrl).
+const WHEEL_LINE: f32 = 96.0;
 /// Slack when deciding whether the page is already scrolled to its edge.
 const EDGE_EPS: f32 = 1.0;
 /// Mouse travel before a press counts as a drag instead of a click.
@@ -86,6 +97,15 @@ struct Page {
     orig: (u32, u32),
     /// Decode tier (longest side in pixels) this image was made at.
     tier: u32,
+    /// Memory the decoded pixels take (BGRA), for the cache budget.
+    bytes: u64,
+}
+
+/// The page that is sliding out during a page turn, frozen as it was when the turn began.
+struct Outgoing {
+    image: Arc<RenderImage>,
+    display: (f32, f32),
+    origin: (f32, f32),
 }
 
 #[derive(Clone, Copy)]
@@ -105,16 +125,32 @@ struct Reader {
     page: usize,
     total: usize,
 
-    /// Right-to-left reading order (the manga default).
+    /// Right-to-left reading order (manga). Off by default: pages run left to right.
     rtl: bool,
     fit: FitMode,
     /// Multiplier on top of the fit size; `1.0` is exactly the fit.
     zoom: f32,
-    /// How far the page is scrolled from its top-left corner.
+    /// How far the page is scrolled from its top-left corner (what is drawn this frame).
     off: (f32, f32),
+    /// Where `off` is gliding to. Equal to `off` when nothing is moving. Key and wheel-notch
+    /// scrolling move this; edge checks and repeated presses accumulate on it, not on `off`.
+    scroll_target: (f32, f32),
     /// Scroll position to apply once the new page's size is known.
     arrive: Option<Arrive>,
     viewport: Viewport,
+
+    /// The slide between pages, if one is running. At most one exists (no queue); a page turn
+    /// that arrives mid-slide replaces it. Purely visual: `page` and the saved progress already
+    /// point at the new page the moment you turn.
+    transition: Option<PageTransition>,
+    outgoing: Option<Outgoing>,
+    /// The viewport the slide started in; resizing the window cancels it.
+    transition_viewport: Viewport,
+    /// Whether page turns and scrolling animate (the setting, unless the desktop asks for
+    /// reduced motion).
+    animate: bool,
+    /// Textures no longer shown, to be freed by the window on its next frame.
+    released: Vec<Arc<RenderImage>>,
 
     images: HashMap<usize, Page>,
     pending: HashSet<usize>,
@@ -142,8 +178,14 @@ impl Reader {
             fit: settings.fit,
             zoom: 1.0,
             off: (0.0, 0.0),
+            scroll_target: (0.0, 0.0),
             arrive: Some(Arrive::Start),
             viewport: Viewport::EMPTY,
+            transition: None,
+            outgoing: None,
+            transition_viewport: Viewport::EMPTY,
+            animate: settings.animate,
+            released: Vec::new(),
             images: HashMap::new(),
             pending: HashSet::new(),
             failed: HashMap::new(),
@@ -171,10 +213,122 @@ impl Reader {
         let display = layout::display_size(self.fit, self.zoom, orig, vp);
         let max = layout::max_offset(display, vp);
         if let Some(arrive) = self.arrive.take() {
-            self.off = layout::arrival_offset(arrive, self.rtl, max);
+            self.set_scroll(layout::arrival_offset(arrive, self.rtl, max));
         }
         self.off = layout::clamp_offset(self.off, display, vp);
+        self.scroll_target = layout::clamp_offset(self.scroll_target, display, vp);
         Some(display)
+    }
+
+    /// Jump the scroll position (no glide).
+    fn set_scroll(&mut self, off: (f32, f32)) {
+        self.off = off;
+        self.scroll_target = off;
+    }
+
+    /// Hand a texture that is no longer drawn to the window to free, unless the page cache
+    /// still holds it.
+    fn release(&mut self, image: Arc<RenderImage>) {
+        if !self
+            .images
+            .values()
+            .any(|page| Arc::ptr_eq(&page.image, &image))
+        {
+            self.released.push(image);
+        }
+    }
+
+    fn cancel_transition(&mut self) {
+        self.transition = None;
+        if let Some(outgoing) = self.outgoing.take() {
+            self.release(outgoing.image);
+        }
+    }
+
+    /// Start the slide for a page turn. Call *before* `page` changes: the page on screen right
+    /// now is what slides out.
+    ///
+    /// No slide is started (and any running one is dropped) when animations are off, when the
+    /// page on screen is not decoded yet, or when the window has no size. If a slide is already
+    /// running it is replaced, never queued: the page that was sliding in takes over as the
+    /// outgoing page from exactly where it is, so rapid turns stay smooth and cannot fall behind.
+    fn begin_transition(&mut self, forward: bool, enabled: bool) {
+        let vp = self.viewport;
+        let on_screen = self
+            .current()
+            .map(|page| (page.image.clone(), Self::orig_of(page)));
+        let Some((image, orig)) =
+            on_screen.filter(|_| enabled && vp.width >= 1.0 && vp.height >= 1.0)
+        else {
+            self.cancel_transition();
+            return;
+        };
+
+        let travel = motion::travel(forward, self.rtl);
+        let display = layout::display_size(self.fit, self.zoom, orig, &vp);
+        let origin = layout::origin(self.off, display, &vp);
+        let next = match self.transition {
+            Some(running) => running.interrupted_by(travel),
+            None => PageTransition::starting(travel),
+        };
+        if let Some(previous) = self.outgoing.take() {
+            self.release(previous.image);
+        }
+        self.outgoing = Some(Outgoing {
+            image,
+            display,
+            origin,
+        });
+        self.transition = Some(next);
+        self.transition_viewport = vp;
+    }
+
+    /// Advance the slide and the scroll glide by `dt` seconds of real time. Returns whether
+    /// another frame is needed; when it returns `false` nothing is moving and the window can
+    /// stay idle.
+    fn advance_animations(&mut self, dt: f32, vp: &Viewport) -> bool {
+        let dt = motion::clamp_frame_dt(dt);
+
+        let resized = vp.width != self.transition_viewport.width
+            || vp.height != self.transition_viewport.height;
+        if self.transition.is_some() && (resized || self.failed.contains_key(&self.page)) {
+            self.cancel_transition();
+        }
+        if !self.animate {
+            self.cancel_transition();
+            self.off = self.scroll_target;
+            return false;
+        }
+
+        let mut animating = false;
+        if let Some(mut transition) = self.transition {
+            // The clock only runs once the new page can be shown, so a slow decode keeps the old
+            // page on screen instead of showing a blank.
+            if self.current().is_some() {
+                transition.advance(dt);
+                if transition.is_done() {
+                    self.transition = None;
+                    if let Some(outgoing) = self.outgoing.take() {
+                        self.release(outgoing.image);
+                    }
+                } else {
+                    self.transition = Some(transition);
+                    animating = true;
+                }
+            }
+        }
+
+        let (off, moving) = motion::step_scroll(self.off, self.scroll_target, dt);
+        self.off = off;
+        animating || moving
+    }
+
+    /// Every texture this reader still owns, for freeing when the book closes.
+    fn into_images(self) -> Vec<Arc<RenderImage>> {
+        let mut images: Vec<_> = self.images.into_values().map(|page| page.image).collect();
+        images.extend(self.outgoing.map(|outgoing| outgoing.image));
+        images.extend(self.released);
+        images
     }
 }
 
@@ -236,6 +390,13 @@ struct Yomu {
     hud: Option<SharedString>,
     hud_seq: u64,
     importing: bool,
+    /// The desktop asks for reduced motion (see `motion::detect_reduced_motion`).
+    reduce_motion: bool,
+    /// When the previous animated frame was drawn; `None` while nothing is animating.
+    last_frame: Option<Instant>,
+    /// Tests drive the animation clock by hand instead of using real time.
+    #[cfg(test)]
+    frame_dt: Option<f32>,
     overlay: Option<Overlay>,
     overlay_closed_at: Option<Instant>,
     /// Books picked for bulk actions in the library.
@@ -255,9 +416,12 @@ impl Yomu {
         let dirs = Arc::new(dirs);
         let (library, toast) = match Library::load(&dirs) {
             Ok(library) => (library, None),
-            Err(err) => (Library::default(), Some(SharedString::from(format!("{err:#}")))),
+            Err(err) => (
+                Library::default(),
+                Some(SharedString::from(format!("{err:#}"))),
+            ),
         };
-        Self {
+        let state = Self {
             focus_handle: cx.focus_handle(),
             dirs,
             library,
@@ -268,12 +432,62 @@ impl Yomu {
             hud: None,
             hud_seq: 0,
             importing: false,
+            reduce_motion: false,
+            last_frame: None,
+            #[cfg(test)]
+            frame_dt: None,
             overlay: None,
             overlay_closed_at: None,
             selection: Selection::new(),
-            slider: Slider { bounds: Rc::new(Cell::new(None)), dragging: false },
+            slider: Slider {
+                bounds: Rc::new(Cell::new(None)),
+                dragging: false,
+            },
             applied_opaque: None,
+        };
+
+        // Asking the desktop about reduced motion can take a moment (it may spawn `gsettings`),
+        // so do it off the UI thread. Tests skip it to stay independent of the machine.
+        #[cfg(not(test))]
+        cx.spawn(async move |this, cx| {
+            let reduce = cx
+                .background_executor()
+                .spawn(async { motion::detect_reduced_motion() })
+                .await;
+            this.update(cx, |this, cx| {
+                this.reduce_motion = reduce;
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+
+        state
+    }
+
+    /// Whether page turns and scrolling should animate right now.
+    fn animations_enabled(&self) -> bool {
+        self.library.settings().animate && !self.reduce_motion
+    }
+
+    /// An input just started an animation: start the frame clock now so the first frame already
+    /// accounts for the input-to-frame latency.
+    fn wake(&mut self) {
+        if self.last_frame.is_none() {
+            self.last_frame = Some(Instant::now());
         }
+    }
+
+    /// Seconds since the previous animated frame.
+    fn frame_delta(&self, now: Instant) -> f32 {
+        #[cfg(test)]
+        {
+            if let Some(dt) = self.frame_dt {
+                return dt;
+            }
+        }
+        self.last_frame
+            .map_or(0.0, |previous| now.duration_since(previous).as_secs_f32())
     }
 
     // ------------------------------------------------------------------------------------
@@ -311,7 +525,9 @@ impl Yomu {
         self.hud = Some(message.into());
         cx.notify();
         cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(Duration::from_secs(HUD_SECS)).await;
+            cx.background_executor()
+                .timer(Duration::from_secs(HUD_SECS))
+                .await;
             this.update(cx, |this, cx| {
                 if this.hud_seq == seq {
                     this.hud = None;
@@ -372,16 +588,22 @@ impl Yomu {
     }
 
     fn menu_hover(&mut self, ix: usize, cx: &mut Context<Self>) {
-        if let Some(Overlay::Menu(menu)) = self.overlay.as_mut() {
-            if menu.selected != Some(ix) {
-                menu.selected = Some(ix);
-                cx.notify();
-            }
+        if let Some(Overlay::Menu(menu)) = self.overlay.as_mut()
+            && menu.selected != Some(ix)
+        {
+            menu.selected = Some(ix);
+            cx.notify();
         }
     }
 
     /// Run a menu action, asking first if it would throw away progress.
-    fn run_book_action(&mut self, action: BookAction, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+    fn run_book_action(
+        &mut self,
+        action: BookAction,
+        id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         // Bulk actions work on the selection, not on the book that was right-clicked.
         match action {
             BookAction::RemoveSelected => {
@@ -414,7 +636,13 @@ impl Yomu {
         self.perform_book_action(action, id, window, cx);
     }
 
-    fn perform_book_action(&mut self, action: BookAction, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+    fn perform_book_action(
+        &mut self,
+        action: BookAction,
+        id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.dismiss();
         let Some(title) = self.library.get(id).map(|book| book.title.clone()) else {
             cx.notify();
@@ -498,8 +726,9 @@ impl Yomu {
         }
         self.overlay = Some(Overlay::Confirm(ConfirmDialog {
             title: "Reset settings?".into(),
-            message: "Background opacity, reading direction and page fit go back to their defaults."
-                .into(),
+            message:
+                "Background opacity, reading direction and page fit go back to their defaults."
+                    .into(),
             confirm_label: "Reset",
             action: ConfirmAction::ResetSettings,
         }));
@@ -537,7 +766,11 @@ impl Yomu {
         let left = f32::from(bounds.origin.x) + KNOB / 2.0;
         let span = (f32::from(bounds.size.width) - KNOB).max(1.0);
         let fraction = ((x - left) / span).clamp(0.0, 1.0);
-        self.set_opacity(OPACITY_MIN + fraction * (OPACITY_MAX - OPACITY_MIN), false, cx);
+        self.set_opacity(
+            OPACITY_MIN + fraction * (OPACITY_MAX - OPACITY_MIN),
+            false,
+            cx,
+        );
     }
 
     /// Save once when a drag ends instead of on every mouse move.
@@ -563,7 +796,9 @@ impl Yomu {
             WindowBackgroundAppearance::Transparent
         };
         // Reconfiguring the surface mid-draw is not safe, so do it right after this frame.
-        window.defer(cx, move |window, _| window.set_background_appearance(appearance));
+        window.defer(cx, move |window, _| {
+            window.set_background_appearance(appearance)
+        });
     }
 
     fn on_overlay_key(&mut self, token: &str, window: &mut Window, cx: &mut Context<Self>) {
@@ -612,8 +847,12 @@ impl Yomu {
                 let current = self.library.settings().opacity;
                 match token {
                     "escape" | "enter" | "q" => self.close_overlay(cx),
-                    "left" | "h" | "down" | "j" => self.set_opacity(current - OPACITY_STEP, true, cx),
-                    "right" | "l" | "up" | "k" => self.set_opacity(current + OPACITY_STEP, true, cx),
+                    "left" | "h" | "down" | "j" => {
+                        self.set_opacity(current - OPACITY_STEP, true, cx)
+                    }
+                    "right" | "l" | "up" | "k" => {
+                        self.set_opacity(current + OPACITY_STEP, true, cx)
+                    }
                     "home" => self.set_opacity(OPACITY_MIN, true, cx),
                     "end" => self.set_opacity(OPACITY_MAX, true, cx),
                     _ => {}
@@ -639,11 +878,13 @@ impl Yomu {
         });
         cx.spawn(async move |this, cx| match rx.await {
             Ok(Ok(Some(paths))) => {
-                this.update(cx, |this, cx| this.import_paths(paths, cx)).ok();
+                this.update(cx, |this, cx| this.import_paths(paths, cx))
+                    .ok();
             }
             Ok(Err(err)) => {
                 let message = format!("{err:#}");
-                this.update(cx, |this, cx| this.show_toast(message, cx)).ok();
+                this.update(cx, |this, cx| this.show_toast(message, cx))
+                    .ok();
             }
             _ => {}
         })
@@ -695,7 +936,11 @@ impl Yomu {
 
     /// Book ids in library order.
     fn library_order(&self) -> Vec<String> {
-        self.library.books().iter().map(|book| book.id.clone()).collect()
+        self.library
+            .books()
+            .iter()
+            .map(|book| book.id.clone())
+            .collect()
     }
 
     fn selected_ids(&self) -> Vec<String> {
@@ -835,7 +1080,12 @@ impl Yomu {
         cx.notify();
     }
 
-    fn pages_listed(&mut self, book_id: String, result: Result<Vec<String>>, cx: &mut Context<Self>) {
+    fn pages_listed(
+        &mut self,
+        book_id: String,
+        result: Result<Vec<String>>,
+        cx: &mut Context<Self>,
+    ) {
         let Some(reader) = self.reader.as_mut() else {
             return;
         };
@@ -862,9 +1112,9 @@ impl Yomu {
 
     fn close_book(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(reader) = self.reader.take() {
-            self.garbage
-                .extend(reader.images.into_values().map(|page| page.image));
+            self.garbage.extend(reader.into_images());
         }
+        self.last_frame = None;
         self.hud = None;
         window.set_window_title("yomu");
         window.focus(&self.focus_handle);
@@ -877,6 +1127,7 @@ impl Yomu {
     // ------------------------------------------------------------------------------------
 
     fn goto_page(&mut self, target: usize, arrive: Arrive, cx: &mut Context<Self>) {
+        let animate = self.animations_enabled();
         let Some(reader) = self.reader.as_mut() else {
             return;
         };
@@ -887,6 +1138,8 @@ impl Yomu {
         if target == reader.page {
             return;
         }
+        // The reading position changes immediately; the slide is only a visual that catches up.
+        reader.begin_transition(target > reader.page, animate);
         reader.page = target;
         reader.arrive = Some(arrive);
         reader.drag = None;
@@ -897,6 +1150,7 @@ impl Yomu {
             book.last_read = Some(now_secs());
         }
         self.save_library();
+        self.wake();
         cx.notify();
     }
 
@@ -940,7 +1194,14 @@ impl Yomu {
 
     /// `j`/`k`/`h`/`l`/space/etc. Scrolls the page; when the page cannot scroll any further in
     /// that direction (or does not overflow at all) it turns the page instead.
-    fn scroll(&mut self, dir: Dir, amount: Amount, count: usize, vp: Viewport, cx: &mut Context<Self>) {
+    fn scroll(
+        &mut self,
+        dir: Dir,
+        amount: Amount,
+        count: usize,
+        vp: Viewport,
+        cx: &mut Context<Self>,
+    ) {
         let count = count.max(1);
         let Some(reader) = self.reader.as_mut() else {
             return;
@@ -951,16 +1212,26 @@ impl Yomu {
         let max = layout::max_offset(display, &vp);
         let vertical = matches!(dir, Dir::Up | Dir::Down);
         let positive = matches!(dir, Dir::Down | Dir::Right);
+        // Edge checks and repeated presses work on where the scroll is *heading*, so pressing
+        // `j` several times quickly accumulates instead of restarting from the glide's position.
         let (axis_max, view, current) = if vertical {
-            (max.1, vp.height, reader.off.1)
+            (max.1, vp.height, reader.scroll_target.1)
         } else {
-            (max.0, vp.width, reader.off.0)
+            (max.0, vp.width, reader.scroll_target.0)
         };
 
         // Which way a page turn goes when the page cannot scroll: down is forward, and
         // left/right depend on the reading direction.
-        let turn_forward = if vertical { positive } else { positive != reader.rtl };
-        let arrive = if turn_forward { Arrive::Start } else { Arrive::End };
+        let turn_forward = if vertical {
+            positive
+        } else {
+            positive != reader.rtl
+        };
+        let arrive = if turn_forward {
+            Arrive::Start
+        } else {
+            Arrive::End
+        };
 
         if axis_max <= EDGE_EPS {
             self.turn_by(turn_forward, count, arrive, cx);
@@ -984,10 +1255,11 @@ impl Yomu {
         let delta = step * count as f32 * if positive { 1.0 } else { -1.0 };
         let target = (current + delta).clamp(0.0, axis_max);
         if vertical {
-            reader.off.1 = target;
+            reader.scroll_target.1 = target;
         } else {
-            reader.off.0 = target;
+            reader.scroll_target.0 = target;
         }
+        self.wake();
         cx.notify();
     }
 
@@ -999,7 +1271,8 @@ impl Yomu {
             return;
         };
         let max = layout::max_offset(display, &vp);
-        reader.off.1 = max.1 * fraction;
+        reader.scroll_target.1 = max.1 * fraction;
+        self.wake();
         cx.notify();
     }
 
@@ -1018,9 +1291,15 @@ impl Yomu {
             let old_origin = layout::origin(reader.off, old_display, &vp);
             let new_display = layout::display_size(reader.fit, zoom, orig, &vp);
             let off = layout::zoom_anchor_offset(old_origin, old_display, new_display, anchor);
+            // Zooming is immediate (and ends any slide, whose frozen page would no longer fit).
+            reader.cancel_transition();
             reader.zoom = zoom;
-            reader.off = layout::clamp_offset(off, new_display, &vp);
-            format!("{} · {}%", reader.fit.label(), (zoom * 100.0).round() as i32)
+            reader.set_scroll(layout::clamp_offset(off, new_display, &vp));
+            format!(
+                "{} · {}%",
+                reader.fit.label(),
+                (zoom * 100.0).round() as i32
+            )
         };
         self.show_hud(message, cx);
     }
@@ -1036,6 +1315,7 @@ impl Yomu {
         let Some(reader) = self.reader.as_mut() else {
             return;
         };
+        reader.cancel_transition();
         reader.fit = mode;
         reader.zoom = 1.0;
         reader.arrive = Some(Arrive::Start);
@@ -1051,7 +1331,14 @@ impl Yomu {
         reader.rtl = rtl;
         self.library.settings_mut().rtl = rtl;
         self.save_library();
-        self.show_hud(if rtl { "right to left" } else { "left to right" }, cx);
+        self.show_hud(
+            if rtl {
+                "right to left"
+            } else {
+                "left to right"
+            },
+            cx,
+        );
     }
 
     fn on_wheel(
@@ -1080,15 +1367,20 @@ impl Yomu {
         let max = layout::max_offset(display, &vp);
         if max.1 > EDGE_EPS {
             // Wheel down gives a negative dy and should move further down the page.
-            let at_bottom = reader.off.1 >= max.1 - EDGE_EPS;
-            let at_top = reader.off.1 <= EDGE_EPS;
+            let at_bottom = reader.scroll_target.1 >= max.1 - EDGE_EPS;
+            let at_top = reader.scroll_target.1 <= EDGE_EPS;
             if discrete && ((dy < 0.0 && at_bottom) || (dy > 0.0 && at_top)) {
                 let forward = dy < 0.0;
                 let arrive = if forward { Arrive::Start } else { Arrive::End };
                 self.turn_by(forward, 1, arrive, cx);
                 return;
             }
-            reader.off.1 = (reader.off.1 - dy).clamp(0.0, max.1);
+            let target = (reader.scroll_target.1 - dy).clamp(0.0, max.1);
+            reader.scroll_target.1 = target;
+            if !discrete {
+                // Touchpads already send a smooth stream of small deltas: follow them 1:1.
+                reader.off.1 = target;
+            }
         } else if discrete && dy != 0.0 {
             let forward = dy < 0.0;
             let arrive = if forward { Arrive::Start } else { Arrive::End };
@@ -1096,15 +1388,24 @@ impl Yomu {
             return;
         }
         if max.0 > EDGE_EPS {
-            reader.off.0 = (reader.off.0 - dx).clamp(0.0, max.0);
+            let target = (reader.scroll_target.0 - dx).clamp(0.0, max.0);
+            reader.scroll_target.0 = target;
+            if !discrete {
+                reader.off.0 = target;
+            }
         }
+        self.wake();
         cx.notify();
     }
 
     fn drag_start(&mut self, at: (f32, f32)) {
         if let Some(reader) = self.reader.as_mut() {
             let off0 = reader.off;
-            reader.drag = Some(Drag { start: at, off0, moved: false });
+            reader.drag = Some(Drag {
+                start: at,
+                off0,
+                moved: false,
+            });
         }
     }
 
@@ -1126,8 +1427,15 @@ impl Yomu {
         let Some(display) = reader.settle(&vp) else {
             return;
         };
-        reader.drag = Some(Drag { moved: true, ..drag });
-        reader.off = layout::clamp_offset((drag.off0.0 - dx, drag.off0.1 - dy), display, &vp);
+        reader.drag = Some(Drag {
+            moved: true,
+            ..drag
+        });
+        reader.set_scroll(layout::clamp_offset(
+            (drag.off0.0 - dx, drag.off0.1 - dy),
+            display,
+            &vp,
+        ));
         cx.notify();
     }
 
@@ -1203,8 +1511,12 @@ impl Yomu {
             Action::GotoPage(n) => self.jump_to(n.saturating_sub(1), cx),
             Action::FirstPage => self.jump_to(0, cx),
             Action::LastPage => self.jump_to(usize::MAX, cx),
-            Action::ZoomIn(n) => self.zoom_by(layout::ZOOM_STEP.powi(n.min(64) as i32), center, vp, cx),
-            Action::ZoomOut(n) => self.zoom_by(layout::ZOOM_STEP.powi(-(n.min(64) as i32)), center, vp, cx),
+            Action::ZoomIn(n) => {
+                self.zoom_by(layout::ZOOM_STEP.powi(n.min(64) as i32), center, vp, cx)
+            }
+            Action::ZoomOut(n) => {
+                self.zoom_by(layout::ZOOM_STEP.powi(-(n.min(64) as i32)), center, vp, cx)
+            }
             Action::ZoomReset => self.zoom_to(1.0, center, vp, cx),
             Action::ZoomSet(zoom) => self.zoom_to(zoom, center, vp, cx),
             Action::Fit(mode) => self.set_fit(mode, cx),
@@ -1217,7 +1529,8 @@ impl Yomu {
             Action::ScrollCenter => self.scroll_vertical_to(0.5, vp, cx),
             Action::ScrollBottom => self.scroll_vertical_to(1.0, vp, cx),
             Action::SetMark(key) => {
-                let Some((id, page)) = self.reader.as_ref().map(|r| (r.book_id.clone(), r.page)) else {
+                let Some((id, page)) = self.reader.as_ref().map(|r| (r.book_id.clone(), r.page))
+                else {
                     return;
                 };
                 if let Some(book) = self.library.get_mut(&id) {
@@ -1257,6 +1570,19 @@ impl Yomu {
                 }
             }
             Action::SetDirection { rtl } => self.set_direction(rtl, cx),
+            Action::SetAnimations(value) => {
+                let enabled = value.unwrap_or(!self.library.settings().animate);
+                self.library.settings_mut().animate = enabled;
+                self.save_library();
+                let message = match (enabled, self.reduce_motion) {
+                    (true, true) => {
+                        "animations on (the desktop asks for reduced motion, so they stay off)"
+                    }
+                    (true, false) => "animations on",
+                    (false, _) => "animations off",
+                };
+                self.show_hud(message, cx);
+            }
             Action::ToggleInfo => {
                 if let Some(reader) = self.reader.as_mut() {
                     reader.show_info = !reader.show_info;
@@ -1283,39 +1609,56 @@ impl Yomu {
 
     /// Called every render: settles the scroll position, frees far-away pages and decodes the
     /// current and next pages at the resolution the current zoom needs.
-    fn sync_reader(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn sync_reader(&mut self, window: &mut Window, cx: &mut Context<Self>, dt: f32) -> bool {
         let vp = viewport_of(window);
+        let animate = self.animations_enabled();
 
-        let wanted: Vec<(usize, u32)> = {
+        let (wanted, animating): (Vec<(usize, u32)>, bool) = {
             let Some(reader) = self.reader.as_mut() else {
-                return;
+                return false;
             };
             reader.viewport = vp;
+            reader.animate = animate;
             let Some(pages) = reader.pages.clone() else {
-                return;
+                return false;
             };
             reader.settle(&vp);
+            let animating = reader.advance_animations(dt, &vp);
 
-            let low = reader.page.saturating_sub(2);
-            let high = reader.page + 4;
-            let stale: Vec<usize> = reader
+            // Keep a bounded window of decoded pages around the current one, and stay under the
+            // memory budget even with very large pages.
+            let entries: Vec<pagecache::Entry> = reader
                 .images
-                .keys()
-                .copied()
-                .filter(|ix| *ix < low || *ix > high)
+                .iter()
+                .map(|(index, page)| pagecache::Entry {
+                    index: *index,
+                    bytes: page.bytes,
+                })
                 .collect();
-            for ix in stale {
+            for ix in pagecache::plan_eviction(&entries, reader.page, pagecache::BUDGET_BYTES) {
                 if let Some(page) = reader.images.remove(&ix) {
-                    let _ = window.drop_image(page.image);
+                    // A page that is still sliding out is freed when its slide ends instead.
+                    let leaving = reader
+                        .outgoing
+                        .as_ref()
+                        .is_some_and(|outgoing| Arc::ptr_eq(&outgoing.image, &page.image));
+                    if !leaving {
+                        let _ = window.drop_image(page.image);
+                    }
                 }
             }
 
             // The current page needs enough pixels for the current zoom; its neighbours only
-            // for zoom 1, since a page turn resets the view anyway.
+            // for zoom 1, since a page turn keeps the fit mode but you start unzoomed there.
             let long_side = |display: (f32, f32)| display.0.max(display.1) * vp.scale;
             let (current_tier, neighbour_tier) = match reader.current().map(Reader::orig_of) {
                 Some(orig) => (
-                    layout::tier_for(long_side(layout::display_size(reader.fit, reader.zoom, orig, &vp))),
+                    layout::tier_for(long_side(layout::display_size(
+                        reader.fit,
+                        reader.zoom,
+                        orig,
+                        &vp,
+                    ))),
                     layout::tier_for(long_side(layout::display_size(reader.fit, 1.0, orig, &vp))),
                 ),
                 None => {
@@ -1324,23 +1667,30 @@ impl Yomu {
                 }
             };
 
-            let current = reader.page as isize;
-            [0isize, 1, 2, -1, 3, 4]
-                .iter()
-                .filter_map(|delta| {
-                    let ix = current + delta;
-                    if ix < 0 || ix as usize >= pages.len() {
-                        return None;
-                    }
-                    let tier = if *delta == 0 { current_tier } else { neighbour_tier };
-                    Some((ix as usize, tier))
+            let wanted = pagecache::prefetch_order(reader.page, pages.len())
+                .into_iter()
+                .map(|ix| {
+                    (
+                        ix,
+                        if ix == reader.page {
+                            current_tier
+                        } else {
+                            neighbour_tier
+                        },
+                    )
                 })
-                .collect()
+                .collect();
+            (wanted, animating)
         };
 
+        // Textures released by finished slides are freed on the next frame.
+        if let Some(reader) = self.reader.as_mut() {
+            self.garbage.append(&mut reader.released);
+        }
         for (ix, tier) in wanted {
             self.request_page(ix, tier, cx);
         }
+        animating
     }
 
     fn request_page(&mut self, ix: usize, tier: u32, cx: &mut Context<Self>) {
@@ -1366,16 +1716,20 @@ impl Yomu {
         let task = cx.background_executor().spawn(async move {
             let bytes = archive::read_page(&path, kind, &name)?;
             let decoded = imaging::decode_fit_bgra(&bytes, tier, tier)?;
+            let (width, height) = decoded.image.dimensions();
             anyhow::Ok((
                 Arc::new(RenderImage::new(vec![Frame::new(decoded.image)])),
                 decoded.orig,
+                u64::from(width) * u64::from(height) * 4,
             ))
         });
 
         cx.spawn(async move |this, cx| {
             let result = task.await;
-            this.update(cx, |this, cx| this.page_decoded(book_id, ix, tier, result, cx))
-                .ok();
+            this.update(cx, |this, cx| {
+                this.page_decoded(book_id, ix, tier, result, cx)
+            })
+            .ok();
         })
         .detach();
     }
@@ -1385,7 +1739,7 @@ impl Yomu {
         book_id: String,
         ix: usize,
         tier: u32,
-        result: Result<(Arc<RenderImage>, (u32, u32))>,
+        result: Result<(Arc<RenderImage>, (u32, u32), u64)>,
         cx: &mut Context<Self>,
     ) {
         let Some(reader) = self.reader.as_mut() else {
@@ -1396,8 +1750,16 @@ impl Yomu {
         }
         reader.pending.remove(&ix);
         match result {
-            Ok((image, orig)) => {
-                if let Some(old) = reader.images.insert(ix, Page { image, orig, tier }) {
+            Ok((image, orig, bytes)) => {
+                if let Some(old) = reader.images.insert(
+                    ix,
+                    Page {
+                        image,
+                        orig,
+                        tier,
+                        bytes,
+                    },
+                ) {
                     self.garbage.push(old.image);
                 }
             }
@@ -1459,8 +1821,12 @@ impl Yomu {
             .shadow_lg()
             .text_sm()
             .text_color(rgb(TEXT))
-            .on_mouse_down(MouseButton::Left, |_: &MouseDownEvent, _, cx| cx.stop_propagation())
-            .on_mouse_down(MouseButton::Right, |_: &MouseDownEvent, _, cx| cx.stop_propagation());
+            .on_mouse_down(MouseButton::Left, |_: &MouseDownEvent, _, cx| {
+                cx.stop_propagation()
+            })
+            .on_mouse_down(MouseButton::Right, |_: &MouseDownEvent, _, cx| {
+                cx.stop_propagation()
+            });
 
         for (ix, entry) in menu.entries.iter().enumerate() {
             list = match entry {
@@ -1501,7 +1867,13 @@ impl Yomu {
         .into_any_element()
     }
 
-    fn menu_item(&self, menu: &BookMenu, ix: usize, item: &Item, cx: &mut Context<Self>) -> AnyElement {
+    fn menu_item(
+        &self,
+        menu: &BookMenu,
+        ix: usize,
+        item: &Item,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let base = div()
             .id(SharedString::from(format!("menu-item-{ix}")))
             .h(px(28.))
@@ -1520,7 +1892,9 @@ impl Yomu {
         base.text_color(rgb(if item.danger { ACCENT } else { TEXT }))
             .cursor_pointer()
             .when(menu.selected == Some(ix), |row| row.bg(rgb(SURFACE_HI)))
-            .on_mouse_move(cx.listener(move |this, _: &MouseMoveEvent, _, cx| this.menu_hover(ix, cx)))
+            .on_mouse_move(
+                cx.listener(move |this, _: &MouseMoveEvent, _, cx| this.menu_hover(ix, cx)),
+            )
             .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                 this.run_book_action(action, &book_id, window, cx);
             }))
@@ -1542,8 +1916,12 @@ impl Yomu {
             .shadow_lg()
             .text_sm()
             .text_color(rgb(TEXT))
-            .on_mouse_down(MouseButton::Left, |_: &MouseDownEvent, _, cx| cx.stop_propagation())
-            .on_mouse_down(MouseButton::Right, |_: &MouseDownEvent, _, cx| cx.stop_propagation())
+            .on_mouse_down(MouseButton::Left, |_: &MouseDownEvent, _, cx| {
+                cx.stop_propagation()
+            })
+            .on_mouse_down(MouseButton::Right, |_: &MouseDownEvent, _, cx| {
+                cx.stop_propagation()
+            })
     }
 
     fn render_confirm(&self, dialog: &ConfirmDialog, cx: &mut Context<Self>) -> AnyElement {
@@ -1597,13 +1975,7 @@ impl Yomu {
                         .text_color(rgb(MUTED))
                         .child(label.clone()),
                 )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .truncate()
-                        .child(value.clone()),
-                )
+                .child(div().flex_1().min_w_0().truncate().child(value.clone()))
         });
 
         self.scrim(true, cx)
@@ -1617,15 +1989,13 @@ impl Yomu {
                             .child(dialog.title.clone()),
                     )
                     .child(div().flex().flex_col().gap_2().children(rows))
-                    .child(
-                        div().flex().flex_row().justify_end().child(panel_button(
-                            "properties-close",
-                            "Close",
-                            ButtonKind::Normal,
-                            true,
-                            cx.listener(|this, _: &ClickEvent, _, cx| this.close_overlay(cx)),
-                        )),
-                    ),
+                    .child(div().flex().flex_row().justify_end().child(panel_button(
+                        "properties-close",
+                        "Close",
+                        ButtonKind::Normal,
+                        true,
+                        cx.listener(|this, _: &ClickEvent, _, cx| this.close_overlay(cx)),
+                    ))),
             )
             .into_any_element()
     }
@@ -1719,18 +2089,17 @@ impl Yomu {
                                     .justify_between()
                                     .child("Window background opacity")
                                     .child(
-                                        div()
-                                            .text_color(rgb(MUTED))
-                                            .child(format!("{}%", (opacity * 100.0).round() as u32)),
+                                        div().text_color(rgb(MUTED)).child(format!(
+                                            "{}%",
+                                            (opacity * 100.0).round() as u32
+                                        )),
                                     ),
                             )
                             .child(track)
-                            .child(
-                                div().text_xs().text_color(rgb(MUTED)).child(
-                                    "Lower values let the desktop show through the window \
+                            .child(div().text_xs().text_color(rgb(MUTED)).child(
+                                "Lower values let the desktop show through the window \
                                      background. Pages, covers and text stay fully opaque.",
-                                ),
-                            ),
+                            )),
                     )
                     .child(
                         div()
@@ -1743,7 +2112,9 @@ impl Yomu {
                                 "Reset to Defaults",
                                 ButtonKind::Normal,
                                 !is_default,
-                                cx.listener(|this, _: &ClickEvent, _, cx| this.request_reset_settings(cx)),
+                                cx.listener(|this, _: &ClickEvent, _, cx| {
+                                    this.request_reset_settings(cx)
+                                }),
                             ))
                             .child(panel_button(
                                 "settings-done",
@@ -1875,12 +2246,9 @@ impl Yomu {
                         .text_color(rgb(TEXT))
                         .child("Your library is empty"),
                 )
-                .child(
-                    div()
-                        .text_sm()
-                        .text_color(rgb(MUTED))
-                        .child("Drop CBZ files or folders onto this window, or use Add files (Ctrl+O)."),
-                )
+                .child(div().text_sm().text_color(rgb(MUTED)).child(
+                    "Drop CBZ files or folders onto this window, or use Add files (Ctrl+O).",
+                ))
                 .into_any_element()
         } else {
             div()
@@ -2012,28 +2380,45 @@ impl Yomu {
     fn render_reader(&self, reader: &Reader, cx: &mut Context<Self>) -> AnyElement {
         let vp = reader.viewport;
 
-        // The page is drawn at a size and position we compute ourselves, so what you see is
-        // exactly what the fit mode and zoom say, independent of the texture's pixel size.
-        let content = if let Some(error) = &reader.error {
-            centered(format!("Couldn't open this book: {error}"))
-        } else if let Some(page) = reader.current() {
-            let display = layout::display_size(reader.fit, reader.zoom, Reader::orig_of(page), &vp);
-            let (left, top) = layout::origin(reader.off, display, &vp);
-            img(page.image.clone())
-                .absolute()
-                .left(px(left))
-                .top(px(top))
-                .w(px(display.0))
-                .h(px(display.1))
-                .object_fit(ObjectFit::Fill)
-                .into_any_element()
-        } else if let Some(error) = reader.failed.get(&reader.page) {
-            centered(format!("Couldn't decode page {}: {error}", reader.page + 1))
-        } else if reader.pages.is_none() {
-            centered("Opening…")
+        // Pages are drawn at a size and position we compute ourselves, so what you see is exactly
+        // what the fit mode and zoom say, independent of the texture's pixel size. During a page
+        // turn the outgoing and incoming pages are both drawn, shifted along the same strip.
+        let mut content: Vec<AnyElement> = Vec::new();
+        if let Some(error) = &reader.error {
+            content.push(centered(format!("Couldn't open this book: {error}")));
         } else {
-            div().size_full().into_any_element()
-        };
+            let (shift_out, shift_in) = match &reader.transition {
+                Some(transition) => (
+                    transition.outgoing_shift() * vp.width,
+                    transition.incoming_shift() * vp.width,
+                ),
+                None => (0.0, 0.0),
+            };
+            if let Some(outgoing) = &reader.outgoing {
+                content.push(page_layer(
+                    &outgoing.image,
+                    outgoing.origin.0 + shift_out,
+                    outgoing.origin.1,
+                    outgoing.display,
+                ));
+            }
+            if let Some(page) = reader.current() {
+                let display =
+                    layout::display_size(reader.fit, reader.zoom, Reader::orig_of(page), &vp);
+                let (left, top) = layout::origin(reader.off, display, &vp);
+                content.push(page_layer(&page.image, left + shift_in, top, display));
+            } else if reader.outgoing.is_none() {
+                if let Some(error) = reader.failed.get(&reader.page) {
+                    content.push(centered(format!(
+                        "Couldn't decode page {}: {error}",
+                        reader.page + 1
+                    )));
+                } else if reader.pages.is_none() {
+                    content.push(centered("Opening…"));
+                }
+                // otherwise: blank for the moment it takes the first page to decode
+            }
+        }
 
         let fraction = (reader.page + 1) as f32 / reader.total.max(1) as f32;
         let progress_line = div()
@@ -2058,7 +2443,11 @@ impl Yomu {
                     reader.total,
                     reader.fit.label(),
                     (reader.zoom * 100.0).round() as i32,
-                    if reader.rtl { "right to left" } else { "left to right" }
+                    if reader.rtl {
+                        "right to left"
+                    } else {
+                        "left to right"
+                    }
                 ),
             )
         });
@@ -2068,7 +2457,11 @@ impl Yomu {
             .map(|text| pill(div().absolute().top_4().left_0().right_0(), text));
 
         let vim_status = reader.vim.status().map(|text| {
-            let text = if reader.vim.in_cmdline() { format!("{text}▏") } else { text };
+            let text = if reader.vim.in_cmdline() {
+                format!("{text}▏")
+            } else {
+                text
+            };
             div()
                 .absolute()
                 .bottom_0()
@@ -2115,7 +2508,7 @@ impl Yomu {
                     cx,
                 );
             }))
-            .child(content)
+            .children(content)
             .child(progress_line)
             .children(info)
             .children(hud)
@@ -2130,7 +2523,21 @@ impl Render for Yomu {
         for image in self.garbage.drain(..) {
             let _ = window.drop_image(image);
         }
-        self.sync_reader(window, cx);
+        // Animations are driven by the time between frames, never by a frame count, and only
+        // ask for another frame while something is actually moving.
+        let now = Instant::now();
+        let dt = self.frame_delta(now);
+        if self.sync_reader(window, cx, dt) {
+            self.last_frame = Some(now);
+            window.request_animation_frame();
+        } else {
+            self.last_frame = None;
+        }
+        // Textures that a finished slide just let go of are not drawn this frame, so free them
+        // now rather than waiting for a frame that an idle window might never draw.
+        for image in self.garbage.drain(..) {
+            let _ = window.drop_image(image);
+        }
         self.sync_appearance(window, cx);
 
         let reading = self.reader.is_some();
@@ -2174,6 +2581,18 @@ impl Render for Yomu {
 // ----------------------------------------------------------------------------------------
 // Small helpers
 // ----------------------------------------------------------------------------------------
+
+/// One page image at an exact position and size (see `render_reader`).
+fn page_layer(image: &Arc<RenderImage>, left: f32, top: f32, display: (f32, f32)) -> AnyElement {
+    img(image.clone())
+        .absolute()
+        .left(px(left))
+        .top(px(top))
+        .w(px(display.0))
+        .h(px(display.1))
+        .object_fit(ObjectFit::Fill)
+        .into_any_element()
+}
 
 fn centered(text: impl Into<SharedString>) -> AnyElement {
     div()
@@ -2230,6 +2649,7 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
             (":zoom 150", "150% of the fit size"),
             (":rtl  :ltr  :q  :qa", "direction, back to library, quit"),
             (":settings  Ctrl+,", "open the settings"),
+            (":animate [on|off]", "page-turn slide and scroll glide"),
         ],
     ),
 ];
@@ -2264,7 +2684,13 @@ fn help_overlay() -> AnyElement {
                         .flex()
                         .flex_row()
                         .gap_4()
-                        .child(div().w(px(190.)).flex_none().text_color(rgb(ACCENT)).child(*keys))
+                        .child(
+                            div()
+                                .w(px(190.))
+                                .flex_none()
+                                .text_color(rgb(ACCENT))
+                                .child(*keys),
+                        )
                         .child(div().text_color(rgb(TEXT)).child(*what))
                 })),
         );
@@ -2413,7 +2839,10 @@ mod tests {
 
     use super::*;
     use gpui::{Entity, Modifiers, TestAppContext, VisualTestContext, point};
-    use std::{fs, io::{Cursor, Write}};
+    use std::{
+        fs,
+        io::{Cursor, Write},
+    };
 
     fn png_bytes() -> Vec<u8> {
         let image = image::RgbaImage::from_pixel(60, 90, image::Rgba([90, 40, 160, 255]));
@@ -2459,7 +2888,10 @@ mod tests {
         Fixture { files, dirs, ids }
     }
 
-    fn launch<'a>(fx: &Fixture, cx: &'a mut TestAppContext) -> (Entity<Yomu>, &'a mut VisualTestContext) {
+    fn launch<'a>(
+        fx: &Fixture,
+        cx: &'a mut TestAppContext,
+    ) -> (Entity<Yomu>, &'a mut VisualTestContext) {
         let dirs = fx.dirs.clone();
         cx.update(|cx| cx.bind_keys([KeyBinding::new("ctrl-,", OpenSettings, None)]));
         cx.add_window_view(move |window, cx| {
@@ -2470,7 +2902,9 @@ mod tests {
     }
 
     fn book(view: &Entity<Yomu>, cx: &mut VisualTestContext, id: &str) -> Book {
-        view.read_with(cx, |this, _| this.library.get(id).cloned().expect("book exists"))
+        view.read_with(cx, |this, _| {
+            this.library.get(id).cloned().expect("book exists")
+        })
     }
 
     fn saved(fx: &Fixture, id: &str) -> Option<Book> {
@@ -2501,7 +2935,9 @@ mod tests {
 
     fn act(view: &Entity<Yomu>, cx: &mut VisualTestContext, id: &str, action: BookAction) {
         let id = id.to_string();
-        view.update_in(cx, move |this, window, cx| this.run_book_action(action, &id, window, cx));
+        view.update_in(cx, move |this, window, cx| {
+            this.run_book_action(action, &id, window, cx)
+        });
         cx.run_until_parked();
     }
 
@@ -2526,7 +2962,9 @@ mod tests {
 
     fn open_menu(view: &Entity<Yomu>, cx: &mut VisualTestContext, id: &str) {
         let id = id.to_string();
-        view.update(cx, move |this, cx| this.open_book_menu(&id, point(px(100.), px(100.)), cx));
+        view.update(cx, move |this, cx| {
+            this.open_book_menu(&id, point(px(100.), px(100.)), cx)
+        });
         cx.run_until_parked();
     }
 
@@ -2595,14 +3033,22 @@ mod tests {
         let id = fx.ids[1].clone();
         set_progress(&view, cx, &id, 3);
         view.update(cx, |this, _| {
-            this.library.get_mut(&fx.ids[1]).unwrap().marks.insert("a".into(), 2);
+            this.library
+                .get_mut(&fx.ids[1])
+                .unwrap()
+                .marks
+                .insert("a".into(), 2);
         });
 
         open_menu(&view, cx, &id);
         assert!(menu_labels(&view, cx).contains(&"Resume Reading".to_string()));
         act(&view, cx, &id, BookAction::ResetProgress);
         assert_eq!(overlay_kind(&view, cx), "confirm");
-        assert_eq!(book(&view, cx, &id).current_page, 3, "nothing changes before confirming");
+        assert_eq!(
+            book(&view, cx, &id).current_page,
+            3,
+            "nothing changes before confirming"
+        );
 
         // cancelling leaves everything alone
         close(&view, cx);
@@ -2620,7 +3066,9 @@ mod tests {
     }
 
     #[gpui::test]
-    fn remove_never_deletes_the_file_and_confirms_only_when_progress_would_be_lost(cx: &mut TestAppContext) {
+    fn remove_never_deletes_the_file_and_confirms_only_when_progress_would_be_lost(
+        cx: &mut TestAppContext,
+    ) {
         let fx = fixture("remove");
         let (view, cx) = launch(&fx, cx);
 
@@ -2630,7 +3078,10 @@ mod tests {
         assert_eq!(overlay_kind(&view, cx), "none");
         assert!(saved(&fx, &a).is_none());
         assert!(fx.files[0].exists(), "the comic file must survive");
-        assert!(!fx.dirs.cover(&a).exists(), "the cached cover is cleaned up");
+        assert!(
+            !fx.dirs.cover(&a).exists(),
+            "the cached cover is cleaned up"
+        );
 
         // with progress: asks first, and cancelling keeps the book
         set_progress(&view, cx, &b, 2);
@@ -2653,7 +3104,11 @@ mod tests {
         set_progress(&view, cx, &id, 3);
 
         act(&view, cx, &id, BookAction::Open);
-        assert_eq!(reading(&view, cx), Some(3), "resume lands on the saved page");
+        assert_eq!(
+            reading(&view, cx),
+            Some(3),
+            "resume lands on the saved page"
+        );
         view.update_in(cx, |this, window, cx| this.close_book(window, cx));
         cx.run_until_parked();
         assert_eq!(reading(&view, cx), None);
@@ -2729,7 +3184,11 @@ mod tests {
 
         click(cx, card(0), MouseButton::Right);
         assert_eq!(overlay_kind(&view, cx), "menu");
-        assert_eq!(reading(&view, cx), None, "right-click must not open the book");
+        assert_eq!(
+            reading(&view, cx),
+            None,
+            "right-click must not open the book"
+        );
         view.read_with(cx, |this, _| match &this.overlay {
             Some(Overlay::Menu(menu)) => assert_eq!(menu.book_id, fx.ids[0]),
             _ => unreachable!(),
@@ -2752,7 +3211,11 @@ mod tests {
         // far from the menu, but directly over another book
         click(cx, card(3), MouseButton::Left);
         assert_eq!(overlay_kind(&view, cx), "none");
-        assert_eq!(reading(&view, cx), None, "the click only dismisses the menu");
+        assert_eq!(
+            reading(&view, cx),
+            None,
+            "the click only dismisses the menu"
+        );
 
         // and an immediate second click (double-click on a menu item) is swallowed too
         click(cx, card(3), MouseButton::Left);
@@ -2782,24 +3245,39 @@ mod tests {
         let id = fx.ids[0].clone();
         let (width, height) = (1920.0, 1080.0);
 
-        for (x, y) in [(2.0, 2.0), (width - 2.0, 2.0), (2.0, height - 2.0), (width - 2.0, height - 2.0)] {
+        for (x, y) in [
+            (2.0, 2.0),
+            (width - 2.0, 2.0),
+            (2.0, height - 2.0),
+            (width - 2.0, height - 2.0),
+        ] {
             let id = id.clone();
-            view.update(cx, move |this, cx| this.open_book_menu(&id, point(px(x), px(y)), cx));
+            view.update(cx, move |this, cx| {
+                this.open_book_menu(&id, point(px(x), px(y)), cx)
+            });
             cx.run_until_parked();
             let bounds = cx.debug_bounds("book-menu").expect("menu was painted");
             let (left, top) = (f32::from(bounds.origin.x), f32::from(bounds.origin.y));
             let right = left + f32::from(bounds.size.width);
             let bottom = top + f32::from(bounds.size.height);
             assert!(left >= 0.0 && top >= 0.0, "({x},{y}) -> {bounds:?}");
-            assert!(right <= width && bottom <= height, "({x},{y}) -> {bounds:?}");
+            assert!(
+                right <= width && bottom <= height,
+                "({x},{y}) -> {bounds:?}"
+            );
             close(&view, cx);
         }
 
         // away from the edges it opens exactly where you clicked
-        view.update(cx, |this, cx| this.open_book_menu(&fx.ids[0], point(px(300.), px(200.)), cx));
+        view.update(cx, |this, cx| {
+            this.open_book_menu(&fx.ids[0], point(px(300.), px(200.)), cx)
+        });
         cx.run_until_parked();
         let bounds = cx.debug_bounds("book-menu").unwrap();
-        assert_eq!((f32::from(bounds.origin.x), f32::from(bounds.origin.y)), (300.0, 200.0));
+        assert_eq!(
+            (f32::from(bounds.origin.x), f32::from(bounds.origin.y)),
+            (300.0, 200.0)
+        );
     }
 
     #[gpui::test]
@@ -2819,7 +3297,11 @@ mod tests {
         cx.simulate_keystrokes("down");
         assert_eq!(selected(&view, cx), Some(0));
         cx.simulate_keystrokes("down down");
-        assert_eq!(selected(&view, cx), Some(4), "skips separators: Start, Mark as Read, Open Location");
+        assert_eq!(
+            selected(&view, cx),
+            Some(4),
+            "skips separators: Start, Mark as Read, Open Location"
+        );
         cx.simulate_keystrokes("up");
         assert_eq!(selected(&view, cx), Some(2));
         cx.simulate_keystrokes("end");
@@ -2848,12 +3330,24 @@ mod tests {
         cx.simulate_keystrokes("ctrl-,");
         assert_eq!(overlay_kind(&view, cx), "settings");
         cx.simulate_keystrokes("J G space");
-        assert_eq!(reading(&view, cx), Some(0), "reader keys are ignored behind a dialog");
+        assert_eq!(
+            reading(&view, cx),
+            Some(0),
+            "reader keys are ignored behind a dialog"
+        );
         cx.simulate_keystrokes("escape");
         assert_eq!(overlay_kind(&view, cx), "none");
-        assert_eq!(reading(&view, cx), Some(0), "escape closed the dialog, not the book");
+        assert_eq!(
+            reading(&view, cx),
+            Some(0),
+            "escape closed the dialog, not the book"
+        );
         cx.simulate_keystrokes("J");
-        assert_eq!(reading(&view, cx), Some(1), "the reader works again afterwards");
+        assert_eq!(
+            reading(&view, cx),
+            Some(1),
+            "the reader works again afterwards"
+        );
     }
 
     // ---------------------------------------------------------------------------------------
@@ -2861,7 +3355,9 @@ mod tests {
     // ---------------------------------------------------------------------------------------
 
     #[gpui::test]
-    fn settings_open_with_shortcut_and_header_button_and_close_with_escape(cx: &mut TestAppContext) {
+    fn settings_open_with_shortcut_and_header_button_and_close_with_escape(
+        cx: &mut TestAppContext,
+    ) {
         let fx = fixture("settingsopen");
         let (view, cx) = launch(&fx, cx);
 
@@ -2886,13 +3382,19 @@ mod tests {
         cx.run_until_parked();
         cx.simulate_keystrokes("left left");
         assert!((opacity(&view, cx) - 0.90).abs() < 1e-4);
-        assert!((saved_settings(&fx).opacity - 0.90).abs() < 1e-4, "saved on every change");
+        assert!(
+            (saved_settings(&fx).opacity - 0.90).abs() < 1e-4,
+            "saved on every change"
+        );
         cx.simulate_keystrokes("right");
         assert!((opacity(&view, cx) - 0.95).abs() < 1e-4);
         cx.simulate_keystrokes("home");
         assert!((opacity(&view, cx) - OPACITY_MIN).abs() < 1e-4);
         cx.simulate_keystrokes("left");
-        assert!((opacity(&view, cx) - OPACITY_MIN).abs() < 1e-4, "cannot go below the minimum");
+        assert!(
+            (opacity(&view, cx) - OPACITY_MIN).abs() < 1e-4,
+            "cannot go below the minimum"
+        );
         cx.simulate_keystrokes("end right");
         assert_eq!(opacity(&view, cx), OPACITY_MAX, "cannot go above 100%");
     }
@@ -2911,24 +3413,48 @@ mod tests {
         let left = track.origin.x;
         let right = track.origin.x + track.size.width;
 
-        cx.simulate_mouse_down(point(left + px(1.), y), MouseButton::Left, Modifiers::default());
-        assert!((opacity(&view, cx) - OPACITY_MIN).abs() < 1e-4, "pressing at the left end");
-        assert!((saved_settings(&fx).opacity - 1.0).abs() < 1e-4, "not saved while dragging");
+        cx.simulate_mouse_down(
+            point(left + px(1.), y),
+            MouseButton::Left,
+            Modifiers::default(),
+        );
+        assert!(
+            (opacity(&view, cx) - OPACITY_MIN).abs() < 1e-4,
+            "pressing at the left end"
+        );
+        assert!(
+            (saved_settings(&fx).opacity - 1.0).abs() < 1e-4,
+            "not saved while dragging"
+        );
 
         let middle = point((left + right) / 2.0, y);
         cx.simulate_mouse_move(middle, MouseButton::Left, Modifiers::default());
         let expected = (OPACITY_MIN + OPACITY_MAX) / 2.0;
-        assert!((opacity(&view, cx) - expected).abs() < 0.02, "dragging to the middle");
+        assert!(
+            (opacity(&view, cx) - expected).abs() < 0.02,
+            "dragging to the middle"
+        );
 
         // dragging past the end (even off the track) clamps
-        cx.simulate_mouse_move(point(right + px(200.), y), MouseButton::Left, Modifiers::default());
+        cx.simulate_mouse_move(
+            point(right + px(200.), y),
+            MouseButton::Left,
+            Modifiers::default(),
+        );
         assert_eq!(opacity(&view, cx), OPACITY_MAX);
 
         cx.simulate_mouse_move(middle, MouseButton::Left, Modifiers::default());
         cx.simulate_mouse_up(middle, MouseButton::Left, Modifiers::default());
         let value = opacity(&view, cx);
-        assert!((saved_settings(&fx).opacity - value).abs() < 1e-4, "saved on release");
-        assert_eq!(overlay_kind(&view, cx), "settings", "dragging does not dismiss the panel");
+        assert!(
+            (saved_settings(&fx).opacity - value).abs() < 1e-4,
+            "saved on release"
+        );
+        assert_eq!(
+            overlay_kind(&view, cx),
+            "settings",
+            "dragging does not dismiss the panel"
+        );
     }
 
     #[gpui::test]
@@ -2938,11 +3464,19 @@ mod tests {
         let applied = |view: &Entity<Yomu>, cx: &mut VisualTestContext| {
             view.read_with(cx, |this, _| this.applied_opaque)
         };
-        assert_eq!(applied(&view, cx), Some(true), "100% uses the opaque appearance");
+        assert_eq!(
+            applied(&view, cx),
+            Some(true),
+            "100% uses the opaque appearance"
+        );
 
         view.update(cx, |this, cx| this.set_opacity(0.6, true, cx));
         cx.run_until_parked();
-        assert_eq!(applied(&view, cx), Some(false), "below 100% needs real transparency");
+        assert_eq!(
+            applied(&view, cx),
+            Some(false),
+            "below 100% needs real transparency"
+        );
 
         view.update(cx, |this, cx| this.set_opacity(1.0, true, cx));
         cx.run_until_parked();
@@ -2965,7 +3499,7 @@ mod tests {
         view.update(cx, |this, cx| {
             this.set_opacity(0.55, true, cx);
             let settings = this.library.settings_mut();
-            settings.rtl = false;
+            settings.rtl = true;
             settings.fit = FitMode::Width;
         });
         view.update(cx, |this, cx| this.request_reset_settings(cx));
@@ -2979,7 +3513,11 @@ mod tests {
 
         view.update(cx, |this, cx| this.request_reset_settings(cx));
         cx.simulate_keystrokes("enter");
-        assert_eq!(overlay_kind(&view, cx), "settings", "back on the panel to see the result");
+        assert_eq!(
+            overlay_kind(&view, cx),
+            "settings",
+            "back on the panel to see the result"
+        );
         assert_eq!(opacity(&view, cx), OPACITY_MAX);
         assert_eq!(saved_settings(&fx), Settings::default());
     }
@@ -2991,7 +3529,7 @@ mod tests {
         let id = fx.ids[0].clone();
         act(&view, cx, &id, BookAction::Open);
         view.update(cx, |this, cx| {
-            this.set_direction(false, cx);
+            this.set_direction(true, cx);
             this.set_fit(FitMode::Width, cx);
         });
         view.update(cx, |this, cx| {
@@ -3003,7 +3541,7 @@ mod tests {
             let reader = this.reader.as_ref().unwrap();
             (reader.rtl, reader.fit)
         });
-        assert!(rtl);
+        assert!(!rtl, "left to right is the default");
         assert_eq!(fit, FitMode::Page);
     }
 
@@ -3034,7 +3572,10 @@ mod tests {
         let (view, cx) = launch(&fx, cx);
         assert_eq!(view.read_with(cx, |this, _| this.library.books().len()), 3);
         assert_eq!(opacity(&view, cx), OPACITY_MAX);
-        assert_eq!(view.read_with(cx, |this, _| this.library.settings().clone()), Settings::default());
+        assert_eq!(
+            view.read_with(cx, |this, _| this.library.settings().clone()),
+            Settings::default()
+        );
     }
 
     // ---------------------------------------------------------------------------------------
@@ -3069,7 +3610,10 @@ mod tests {
 
         // selection mode: a plain click adds, and clicking a selected book removes it
         click(cx, card(2), MouseButton::Left);
-        assert_eq!(selected(&view, cx), vec![fx.ids[0].clone(), fx.ids[2].clone()]);
+        assert_eq!(
+            selected(&view, cx),
+            vec![fx.ids[0].clone(), fx.ids[2].clone()]
+        );
         assert_eq!(reading(&view, cx), None);
         click(cx, card(0), MouseButton::Left);
         assert_eq!(selected(&view, cx), vec![fx.ids[2].clone()]);
@@ -3102,7 +3646,11 @@ mod tests {
         assert_eq!(selected(&view, cx), fx.ids);
         cx.simulate_keystrokes("escape");
         assert!(selected(&view, cx).is_empty());
-        assert_eq!(reading(&view, cx), None, "escape in the library does nothing else");
+        assert_eq!(
+            reading(&view, cx),
+            None,
+            "escape in the library does nothing else"
+        );
     }
 
     #[gpui::test]
@@ -3113,13 +3661,20 @@ mod tests {
         ctrl_click(cx, 0);
         ctrl_click(cx, 1);
         cx.simulate_keystrokes("delete");
-        assert_eq!(overlay_kind(&view, cx), "none", "no confirmation: nothing would be lost");
+        assert_eq!(
+            overlay_kind(&view, cx),
+            "none",
+            "no confirmation: nothing would be lost"
+        );
         assert_eq!(book_count(&view, cx), 1);
         assert!(selected(&view, cx).is_empty());
         let on_disk = Library::load(&fx.dirs).unwrap();
         assert_eq!(on_disk.books().len(), 1, "saved once, for the whole batch");
         assert_eq!(on_disk.books()[0].id, fx.ids[2]);
-        assert!(fx.files.iter().all(|file| file.exists()), "comic files are never deleted");
+        assert!(
+            fx.files.iter().all(|file| file.exists()),
+            "comic files are never deleted"
+        );
         assert!(!fx.dirs.cover(&fx.ids[0]).exists() && !fx.dirs.cover(&fx.ids[1]).exists());
         let toast = view.read_with(cx, |this, _| this.toast.clone().map(|t| t.to_string()));
         assert_eq!(toast.as_deref(), Some("Removed 2 books from the library"));
@@ -3134,7 +3689,11 @@ mod tests {
         cx.simulate_keystrokes("ctrl-a");
         cx.simulate_keystrokes("delete");
         assert_eq!(overlay_kind(&view, cx), "confirm");
-        assert_eq!(book_count(&view, cx), 3, "nothing is removed before confirming");
+        assert_eq!(
+            book_count(&view, cx),
+            3,
+            "nothing is removed before confirming"
+        );
 
         // cancelling keeps both the books and the selection
         cx.simulate_keystrokes("escape");
@@ -3165,11 +3724,16 @@ mod tests {
         let (view, cx) = launch(&fx, cx);
         // (gpui keeps the last painted bounds of every selector, so only "has it ever appeared"
         // can be checked for these, not "has it disappeared")
-        assert!(cx.debug_bounds("select-remove").is_none(), "no selection controls until needed");
+        assert!(
+            cx.debug_bounds("select-remove").is_none(),
+            "no selection controls until needed"
+        );
         assert!(cx.debug_bounds("add-files").is_some());
 
         ctrl_click(cx, 0);
-        let select_all = cx.debug_bounds("select-all").expect("the header offers Select all");
+        let select_all = cx
+            .debug_bounds("select-all")
+            .expect("the header offers Select all");
         click(cx, select_all.center(), MouseButton::Left);
         assert_eq!(selected(&view, cx), fx.ids);
 
@@ -3196,9 +3760,16 @@ mod tests {
         assert_eq!(overlay_kind(&view, cx), "menu");
         assert_eq!(
             menu_labels(&view, cx),
-            vec!["Clear Selection".to_string(), "Remove 2 Books from Library".to_string()]
+            vec![
+                "Clear Selection".to_string(),
+                "Remove 2 Books from Library".to_string()
+            ]
         );
-        assert_eq!(selected(&view, cx).len(), 2, "opening the menu keeps the selection");
+        assert_eq!(
+            selected(&view, cx).len(),
+            2,
+            "opening the menu keeps the selection"
+        );
 
         cx.simulate_keystrokes("down enter");
         assert!(selected(&view, cx).is_empty());
@@ -3223,7 +3794,11 @@ mod tests {
         ctrl_click(cx, 1);
         click(cx, card(2), MouseButton::Right);
         assert!(selected(&view, cx).is_empty());
-        assert_eq!(menu_labels(&view, cx)[0], "Start Reading", "the normal single-book menu");
+        assert_eq!(
+            menu_labels(&view, cx)[0],
+            "Start Reading",
+            "the normal single-book menu"
+        );
 
         // a single selected book also gets the normal menu, not a "1 book" bulk menu
         close(&view, cx);
@@ -3241,11 +3816,18 @@ mod tests {
         ctrl_click(cx, 0);
         ctrl_click(cx, 1);
         act(&view, cx, &fx.ids[0], BookAction::Remove);
-        assert_eq!(selected(&view, cx), vec![fx.ids[1].clone()], "the removed book left the selection");
+        assert_eq!(
+            selected(&view, cx),
+            vec![fx.ids[1].clone()],
+            "the removed book left the selection"
+        );
 
         act(&view, cx, &fx.ids[1], BookAction::Open);
         assert_eq!(reading(&view, cx), Some(0));
-        assert!(selected(&view, cx).is_empty(), "opening a book clears the selection");
+        assert!(
+            selected(&view, cx).is_empty(),
+            "opening a book clears the selection"
+        );
     }
 
     #[gpui::test]
@@ -3254,8 +3836,965 @@ mod tests {
         let (view, cx) = launch(&fx, cx);
         act(&view, cx, &fx.ids[0], BookAction::Open);
         cx.simulate_keystrokes("ctrl-a");
-        assert!(selected(&view, cx).is_empty(), "Ctrl+A only selects in the library");
+        assert!(
+            selected(&view, cx).is_empty(),
+            "Ctrl+A only selects in the library"
+        );
         cx.simulate_keystrokes("delete");
         assert_eq!(book_count(&view, cx), 3);
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Reading direction, page-turn slide, smooth scrolling
+    // ---------------------------------------------------------------------------------------
+
+    const TEST_VIEWPORT: Viewport = Viewport {
+        width: 800.0,
+        height: 600.0,
+        scale: 1.0,
+    };
+
+    fn fake_page(shade: u8) -> Page {
+        let image = image::RgbaImage::from_pixel(60, 90, image::Rgba([shade, 0, 0, 255]));
+        Page {
+            image: Arc::new(RenderImage::new(vec![Frame::new(image)])),
+            orig: (60, 90),
+            tier: 1024,
+            bytes: 60 * 90 * 4,
+        }
+    }
+
+    /// A reader with `pages` decoded pages and an 800x600 viewport, no window needed.
+    fn test_reader(pages: usize, settings: &Settings) -> Reader {
+        let book = Book {
+            id: "b".into(),
+            title: "Test".into(),
+            path: PathBuf::from("/tmp/test.cbz"),
+            kind: SourceKind::Archive,
+            page_count: pages,
+            current_page: 0,
+            opened: true,
+            added_at: 0,
+            last_read: None,
+            marks: Default::default(),
+        };
+        let mut reader = Reader::new(&book, settings);
+        reader.pages = Some(Arc::new((0..pages).map(|i| format!("{i}.png")).collect()));
+        reader.viewport = TEST_VIEWPORT;
+        for index in 0..pages {
+            reader.images.insert(index, fake_page(index as u8));
+        }
+        reader
+    }
+
+    /// Turn the page the way `Yomu::goto_page` does: start the slide, then move.
+    fn turn(reader: &mut Reader, forward: bool) {
+        let target = if forward {
+            reader.page + 1
+        } else {
+            reader.page - 1
+        };
+        reader.begin_transition(forward, true);
+        reader.page = target;
+    }
+
+    fn run_frames(reader: &mut Reader, hz: f32) -> usize {
+        let mut frames = 0;
+        while reader.advance_animations(1.0 / hz, &TEST_VIEWPORT) {
+            frames += 1;
+            assert!(frames < 5_000, "animation never stopped");
+        }
+        frames
+    }
+
+    #[test]
+    fn default_reading_direction_is_left_to_right() {
+        assert!(!Settings::default().rtl);
+        assert!(!test_reader(3, &Settings::default()).rtl);
+    }
+
+    #[test]
+    fn page_turn_slides_in_the_direction_of_reading() {
+        for (rtl, forward, expected) in [
+            (false, true, -1.0), // left to right, next page: content moves left
+            (false, false, 1.0), // left to right, previous page: content moves right
+            (true, true, 1.0),   // right to left (manga) mirrors it
+            (true, false, -1.0),
+        ] {
+            let settings = Settings {
+                rtl,
+                ..Settings::default()
+            };
+            let mut reader = test_reader(4, &settings);
+            reader.page = 2;
+            let leaving = reader.images[&2].image.clone();
+            turn(&mut reader, forward);
+            let transition = reader.transition.expect("a slide started");
+            assert_eq!(transition.travel(), expected, "rtl={rtl} forward={forward}");
+            assert!(Arc::ptr_eq(
+                &reader.outgoing.as_ref().unwrap().image,
+                &leaving
+            ));
+        }
+    }
+
+    #[test]
+    fn slide_finishes_and_never_frees_a_texture_the_cache_still_holds() {
+        let mut reader = test_reader(3, &Settings::default());
+        turn(&mut reader, true);
+        let frames = run_frames(&mut reader, 144.0);
+        assert!(
+            frames > 5,
+            "the slide spans several frames, not a jump ({frames})"
+        );
+        assert!(reader.transition.is_none() && reader.outgoing.is_none());
+        assert!(reader.released.is_empty());
+    }
+
+    #[test]
+    fn an_evicted_outgoing_page_is_released_exactly_once_when_its_slide_ends() {
+        let mut reader = test_reader(3, &Settings::default());
+        let leaving = reader.images[&0].image.clone();
+        turn(&mut reader, true);
+        reader.images.remove(&0); // evicted while still sliding out
+        run_frames(&mut reader, 60.0);
+        assert_eq!(reader.released.len(), 1);
+        assert!(Arc::ptr_eq(&reader.released[0], &leaving));
+    }
+
+    #[test]
+    fn rapid_turns_replace_the_slide_instead_of_queueing_and_continue_from_where_the_page_is() {
+        let mut reader = test_reader(5, &Settings::default());
+        turn(&mut reader, true);
+        for _ in 0..4 {
+            reader.advance_animations(1.0 / 120.0, &TEST_VIEWPORT);
+        }
+        let on_screen = reader.transition.unwrap().incoming_shift();
+        assert!(on_screen > 0.0 && on_screen < 1.0, "mid-slide");
+
+        let first_out = reader.images[&0].image.clone();
+        reader.images.remove(&0);
+        let second_out = reader.images[&1].image.clone();
+        turn(&mut reader, true); // page 1 -> 2 while 0 -> 1 is still sliding
+        assert!(Arc::ptr_eq(
+            &reader.outgoing.as_ref().unwrap().image,
+            &second_out
+        ));
+        assert_eq!(
+            reader.transition.unwrap().outgoing_shift(),
+            on_screen,
+            "no jump when interrupted"
+        );
+        assert!(
+            reader
+                .released
+                .iter()
+                .any(|image| Arc::ptr_eq(image, &first_out)),
+            "the page that was leaving is dropped, not kept around"
+        );
+        assert_eq!(reader.released.len(), 1);
+
+        // keep mashing: still exactly one slide, and it settles
+        for _ in 0..2 {
+            turn(&mut reader, true);
+        }
+        assert_eq!(reader.page, 4);
+        run_frames(&mut reader, 144.0);
+        assert!(reader.transition.is_none() && reader.outgoing.is_none());
+    }
+
+    #[test]
+    fn pressing_back_mid_slide_reverses_smoothly() {
+        let mut reader = test_reader(4, &Settings::default());
+        reader.page = 1;
+        turn(&mut reader, true);
+        for _ in 0..3 {
+            reader.advance_animations(1.0 / 120.0, &TEST_VIEWPORT);
+        }
+        let on_screen = reader.transition.unwrap().incoming_shift();
+        turn(&mut reader, false);
+        let transition = reader.transition.unwrap();
+        assert_eq!(transition.travel(), 1.0, "now moving the other way");
+        assert_eq!(transition.outgoing_shift(), on_screen);
+    }
+
+    #[test]
+    fn no_slide_when_animations_are_off_the_page_is_not_ready_or_there_is_no_window() {
+        // animations off
+        let mut reader = test_reader(3, &Settings::default());
+        reader.begin_transition(true, false);
+        assert!(reader.transition.is_none() && reader.outgoing.is_none());
+
+        // the page on screen is not decoded yet (initial loading)
+        let mut reader = test_reader(3, &Settings::default());
+        reader.images.remove(&0);
+        reader.begin_transition(true, true);
+        assert!(reader.transition.is_none() && reader.outgoing.is_none());
+
+        // no window size yet
+        let mut reader = test_reader(3, &Settings::default());
+        reader.viewport = Viewport::EMPTY;
+        reader.begin_transition(true, true);
+        assert!(reader.transition.is_none());
+
+        // a freshly opened book never starts with a slide
+        assert!(test_reader(3, &Settings::default()).transition.is_none());
+    }
+
+    #[test]
+    fn resizing_the_window_cancels_the_slide() {
+        let mut reader = test_reader(3, &Settings::default());
+        turn(&mut reader, true);
+        assert!(reader.transition.is_some());
+        let resized = Viewport {
+            width: 900.0,
+            ..TEST_VIEWPORT
+        };
+        reader.advance_animations(0.016, &resized);
+        assert!(reader.transition.is_none() && reader.outgoing.is_none());
+    }
+
+    #[test]
+    fn the_slide_waits_for_the_new_page_instead_of_showing_a_blank() {
+        let mut reader = test_reader(4, &Settings::default());
+        reader.begin_transition(true, true);
+        reader.page = 3;
+        reader.images.remove(&3); // still decoding
+
+        assert!(
+            !reader.advance_animations(0.1, &TEST_VIEWPORT),
+            "no frames requested while waiting"
+        );
+        let waiting = reader.transition.expect("still pending");
+        assert_eq!(
+            waiting.outgoing_shift(),
+            0.0,
+            "the old page stays where it was"
+        );
+
+        reader.images.insert(3, fake_page(3));
+        assert!(
+            reader.advance_animations(0.016, &TEST_VIEWPORT),
+            "starts moving once the page is ready"
+        );
+        assert!(reader.transition.unwrap().outgoing_shift() != 0.0);
+    }
+
+    #[test]
+    fn a_page_that_fails_to_decode_ends_the_slide() {
+        let mut reader = test_reader(3, &Settings::default());
+        reader.begin_transition(true, true);
+        reader.page = 1;
+        reader.failed.insert(1, "broken".into());
+        reader.advance_animations(0.016, &TEST_VIEWPORT);
+        assert!(reader.transition.is_none() && reader.outgoing.is_none());
+    }
+
+    #[test]
+    fn scroll_glides_to_its_target_and_then_stops_asking_for_frames() {
+        let mut reader = test_reader(2, &Settings::default());
+        reader.scroll_target = (0.0, 300.0);
+        let mut last = 0.0;
+        let mut frames = 0;
+        while reader.advance_animations(1.0 / 144.0, &TEST_VIEWPORT) {
+            assert!(
+                reader.off.1 >= last && reader.off.1 <= 300.0,
+                "monotonic, no overshoot"
+            );
+            assert!(reader.off.1 < 300.0 || frames > 0);
+            last = reader.off.1;
+            frames += 1;
+            assert!(frames < 1_000);
+        }
+        assert_eq!(reader.off, (0.0, 300.0));
+        assert!(frames > 10, "a glide, not a jump ({frames} frames)");
+        assert!(
+            !reader.advance_animations(1.0 / 144.0, &TEST_VIEWPORT),
+            "idle afterwards"
+        );
+    }
+
+    #[test]
+    fn scroll_glide_takes_the_same_time_at_every_refresh_rate() {
+        let mut durations = Vec::new();
+        for hz in [60.0, 120.0, 144.0, 240.0] {
+            let mut reader = test_reader(2, &Settings::default());
+            reader.scroll_target = (0.0, 400.0);
+            let frames = run_frames(&mut reader, hz);
+            durations.push(frames as f32 / hz);
+        }
+        let (min, max) = durations
+            .iter()
+            .fold((f32::MAX, 0.0f32), |(lo, hi), d| (lo.min(*d), hi.max(*d)));
+        assert!(max - min < 0.03, "{durations:?}");
+    }
+
+    #[test]
+    fn with_animations_off_scrolling_snaps_and_nothing_slides() {
+        let settings = Settings {
+            animate: false,
+            ..Settings::default()
+        };
+        let mut reader = test_reader(3, &settings);
+        reader.scroll_target = (0.0, 250.0);
+        assert!(!reader.advance_animations(0.016, &TEST_VIEWPORT));
+        assert_eq!(reader.off, (0.0, 250.0));
+        reader.begin_transition(true, reader.animate);
+        assert!(reader.transition.is_none());
+    }
+
+    #[test]
+    fn closing_a_book_hands_back_every_texture() {
+        let mut reader = test_reader(4, &Settings::default());
+        turn(&mut reader, true);
+        reader.images.remove(&0);
+        reader.released.push(fake_page(9).image);
+        // 3 cached + 1 outgoing (no longer cached) + 1 already released
+        assert_eq!(reader.into_images().len(), 5);
+    }
+
+    // ---- through the real views ----
+
+    fn with_reader<T>(
+        view: &Entity<Yomu>,
+        cx: &mut VisualTestContext,
+        f: impl FnOnce(&Reader) -> T,
+    ) -> T {
+        view.read_with(cx, |this, _| {
+            f(this.reader.as_ref().expect("a book is open"))
+        })
+    }
+
+    fn open_book_by_index(
+        fx: &Fixture,
+        view: &Entity<Yomu>,
+        cx: &mut VisualTestContext,
+        index: usize,
+    ) {
+        act(view, cx, &fx.ids[index], BookAction::Open);
+        cx.run_until_parked();
+        assert!(with_reader(view, cx, |r| r.pages.is_some() && r.current().is_some()));
+    }
+
+    /// Run animation frames with a fixed 120 Hz clock until nothing is moving.
+    fn settle_animations(view: &Entity<Yomu>, cx: &mut VisualTestContext) {
+        view.update(cx, |this, _| this.frame_dt = Some(1.0 / 120.0));
+        for _ in 0..600 {
+            cx.run_until_parked();
+            if view.read_with(cx, |this, _| this.last_frame.is_none()) {
+                return;
+            }
+            view.update(cx, |_, cx| cx.notify());
+        }
+        panic!("animation never settled");
+    }
+
+    fn page(view: &Entity<Yomu>, cx: &mut VisualTestContext) -> usize {
+        with_reader(view, cx, |r| r.page)
+    }
+
+    #[gpui::test]
+    fn left_to_right_navigation_in_both_directions_at_the_start_middle_and_end(
+        cx: &mut TestAppContext,
+    ) {
+        let fx = fixture("ltr");
+        let (view, cx) = launch(&fx, cx);
+        open_book_by_index(&fx, &view, cx, 0);
+        assert!(
+            !with_reader(&view, cx, |r| r.rtl),
+            "left to right by default"
+        );
+
+        cx.simulate_keystrokes("left");
+        assert_eq!(page(&view, cx), 0, "cannot go before the first page");
+        cx.simulate_keystrokes("right");
+        assert_eq!(page(&view, cx), 1);
+        cx.simulate_keystrokes("right right");
+        assert_eq!(page(&view, cx), 3);
+        cx.simulate_keystrokes("left");
+        assert_eq!(page(&view, cx), 2, "backward from the middle");
+
+        cx.simulate_keystrokes("shift-g");
+        assert_eq!(page(&view, cx), 4);
+        cx.simulate_keystrokes("right");
+        assert_eq!(page(&view, cx), 4, "cannot go past the last page");
+        cx.simulate_keystrokes("left");
+        assert_eq!(page(&view, cx), 3, "backward from the end");
+        cx.simulate_keystrokes("g g");
+        assert_eq!(page(&view, cx), 0);
+
+        // vim motions and the other next/previous keys agree
+        cx.simulate_keystrokes("l");
+        assert_eq!(page(&view, cx), 1);
+        cx.simulate_keystrokes("h");
+        assert_eq!(page(&view, cx), 0);
+        cx.simulate_keystrokes("space");
+        assert_eq!(page(&view, cx), 1);
+        cx.simulate_keystrokes("shift-space");
+        assert_eq!(page(&view, cx), 0);
+
+        // every step was saved
+        cx.simulate_keystrokes("right right");
+        assert_eq!(saved(&fx, &fx.ids[0]).unwrap().current_page, 2);
+    }
+
+    #[gpui::test]
+    fn right_to_left_is_an_option_and_mirrors_left_right(cx: &mut TestAppContext) {
+        let fx = fixture("rtl");
+        let (view, cx) = launch(&fx, cx);
+        open_book_by_index(&fx, &view, cx, 0);
+        view.update(cx, |this, cx| this.set_direction(true, cx));
+        assert!(saved_settings(&fx).rtl, "the choice is remembered");
+
+        cx.simulate_keystrokes("right");
+        assert_eq!(
+            page(&view, cx),
+            0,
+            "right goes back in a right-to-left book"
+        );
+        cx.simulate_keystrokes("left");
+        assert_eq!(page(&view, cx), 1);
+        cx.simulate_keystrokes("h h");
+        assert_eq!(page(&view, cx), 3, "h is left, which is forward");
+        cx.simulate_keystrokes("shift-g");
+        cx.simulate_keystrokes("left");
+        assert_eq!(page(&view, cx), 4, "no further than the last page");
+        cx.simulate_keystrokes("right");
+        assert_eq!(page(&view, cx), 3);
+        // pages keep their order: j/k, J/K and gg/G do not depend on the direction
+        cx.simulate_keystrokes("g g");
+        cx.simulate_keystrokes("shift-j");
+        assert_eq!(page(&view, cx), 1);
+
+        // the next book starts with the remembered preference
+        view.update_in(cx, |this, window, cx| this.close_book(window, cx));
+        open_book_by_index(&fx, &view, cx, 1);
+        assert!(with_reader(&view, cx, |r| r.rtl));
+    }
+
+    #[gpui::test]
+    fn clicking_the_screen_edges_and_the_wheel_follow_the_reading_direction(
+        cx: &mut TestAppContext,
+    ) {
+        let fx = fixture("clicks");
+        let (view, cx) = launch(&fx, cx);
+        open_book_by_index(&fx, &view, cx, 0);
+        let (left, right) = (point(px(100.), px(500.)), point(px(1800.), px(500.)));
+
+        click(cx, right, MouseButton::Left);
+        assert_eq!(page(&view, cx), 1, "right edge advances left to right");
+        click(cx, left, MouseButton::Left);
+        assert_eq!(page(&view, cx), 0);
+
+        view.update(cx, |this, cx| this.set_direction(true, cx));
+        click(cx, left, MouseButton::Left);
+        assert_eq!(page(&view, cx), 1, "the left edge advances right to left");
+        click(cx, right, MouseButton::Left);
+        assert_eq!(page(&view, cx), 0);
+
+        // a wheel notch on a page that fits turns the page, whichever way you read
+        for rtl in [false, true] {
+            view.update(cx, |this, cx| this.set_direction(rtl, cx));
+            view.update_in(cx, |this, window, cx| {
+                this.on_wheel(
+                    (0.0, -96.0),
+                    false,
+                    (0.0, 0.0),
+                    true,
+                    viewport_of(window),
+                    cx,
+                )
+            });
+            assert_eq!(page(&view, cx), 1);
+            view.update_in(cx, |this, window, cx| {
+                this.on_wheel(
+                    (0.0, 96.0),
+                    false,
+                    (0.0, 0.0),
+                    true,
+                    viewport_of(window),
+                    cx,
+                )
+            });
+            assert_eq!(page(&view, cx), 0);
+        }
+    }
+
+    #[gpui::test]
+    fn decoded_pages_stay_in_a_small_window_whatever_the_direction(cx: &mut TestAppContext) {
+        for rtl in [false, true] {
+            let fx = fixture(if rtl { "cache-rtl" } else { "cache-ltr" });
+            let (view, cx) = launch(&fx, cx);
+            open_book_by_index(&fx, &view, cx, 0);
+            view.update(cx, |this, cx| this.set_direction(rtl, cx));
+            cx.simulate_keystrokes("shift-g");
+            cx.run_until_parked();
+            settle_animations(&view, cx);
+
+            let (cached, current) = with_reader(&view, cx, |r| {
+                let mut keys: Vec<usize> = r.images.keys().copied().collect();
+                keys.sort();
+                (keys, r.page)
+            });
+            assert_eq!(current, 4);
+            assert!(
+                cached.contains(&4) && cached.contains(&3),
+                "the page behind is ready: {cached:?}"
+            );
+            assert!(
+                cached.len() <= 1 + pagecache::KEEP_BEHIND + pagecache::KEEP_AHEAD,
+                "{cached:?}"
+            );
+            let garbage = view.read_with(cx, |this, _| this.garbage.len());
+            assert_eq!(garbage, 0, "no textures waiting to be freed once idle");
+        }
+    }
+
+    // ---- page-turn slide through the app ----
+
+    #[gpui::test]
+    fn a_page_turn_slides_then_settles_and_position_is_never_behind(cx: &mut TestAppContext) {
+        let fx = fixture("slide");
+        let (view, cx) = launch(&fx, cx);
+        open_book_by_index(&fx, &view, cx, 0);
+        assert!(
+            with_reader(&view, cx, |r| r.transition.is_none()
+                && r.outgoing.is_none()),
+            "no slide on opening"
+        );
+
+        view.update(cx, |this, cx| {
+            this.goto_page(1, Arrive::Start, cx);
+            let reader = this.reader.as_ref().unwrap();
+            // the position is already on the new page; only the visual is catching up
+            assert_eq!(reader.page, 1);
+            assert_eq!(this.library.get(&reader.book_id).unwrap().current_page, 1);
+            assert_eq!(
+                reader.transition.unwrap().travel(),
+                -1.0,
+                "forward, left to right: content moves left"
+            );
+            assert!(reader.outgoing.is_some());
+        });
+        settle_animations(&view, cx);
+        assert!(with_reader(&view, cx, |r| r.transition.is_none()
+            && r.outgoing.is_none()));
+        assert_eq!(page(&view, cx), 1);
+        assert_eq!(view.read_with(cx, |this, _| this.garbage.len()), 0);
+
+        // backward slides the other way, and right to left mirrors both
+        view.update(cx, |this, cx| {
+            this.goto_page(0, Arrive::End, cx);
+            assert_eq!(
+                this.reader.as_ref().unwrap().transition.unwrap().travel(),
+                1.0
+            );
+        });
+        settle_animations(&view, cx);
+        view.update(cx, |this, cx| {
+            this.set_direction(true, cx);
+            this.goto_page(1, Arrive::Start, cx);
+            assert_eq!(
+                this.reader.as_ref().unwrap().transition.unwrap().travel(),
+                1.0
+            );
+        });
+        settle_animations(&view, cx);
+    }
+
+    #[gpui::test]
+    fn rapid_page_turns_never_desync_the_position_from_the_picture(cx: &mut TestAppContext) {
+        let fx = fixture("rapid");
+        let (view, cx) = launch(&fx, cx);
+        open_book_by_index(&fx, &view, cx, 0);
+        let id = fx.ids[0].clone();
+
+        view.update(cx, |this, cx| {
+            for step in [
+                true, true, true, true, false, false, true, false, false, false,
+            ] {
+                this.turn_by(step, 1, Arrive::Start, cx);
+                let reader = this.reader.as_ref().unwrap();
+                assert!(
+                    reader.transition.is_some() || reader.outgoing.is_none(),
+                    "at most one slide"
+                );
+                assert_eq!(
+                    this.library.get(&id).unwrap().current_page,
+                    reader.page,
+                    "saved position tracks the page instantly"
+                );
+            }
+        });
+        settle_animations(&view, cx);
+        assert_eq!(page(&view, cx), 0);
+        assert!(with_reader(&view, cx, |r| r.transition.is_none()
+            && r.outgoing.is_none()
+            && r.released.is_empty()));
+        assert_eq!(saved(&fx, &id).unwrap().current_page, 0);
+
+        // key repeat arrives as separate key presses
+        cx.simulate_keystrokes("right right right right");
+        settle_animations(&view, cx);
+        assert_eq!(page(&view, cx), 4);
+        assert_eq!(saved(&fx, &id).unwrap().current_page, 4);
+    }
+
+    #[gpui::test]
+    fn zooming_fitting_and_resizing_do_not_slide(cx: &mut TestAppContext) {
+        let fx = fixture("noslide");
+        let (view, cx) = launch(&fx, cx);
+        open_book_by_index(&fx, &view, cx, 0);
+
+        for action in 0..3 {
+            view.update_in(cx, |this, window, cx| {
+                this.goto_page(this.reader.as_ref().unwrap().page + 1, Arrive::Start, cx);
+                assert!(this.reader.as_ref().unwrap().transition.is_some());
+                match action {
+                    0 => this.set_fit(FitMode::Width, cx),
+                    1 => {
+                        let vp = viewport_of(window);
+                        this.zoom_by(1.25, (vp.width / 2.0, vp.height / 2.0), vp, cx);
+                    }
+                    _ => {
+                        let reader = this.reader.as_mut().unwrap();
+                        let vp = Viewport {
+                            width: reader.viewport.width + 100.0,
+                            ..reader.viewport
+                        };
+                        reader.advance_animations(0.016, &vp);
+                    }
+                }
+                let reader = this.reader.as_ref().unwrap();
+                assert!(
+                    reader.transition.is_none() && reader.outgoing.is_none(),
+                    "action {action}"
+                );
+            });
+            settle_animations(&view, cx);
+        }
+    }
+
+    #[gpui::test]
+    fn switching_comics_starts_clean(cx: &mut TestAppContext) {
+        let fx = fixture("switch");
+        let (view, cx) = launch(&fx, cx);
+        open_book_by_index(&fx, &view, cx, 0);
+        view.update(cx, |this, cx| this.goto_page(2, Arrive::Start, cx));
+        view.update_in(cx, |this, window, cx| this.close_book(window, cx));
+        cx.run_until_parked();
+        open_book_by_index(&fx, &view, cx, 1);
+        assert!(with_reader(&view, cx, |r| r.transition.is_none()
+            && r.outgoing.is_none()
+            && r.page == 0));
+        assert!(
+            view.read_with(cx, |this, _| this.last_frame.is_none()),
+            "no animation clock left running"
+        );
+    }
+
+    #[gpui::test]
+    fn reduced_motion_and_the_animate_command_turn_animation_off(cx: &mut TestAppContext) {
+        let fx = fixture("reduced");
+        let (view, cx) = launch(&fx, cx);
+        open_book_by_index(&fx, &view, cx, 0);
+
+        // the desktop asks for reduced motion
+        view.update(cx, |this, _| this.reduce_motion = true);
+        view.update(cx, |this, cx| {
+            this.goto_page(1, Arrive::Start, cx);
+            assert!(
+                this.reader.as_ref().unwrap().transition.is_none(),
+                "no slide"
+            );
+        });
+        cx.run_until_parked();
+        assert_eq!(page(&view, cx), 1, "navigation itself is unaffected");
+        view.update(cx, |this, _| this.reduce_motion = false);
+
+        // `:animate off` is a saved preference
+        view.update_in(cx, |this, window, cx| {
+            this.apply(
+                Action::SetAnimations(Some(false)),
+                viewport_of(window),
+                window,
+                cx,
+            );
+            this.goto_page(2, Arrive::Start, cx);
+            assert!(this.reader.as_ref().unwrap().transition.is_none());
+        });
+        assert!(!saved_settings(&fx).animate);
+
+        // the toggle form flips it back
+        view.update_in(cx, |this, window, cx| {
+            this.apply(Action::SetAnimations(None), viewport_of(window), window, cx);
+        });
+        assert!(saved_settings(&fx).animate);
+        view.update(cx, |this, cx| {
+            this.goto_page(3, Arrive::Start, cx);
+            assert!(this.reader.as_ref().unwrap().transition.is_some());
+        });
+        settle_animations(&view, cx);
+    }
+
+    // ---- smooth scrolling through the app ----
+
+    #[gpui::test]
+    fn keyboard_scrolling_glides_accumulates_and_leaves_the_app_idle(cx: &mut TestAppContext) {
+        let fx = fixture("glide");
+        let (view, cx) = launch(&fx, cx);
+        open_book_by_index(&fx, &view, cx, 0);
+        // zoom in far enough that the page is taller than the window
+        view.update_in(cx, |this, window, cx| {
+            let vp = viewport_of(window);
+            this.zoom_to(2.0, (vp.width / 2.0, vp.height / 2.0), vp, cx);
+        });
+        cx.run_until_parked();
+        settle_animations(&view, cx);
+        assert!(with_reader(&view, cx, |r| layout::max_offset(
+            layout::display_size(r.fit, r.zoom, (60.0, 90.0), &r.viewport),
+            &r.viewport
+        )
+        .1 > 100.0));
+
+        // zooming at the centre leaves the page scrolled part way down
+        let base = with_reader(&view, cx, |r| r.off.1);
+        view.update_in(cx, |this, window, cx| {
+            let vp = viewport_of(window);
+            this.scroll(Dir::Down, Amount::Line, 1, vp, cx);
+            this.scroll(Dir::Down, Amount::Line, 1, vp, cx);
+            let reader = this.reader.as_ref().unwrap();
+            assert_eq!(
+                reader.scroll_target.1,
+                base + 2.0 * LINE_STEP,
+                "presses accumulate on the target"
+            );
+            assert_eq!(reader.off.1, base, "the picture has not jumped; it glides");
+        });
+        settle_animations(&view, cx);
+        assert_eq!(
+            with_reader(&view, cx, |r| r.off.1),
+            base + 2.0 * LINE_STEP,
+            "arrives exactly"
+        );
+        assert!(
+            view.read_with(cx, |this, _| this.last_frame.is_none()),
+            "no frames requested when idle"
+        );
+
+        // pressing up goes back along the same path
+        cx.simulate_keystrokes("k");
+        settle_animations(&view, cx);
+        assert_eq!(with_reader(&view, cx, |r| r.off.1), base + LINE_STEP);
+    }
+
+    #[gpui::test]
+    fn touchpad_deltas_are_followed_one_to_one_and_wheel_notches_glide(cx: &mut TestAppContext) {
+        let fx = fixture("wheel");
+        let (view, cx) = launch(&fx, cx);
+        open_book_by_index(&fx, &view, cx, 0);
+        view.update_in(cx, |this, window, cx| {
+            let vp = viewport_of(window);
+            this.zoom_to(2.0, (vp.width / 2.0, vp.height / 2.0), vp, cx);
+        });
+        settle_animations(&view, cx);
+
+        let base = with_reader(&view, cx, |r| r.off.1);
+        view.update_in(cx, |this, window, cx| {
+            let vp = viewport_of(window);
+            // a touchpad: small pixel deltas, not discrete
+            this.on_wheel((0.0, -30.0), false, (0.0, 0.0), false, vp, cx);
+            let reader = this.reader.as_ref().unwrap();
+            assert_eq!(
+                (reader.off.1, reader.scroll_target.1),
+                (base + 30.0, base + 30.0),
+                "no lag"
+            );
+            // a wheel notch: glides
+            this.on_wheel((0.0, -WHEEL_LINE), false, (0.0, 0.0), true, vp, cx);
+            let reader = this.reader.as_ref().unwrap();
+            assert_eq!(reader.scroll_target.1, base + 30.0 + WHEEL_LINE);
+            assert_eq!(reader.off.1, base + 30.0);
+        });
+        settle_animations(&view, cx);
+        assert_eq!(
+            with_reader(&view, cx, |r| r.off.1),
+            base + 30.0 + WHEEL_LINE
+        );
+    }
+
+    #[gpui::test]
+    fn scrolling_with_reduced_motion_is_immediate(cx: &mut TestAppContext) {
+        let fx = fixture("glide-off");
+        let (view, cx) = launch(&fx, cx);
+        open_book_by_index(&fx, &view, cx, 0);
+        view.update_in(cx, |this, window, cx| {
+            let vp = viewport_of(window);
+            this.zoom_to(2.0, (vp.width / 2.0, vp.height / 2.0), vp, cx);
+            this.reduce_motion = true;
+        });
+        settle_animations(&view, cx);
+        let base = with_reader(&view, cx, |r| r.off.1);
+        view.update_in(cx, |this, window, cx| {
+            this.scroll(Dir::Down, Amount::Line, 3, viewport_of(window), cx);
+        });
+        settle_animations(&view, cx);
+        assert_eq!(with_reader(&view, cx, |r| r.off.1), base + 3.0 * LINE_STEP);
+    }
+
+    #[gpui::test]
+    fn the_whole_session_leaves_no_leaked_state(cx: &mut TestAppContext) {
+        let fx = fixture("leaks");
+        let (view, cx) = launch(&fx, cx);
+        open_book_by_index(&fx, &view, cx, 0);
+        for _ in 0..3 {
+            cx.simulate_keystrokes("right right right right left left left left");
+        }
+        settle_animations(&view, cx);
+        assert_eq!(view.read_with(cx, |this, _| this.garbage.len()), 0);
+        let (cached, pending, released) = with_reader(&view, cx, |r| {
+            (r.images.len(), r.pending.len(), r.released.len())
+        });
+        assert!(cached <= 1 + pagecache::KEEP_BEHIND + pagecache::KEEP_AHEAD);
+        assert_eq!((pending, released), (0, 0));
+        view.update_in(cx, |this, window, cx| this.close_book(window, cx));
+        settle_animations(&view, cx);
+        assert!(view.read_with(cx, |this, _| this.reader.is_none()
+            && this.last_frame.is_none()));
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Measurements. `cargo test perf_ -- --ignored --nocapture`
+    // ---------------------------------------------------------------------------------------
+
+    fn median(values: &mut [f64]) -> f64 {
+        values.sort_by(|a, b| a.total_cmp(b));
+        values[values.len() / 2]
+    }
+
+    #[test]
+    #[ignore = "prints timings"]
+    fn perf_decode_cost_per_tier() {
+        // a large, noisy 3000x4500 page, like a high resolution scan
+        let (w, h) = (3000u32, 4500u32);
+        let image = image::RgbImage::from_fn(w, h, |x, y| {
+            let n = (x.wrapping_mul(2654435761) ^ y.wrapping_mul(40503)) >> 24;
+            image::Rgb([
+                ((x / 12 + n) & 255) as u8,
+                ((y / 17 + n) & 255) as u8,
+                (((x + y) / 23) & 255) as u8,
+            ])
+        });
+        let mut jpeg = Vec::new();
+        image::DynamicImage::ImageRgb8(image)
+            .write_with_encoder(image::codecs::jpeg::JpegEncoder::new_with_quality(
+                &mut jpeg, 85,
+            ))
+            .unwrap();
+        println!(
+            "source page: {w}x{h} JPEG, {:.1} MB",
+            jpeg.len() as f64 / 1e6
+        );
+
+        let mut times = Vec::new();
+        for _ in 0..5 {
+            let start = Instant::now();
+            let decoded = image::load_from_memory(&jpeg).unwrap();
+            times.push(start.elapsed().as_secs_f64() * 1000.0);
+            assert_eq!(decoded.width(), w);
+        }
+        println!(
+            "JPEG decode only (no scaling): {:.0} ms",
+            median(&mut times)
+        );
+
+        let full = image::load_from_memory(&jpeg).unwrap();
+        for filter in [
+            image::imageops::FilterType::Lanczos3,
+            image::imageops::FilterType::CatmullRom,
+            image::imageops::FilterType::Triangle,
+        ] {
+            let mut times = Vec::new();
+            for _ in 0..3 {
+                let start = Instant::now();
+                let _ = full.resize_exact(1365, 2048, filter);
+                times.push(start.elapsed().as_secs_f64() * 1000.0);
+            }
+            println!(
+                "resize 3000x4500 -> 1365x2048 with {filter:?}: {:.0} ms",
+                median(&mut times)
+            );
+        }
+
+        for tier in layout::TIERS {
+            let mut times = Vec::new();
+            let mut bytes = 0u64;
+            for _ in 0..3 {
+                let start = Instant::now();
+                let decoded = imaging::decode_fit_bgra(&jpeg, tier, tier).unwrap();
+                times.push(start.elapsed().as_secs_f64() * 1000.0);
+                let (dw, dh) = decoded.image.dimensions();
+                bytes = u64::from(dw) * u64::from(dh) * 4;
+            }
+            println!(
+                "tier {tier:>4}: decode+scale {:>6.0} ms (median of 3, background thread), result {:>5.1} MB",
+                median(&mut times),
+                bytes as f64 / 1e6
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "prints timings"]
+    fn perf_per_frame_animation_math() {
+        const N: u32 = 2_000_000;
+        let start = Instant::now();
+        let mut off = (0.0f32, 0.0f32);
+        let mut sink = 0.0f32;
+        for i in 0..N {
+            let target = (0.0, 400.0 + (i % 7) as f32);
+            off = motion::step_scroll(off, target, 1.0 / 144.0).0;
+            let mut transition = PageTransition::starting(-1.0);
+            transition.advance(0.01);
+            sink += transition.outgoing_shift() + transition.incoming_shift() + off.1;
+        }
+        let per_frame = start.elapsed().as_secs_f64() * 1e9 / f64::from(N);
+        println!("slide + glide state update: {per_frame:.0} ns per frame (sink {sink:.1})");
+    }
+
+    #[gpui::test]
+    #[ignore = "prints timings"]
+    fn perf_frames_during_a_slide(cx: &mut TestAppContext) {
+        let fx = fixture("perf");
+        let (view, cx) = launch(&fx, cx);
+        open_book_by_index(&fx, &view, cx, 0);
+        view.update(cx, |this, _| this.frame_dt = Some(1.0 / 144.0));
+
+        let mut times = Vec::new();
+        for turn in 0..20 {
+            view.update(cx, |this, cx| {
+                this.turn_by(turn % 2 == 0, 1, Arrive::Start, cx)
+            });
+            for _ in 0..40 {
+                // one frame = state update + element tree + layout + paint
+                let start = Instant::now();
+                view.update(cx, |_, cx| cx.notify());
+                cx.run_until_parked();
+                times.push(start.elapsed().as_secs_f64() * 1000.0);
+                if view.read_with(cx, |this, _| this.last_frame.is_none()) {
+                    break;
+                }
+            }
+        }
+        times.sort_by(|a, b| a.total_cmp(b));
+        let mean = times.iter().sum::<f64>() / times.len() as f64;
+        println!(
+            "{} animated frames: mean {mean:.2} ms, median {:.2} ms, p95 {:.2} ms, max {:.2} ms \
+             (view update + layout + paint into the test platform; unoptimised build, no GPU)",
+            times.len(),
+            times[times.len() / 2],
+            times[(times.len() * 95 / 100).min(times.len() - 1)],
+            times[times.len() - 1],
+        );
     }
 }

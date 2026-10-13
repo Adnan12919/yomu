@@ -11,7 +11,8 @@ rendering is GPU-accelerated, and it talks to Wayland directly (no webview, no T
 - Settings panel with a live background-opacity slider (`Ctrl+,`)
 - Fit page / width / height / original size, zoom in and out, pan by dragging
 - Vim motions (counts, `gg`, `G`, marks, `:` commands) next to the normal keys
-- Right-to-left (manga) or left-to-right reading order
+- Left-to-right by default, like a Western comic; right-to-left (manga) is a preference (`r` or `:rtl`)
+- A short slide between pages and a smooth scroll glide, frame-rate independent, switchable (`:animate off`)
 - Progress is saved on every page turn and restored when you reopen a book
 - Pages are decoded on background threads at the resolution the current zoom needs, with the next pages prefetched
 
@@ -139,8 +140,13 @@ Counts work on motions: `5j` scrolls five steps, `3J` skips three pages. Marks a
 | `:q` | Back to the library |
 | `:qa` | Quit |
 
-In right-to-left mode `Left` and `h` go forward, like turning a printed manga. The fit mode and
-reading direction are remembered between books.
+By default pages run left to right: `Right` and `l` go forward, `Left` and `h` go back. In right-to-left mode
+(`r` or `:rtl`) it is the other way round, like turning a printed manga. The fit mode, reading direction and
+animation preference are remembered between books.
+
+Libraries from versions that defaulted to right-to-left are moved to left-to-right once when they are first
+opened (the old default was stored in every library file, so it cannot be told apart from a deliberate choice).
+Manga readers press `r` once and it sticks.
 
 ## Selecting several books
 
@@ -197,6 +203,33 @@ the compositor skip blending.
 - I could not look at a real compositor while building this, so the actual translucent look (including the colour
   of semi-transparent areas) is the one thing not verified by the tests.
 
+## Page turns, scrolling and performance
+
+- **Page turn slide.** Turning a page slides the old page out and the new one in along the reading direction:
+  forward moves the content left in a left-to-right book and right in a right-to-left one, backward the reverse.
+  Both pages move by one window width, so the change is visible even when zoomed in. It takes 160 ms
+  (90 ms when it interrupts a running slide, e.g. holding a key). There is never a queue: a turn that arrives
+  mid-slide replaces the running one, and the page that was sliding in continues from exactly where it is.
+  Your position (and the saved progress) change the instant you turn; the slide is only a visual.
+- **No slide** when opening a comic, switching comics, resizing the window, zooming or changing the fit mode, and
+  none while the next page is still decoding (the old page stays on screen instead of a blank).
+- **Smooth scrolling.** `j`/`k`/`h`/`l`, Space and the mouse wheel glide to their target; repeated presses
+  accumulate. Touchpads follow your fingers one to one.
+- **Reduced motion.** `:animate off` (or `:animate` to toggle) turns the slide and the glide off and is
+  remembered. They are also off when `YOMU_REDUCE_MOTION=1` is set or the GNOME "Animations" switch is off.
+- **Frame pacing.** Animations are driven by the time between frames, never a frame count, so they take the same
+  time at 60, 144 or 240 Hz, and a frame is only requested while something is moving; an idle window draws nothing.
+  The compositor's frame callbacks set the pace.
+- **Memory.** At most the current page, three ahead and two behind stay decoded (one behind and three ahead are
+  prefetched), under a 320 MB cap; textures are freed as soon as they are no longer drawn. Pages are decoded and
+  scaled on background threads at the resolution the current zoom needs, with a SIMD resampler.
+
+Measured here (a slow single-core VM with no GPU, so only the CPU side): a 3000x4500 JPEG decodes and scales in
+300 to 500 ms at every resolution tier (the old resampler needed about 1.3 s at the 1536 to 2048 pixel tiers and
+about 2 s at the 3072 to 4096 pixel tiers), and a frame of the slide costs 0.26 ms of CPU on average (95th
+percentile 0.38 ms, unoptimised build) against a 6.9 ms budget at 144 Hz. `cargo test perf_ -- --ignored --nocapture`
+reproduces the numbers.
+
 ## Where data lives
 
 `$XDG_DATA_HOME/yomu/` (usually `~/.local/share/yomu/`), or `$YOMU_DATA_DIR` if set:
@@ -205,6 +238,18 @@ the compositor skip blending.
 - `covers/` holds generated cover thumbnails
 
 Importing never copies or modifies your comic files.
+
+## Dependencies
+
+Two crates from gpui's dependency tree are vendored with small fixes (see the comment at the top of each
+`Cargo.toml`), wired up through `[patch.crates-io]`:
+
+- `vendor/xattr`: 0.2.3 does not compile against recent `libc` releases.
+- `vendor/stacksafe-macro`: gpui 0.2.2 pins `stacksafe 0.1.4`, whose macro crate depends on `proc-macro-error2`,
+  which is archived. Upstream already dropped it in `stacksafe-macro` 1.0.2 (it returns `syn::Error` instead), but
+  gpui's exact `=0.1.4` requirement blocks the upgrade, so the vendored copy carries that upstream change. No
+  replacement crate is needed, and neither `proc-macro-error2` nor its helper crate is in `Cargo.lock` any more.
+  Delete the patch entry once gpui moves to `stacksafe` 1.x.
 
 ## Development
 
