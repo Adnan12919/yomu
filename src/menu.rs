@@ -19,6 +19,8 @@ pub enum BookAction {
     ResetProgress,
     RevealFile,
     Properties,
+    /// Assign one or more books to a named series.
+    SetSeries,
     /// Remove from the library. The comic file itself is never touched.
     Remove,
     /// Remove every selected book from the library (files are never touched).
@@ -96,6 +98,15 @@ pub fn book_menu(book: &Book, file_exists: bool) -> Vec<Entry> {
         file_exists,
     ));
     entries.push(item(BookAction::Properties, "Properties", true));
+    entries.push(item(
+        BookAction::SetSeries,
+        if book.series.is_some() {
+            "Change Series…"
+        } else {
+            "Set Series…"
+        },
+        true,
+    ));
     entries.push(Entry::Separator);
 
     entries.push(Entry::Item(Item {
@@ -119,6 +130,11 @@ fn plural_books(count: usize) -> String {
 pub fn selection_menu(count: usize) -> Vec<Entry> {
     vec![
         item(BookAction::ClearSelection, "Clear Selection", true),
+        item(
+            BookAction::SetSeries,
+            "Set Series for Selected Books…",
+            true,
+        ),
         Entry::Separator,
         Entry::Item(Item {
             action: BookAction::RemoveSelected,
@@ -238,6 +254,12 @@ pub fn properties(book: &Book) -> Vec<(String, String)> {
     };
     rows.push(("Format".to_string(), format.to_string()));
     rows.push(("Pages".to_string(), book.page_count.to_string()));
+    rows.push((
+        "Series".to_string(),
+        book.series
+            .clone()
+            .unwrap_or_else(|| "Unassigned".to_string()),
+    ));
 
     let progress = match book.status() {
         ReadStatus::Unread => "Unread".to_string(),
@@ -284,6 +306,7 @@ mod tests {
         let mut book = Book {
             id: "id".into(),
             title: "Blue Period".into(),
+            series: None,
             path: PathBuf::from("/definitely/not/here.cbz"),
             kind: SourceKind::Archive,
             page_count: 20,
@@ -323,7 +346,7 @@ mod tests {
         use BookAction::*;
         assert_eq!(
             actions(&book_menu(&book(ReadStatus::Unread), true)),
-            vec![Open, MarkRead, RevealFile, Properties, Remove]
+            vec![Open, MarkRead, RevealFile, Properties, SetSeries, Remove]
         );
         assert_eq!(
             actions(&book_menu(&book(ReadStatus::InProgress), true)),
@@ -334,12 +357,15 @@ mod tests {
                 ResetProgress,
                 RevealFile,
                 Properties,
+                SetSeries,
                 Remove
             ]
         );
         assert_eq!(
             actions(&book_menu(&book(ReadStatus::Finished), true)),
-            vec![StartOver, MarkUnread, RevealFile, Properties, Remove]
+            vec![
+                StartOver, MarkUnread, RevealFile, Properties, SetSeries, Remove
+            ]
         );
     }
 
@@ -398,19 +424,20 @@ mod tests {
     #[test]
     fn keyboard_navigation_skips_separators_and_disabled_items_and_wraps() {
         let entries = book_menu(&book(ReadStatus::Unread), false);
-        // Start Reading (0, disabled), sep, Mark as Read (2), sep, Open File Location (4,
-        // disabled), Properties (5), sep, Remove (7)
-        assert_eq!(step(&entries, None, true), Some(2));
-        assert_eq!(step(&entries, Some(2), true), Some(5));
+        // Start Reading (0, disabled), Mark as Read (1), sep, Open File Location (3,
+        // disabled), Properties (4), Set Series (5), sep, Remove (7)
+        assert_eq!(step(&entries, None, true), Some(1));
+        assert_eq!(step(&entries, Some(1), true), Some(4));
+        assert_eq!(step(&entries, Some(4), true), Some(5));
         assert_eq!(step(&entries, Some(5), true), Some(7));
         assert_eq!(
             step(&entries, Some(7), true),
-            Some(2),
+            Some(1),
             "wraps to the first enabled item"
         );
         assert_eq!(step(&entries, None, false), Some(7));
-        assert_eq!(step(&entries, Some(2), false), Some(7));
-        assert_eq!(step(&entries, Some(5), false), Some(2));
+        assert_eq!(step(&entries, Some(1), false), Some(7));
+        assert_eq!(step(&entries, Some(4), false), Some(1));
         assert_eq!(step(&[], None, true), None);
     }
 
@@ -446,9 +473,13 @@ mod tests {
         let entries = selection_menu(3);
         assert_eq!(
             actions(&entries),
-            vec![BookAction::ClearSelection, BookAction::RemoveSelected]
+            vec![
+                BookAction::ClearSelection,
+                BookAction::SetSeries,
+                BookAction::RemoveSelected
+            ]
         );
-        match &entries[2] {
+        match &entries[3] {
             Entry::Item(item) => {
                 assert_eq!(item.label, "Remove 3 Books from Library");
                 assert!(item.danger);

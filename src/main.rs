@@ -26,9 +26,9 @@ use yomu::{
     library::{self, Book, DataDirs, Library, OPACITY_MAX, OPACITY_MIN, Settings},
     menu::{self, BookAction, Entry, Item},
     motion::{self, PageTransition},
-    pagecache,
+    pagecache, search,
     selection::Selection,
-    util::now_secs,
+    util::{natural_cmp, now_secs},
     vim::{self, Action, Amount, Dir, Vim},
 };
 
@@ -122,6 +122,9 @@ struct Reader {
     kind: SourceKind,
     /// `None` while the page list is still being read from disk.
     pages: Option<Arc<Vec<String>>>,
+    /// Original dimensions are retained separately from decoded textures so continuous layout
+    /// can keep stable geometry while pages are evicted from the image cache.
+    orig_sizes: Vec<Option<(u32, u32)>>,
     page: usize,
     total: usize,
 
@@ -149,6 +152,8 @@ struct Reader {
     /// Whether page turns and scrolling animate (the setting, unless the desktop asks for
     /// reduced motion).
     animate: bool,
+    continuous: bool,
+    webcomics: bool,
     /// Textures no longer shown, to be freed by the window on its next frame.
     released: Vec<Arc<RenderImage>>,
 
@@ -172,6 +177,7 @@ impl Reader {
             path: book.path.clone(),
             kind: book.kind,
             pages: None,
+            orig_sizes: Vec::new(),
             page: book.current_page.min(book.page_count.saturating_sub(1)),
             total: book.page_count,
             rtl: settings.rtl,
@@ -185,6 +191,8 @@ impl Reader {
             outgoing: None,
             transition_viewport: Viewport::EMPTY,
             animate: settings.animate,
+            continuous: settings.continuous || settings.webcomics,
+            webcomics: settings.webcomics,
             released: Vec::new(),
             images: HashMap::new(),
             pending: HashSet::new(),
@@ -202,6 +210,35 @@ impl Reader {
         self.images.get(&self.page)
     }
 
+    fn continuous_layout(&self, vp: &Viewport) -> (Vec<f32>, Vec<f32>) {
+        let width = (vp.width * self.zoom).max(1.0);
+        let gap = if self.webcomics {
+            0.0
+        } else {
+            12.0 * self.zoom
+        };
+        let mut tops = Vec::with_capacity(self.total);
+        let mut heights = Vec::with_capacity(self.total);
+        let mut top = 0.0;
+        for ix in 0..self.total {
+            tops.push(top);
+            // Unknown pages use a typical portrait ratio until their metadata is read.
+            let (w, h) = self.orig_sizes.get(ix).and_then(|v| *v).unwrap_or((2, 3));
+            let height = width * h as f32 / w.max(1) as f32;
+            heights.push(height);
+            top += height + gap;
+        }
+        (tops, heights)
+    }
+
+    fn continuous_page_at(&self, y: f32, vp: &Viewport) -> usize {
+        let (tops, heights) = self.continuous_layout(vp);
+        tops.iter()
+            .zip(heights)
+            .position(|(top, height)| y < *top + height)
+            .unwrap_or_else(|| self.total.saturating_sub(1))
+    }
+
     fn orig_of(page: &Page) -> (f32, f32) {
         (page.orig.0 as f32, page.orig.1 as f32)
     }
@@ -209,6 +246,31 @@ impl Reader {
     /// Apply a pending page-turn arrival and clamp the scroll offset. Returns the display size
     /// of the current page, or `None` while it is still being decoded.
     fn settle(&mut self, vp: &Viewport) -> Option<(f32, f32)> {
+        if self.continuous {
+            if self.total == 0 {
+                return None;
+            }
+            let (tops, heights) = self.continuous_layout(vp);
+            let doc_height =
+                tops.last().copied().unwrap_or(0.0) + heights.last().copied().unwrap_or(0.0);
+            let page = self.page.min(self.total - 1);
+            if let Some(arrive) = self.arrive.take() {
+                self.scroll_target.1 = match arrive {
+                    Arrive::Start => tops[page],
+                    Arrive::End => (tops[page] + heights[page] - vp.height).max(0.0),
+                };
+                self.off = self.scroll_target;
+            }
+            let width = vp.width * self.zoom;
+            let max_x = (width - vp.width).max(0.0);
+            let max_y = (doc_height - vp.height).max(0.0);
+            self.off.0 = self.off.0.clamp(0.0, max_x);
+            self.off.1 = self.off.1.clamp(0.0, max_y);
+            self.scroll_target.0 = self.scroll_target.0.clamp(0.0, max_x);
+            self.scroll_target.1 = self.scroll_target.1.clamp(0.0, max_y);
+            self.page = self.continuous_page_at(self.off.1 + vp.height * 0.5, vp);
+            return Some((width, heights[self.page]));
+        }
         let orig = Self::orig_of(self.current()?);
         let display = layout::display_size(self.fit, self.zoom, orig, vp);
         let max = layout::max_offset(display, vp);
@@ -357,11 +419,17 @@ struct PropertiesDialog {
     rows: Vec<(String, String)>,
 }
 
+struct SeriesDialog {
+    book_ids: Vec<String>,
+    value: String,
+}
+
 /// At most one menu or dialog is open at a time; it sits on top of whatever view is showing.
 enum Overlay {
     Menu(BookMenu),
     Confirm(ConfirmDialog),
     Properties(PropertiesDialog),
+    Series(SeriesDialog),
     Settings,
 }
 
@@ -401,6 +469,10 @@ struct Yomu {
     overlay_closed_at: Option<Instant>,
     /// Books picked for bulk actions in the library.
     selection: Selection,
+    /// Transient library filter; it is not part of persisted reader settings.
+    search_query: String,
+    search_active: bool,
+    collapsed_series: HashSet<String>,
     slider: Slider,
     /// Which background appearance the window currently has (`None` before the first frame).
     applied_opaque: Option<bool>,
@@ -439,6 +511,9 @@ impl Yomu {
             overlay: None,
             overlay_closed_at: None,
             selection: Selection::new(),
+            search_query: String::new(),
+            search_active: false,
+            collapsed_series: HashSet::new(),
             slider: Slider {
                 bounds: Rc::new(Cell::new(None)),
                 dragging: false,
@@ -587,6 +662,61 @@ impl Yomu {
         cx.notify();
     }
 
+    fn open_series_dialog(&mut self, book_ids: Vec<String>, cx: &mut Context<Self>) {
+        if book_ids.is_empty() {
+            return;
+        }
+        let books: Vec<&Book> = book_ids
+            .iter()
+            .filter_map(|id| self.library.get(id))
+            .collect();
+        let existing = books
+            .first()
+            .and_then(|first| first.series.clone())
+            .filter(|name| {
+                books.iter().all(|book| {
+                    book.series
+                        .as_deref()
+                        .is_some_and(|other| other.eq_ignore_ascii_case(name))
+                })
+            });
+        let common_parent = books
+            .first()
+            .and_then(|book| book.path.parent().map(PathBuf::from))
+            .filter(|parent| {
+                books
+                    .iter()
+                    .all(|book| book.path.parent() == Some(parent.as_path()))
+            })
+            .and_then(|parent| {
+                parent
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+            });
+        let value = existing.or(common_parent).unwrap_or_default();
+        self.dismiss();
+        self.overlay = Some(Overlay::Series(SeriesDialog { book_ids, value }));
+        cx.notify();
+    }
+
+    fn save_series_dialog(&mut self, cx: &mut Context<Self>) {
+        let Some(Overlay::Series(dialog)) = self.overlay.take() else {
+            return;
+        };
+        self.overlay_closed_at = Some(Instant::now());
+        let count = dialog.book_ids.len();
+        let series = (!dialog.value.trim().is_empty()).then_some(dialog.value);
+        self.library.set_series(&dialog.book_ids, series.clone());
+        self.save_library();
+        let message = match (series, count) {
+            (Some(name), 1) => format!("Added to series “{name}”"),
+            (Some(name), _) => format!("Assigned {count} books to “{name}”"),
+            (None, 1) => "Removed from series".to_string(),
+            (None, _) => format!("Removed {count} books from their series"),
+        };
+        self.show_toast(message, cx);
+    }
+
     fn menu_hover(&mut self, ix: usize, cx: &mut Context<Self>) {
         if let Some(Overlay::Menu(menu)) = self.overlay.as_mut()
             && menu.selected != Some(ix)
@@ -606,6 +736,15 @@ impl Yomu {
     ) {
         // Bulk actions work on the selection, not on the book that was right-clicked.
         match action {
+            BookAction::SetSeries => {
+                let ids = if self.selection.contains(id) && self.selection.len() > 1 {
+                    self.selected_ids()
+                } else {
+                    vec![id.to_string()]
+                };
+                self.open_series_dialog(ids, cx);
+                return;
+            }
             BookAction::RemoveSelected => {
                 self.request_remove_selected(cx);
                 return;
@@ -688,6 +827,7 @@ impl Yomu {
                     }));
                 }
             }
+            BookAction::SetSeries => {}
             BookAction::Remove => self.remove_book(id, cx),
             // Handled in `run_book_action`; they never reach here.
             BookAction::RemoveSelected | BookAction::ClearSelection => {}
@@ -726,9 +866,7 @@ impl Yomu {
         }
         self.overlay = Some(Overlay::Confirm(ConfirmDialog {
             title: "Reset settings?".into(),
-            message:
-                "Background opacity, reading direction and page fit go back to their defaults."
-                    .into(),
+            message: "All preferences go back to their defaults.".into(),
             confirm_label: "Reset",
             action: ConfirmAction::ResetSettings,
         }));
@@ -742,6 +880,9 @@ impl Yomu {
             reader.rtl = defaults.rtl;
             reader.fit = defaults.fit;
             reader.zoom = 1.0;
+            reader.continuous = defaults.continuous;
+            reader.webcomics = defaults.webcomics;
+            reader.continuous |= reader.webcomics;
             reader.arrive = Some(Arrive::Start);
         }
         self.save_library();
@@ -843,6 +984,7 @@ impl Yomu {
                     self.close_overlay(cx);
                 }
             }
+            Some(Overlay::Series(_)) => {}
             Some(Overlay::Settings) => {
                 let current = self.library.settings().opacity;
                 match token {
@@ -859,6 +1001,43 @@ impl Yomu {
                 }
             }
             None => {}
+        }
+    }
+
+    fn on_series_key(
+        &mut self,
+        token: &str,
+        key_char: Option<&str>,
+        control: bool,
+        alt: bool,
+        cx: &mut Context<Self>,
+    ) {
+        match token {
+            "escape" => self.close_overlay(cx),
+            "enter" => self.save_series_dialog(cx),
+            "backspace" => {
+                if let Some(Overlay::Series(dialog)) = self.overlay.as_mut() {
+                    dialog.value.pop();
+                }
+                cx.notify();
+            }
+            "C-a" => {
+                if let Some(Overlay::Series(dialog)) = self.overlay.as_mut() {
+                    dialog.value.clear();
+                }
+                cx.notify();
+            }
+            _ if !control && !alt => {
+                if let Some(text) =
+                    key_char.filter(|text| !text.is_empty() && !text.chars().any(char::is_control))
+                {
+                    if let Some(Overlay::Series(dialog)) = self.overlay.as_mut() {
+                        dialog.value.push_str(text);
+                    }
+                    cx.notify();
+                }
+            }
+            _ => {}
         }
     }
 
@@ -1021,7 +1200,53 @@ impl Yomu {
         self.show_toast(message, cx);
     }
 
-    fn on_library_key(&mut self, token: &str, cx: &mut Context<Self>) {
+    fn on_library_key(
+        &mut self,
+        token: &str,
+        key_char: Option<&str>,
+        control: bool,
+        alt: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if matches!(token, "C-f" | "/" | "slash") {
+            self.search_active = true;
+            cx.notify();
+            return;
+        }
+        if self.search_active {
+            match token {
+                "escape" => {
+                    if self.search_query.is_empty() {
+                        self.search_active = false;
+                    } else {
+                        self.search_query.clear();
+                    }
+                    cx.notify();
+                }
+                "enter" => {
+                    self.search_active = false;
+                    cx.notify();
+                }
+                "backspace" => {
+                    self.search_query.pop();
+                    cx.notify();
+                }
+                "C-a" => {
+                    self.search_query.clear();
+                    cx.notify();
+                }
+                _ if !control && !alt => {
+                    if let Some(text) = key_char
+                        .filter(|text| !text.is_empty() && !text.chars().any(char::is_control))
+                    {
+                        self.search_query.push_str(text);
+                        cx.notify();
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
         match token {
             "C-a" => {
                 let order = self.library_order();
@@ -1053,6 +1278,7 @@ impl Yomu {
         }
 
         self.selection.clear();
+        self.search_active = false;
         window.set_window_title(&book.title);
         window.focus(&self.focus_handle);
 
@@ -1099,6 +1325,7 @@ impl Yomu {
                 reader.page = reader.page.min(pages.len() - 1);
                 let (page, total) = (reader.page, pages.len());
                 reader.pages = Some(Arc::new(pages));
+                reader.orig_sizes = vec![None; total];
                 if let Some(book) = self.library.get_mut(&book_id) {
                     book.page_count = total;
                     book.current_page = page;
@@ -1139,7 +1366,7 @@ impl Yomu {
             return;
         }
         // The reading position changes immediately; the slide is only a visual that catches up.
-        reader.begin_transition(target > reader.page, animate);
+        reader.begin_transition(target > reader.page, animate && !reader.continuous);
         reader.page = target;
         reader.arrive = Some(arrive);
         reader.drag = None;
@@ -1209,7 +1436,17 @@ impl Yomu {
         let Some(display) = reader.settle(&vp) else {
             return;
         };
-        let max = layout::max_offset(display, &vp);
+        let max = if reader.continuous {
+            let (tops, heights) = reader.continuous_layout(&vp);
+            (
+                (display.0 - vp.width).max(0.0),
+                (tops.last().copied().unwrap_or(0.0) + heights.last().copied().unwrap_or(0.0)
+                    - vp.height)
+                    .max(0.0),
+            )
+        } else {
+            layout::max_offset(display, &vp)
+        };
         let vertical = matches!(dir, Dir::Up | Dir::Down);
         let positive = matches!(dir, Dir::Down | Dir::Right);
         // Edge checks and repeated presses work on where the scroll is *heading*, so pressing
@@ -1233,7 +1470,7 @@ impl Yomu {
             Arrive::End
         };
 
-        if axis_max <= EDGE_EPS {
+        if axis_max <= EDGE_EPS && !(reader.continuous && vertical) {
             self.turn_by(turn_forward, count, arrive, cx);
             return;
         }
@@ -1242,7 +1479,7 @@ impl Yomu {
         } else {
             current <= EDGE_EPS
         };
-        if at_end {
+        if at_end && !(reader.continuous && vertical) {
             self.turn_by(turn_forward, 1, arrive, cx);
             return;
         }
@@ -1259,6 +1496,9 @@ impl Yomu {
         } else {
             reader.scroll_target.0 = target;
         }
+        if !reader.animate {
+            reader.off = reader.scroll_target;
+        }
         self.wake();
         cx.notify();
     }
@@ -1270,8 +1510,15 @@ impl Yomu {
         let Some(display) = reader.settle(&vp) else {
             return;
         };
-        let max = layout::max_offset(display, &vp);
-        reader.scroll_target.1 = max.1 * fraction;
+        let max = if reader.continuous {
+            let (tops, heights) = reader.continuous_layout(&vp);
+            (tops.last().copied().unwrap_or(0.0) + heights.last().copied().unwrap_or(0.0)
+                - vp.height)
+                .max(0.0)
+        } else {
+            layout::max_offset(display, &vp).1
+        };
+        reader.scroll_target.1 = max * fraction;
         self.wake();
         cx.notify();
     }
@@ -1284,22 +1531,47 @@ impl Yomu {
             let Some(old_display) = reader.settle(&vp) else {
                 return;
             };
-            let Some(orig) = reader.current().map(Reader::orig_of) else {
-                return;
-            };
-            let zoom = layout::clamp_zoom(zoom);
-            let old_origin = layout::origin(reader.off, old_display, &vp);
-            let new_display = layout::display_size(reader.fit, zoom, orig, &vp);
-            let off = layout::zoom_anchor_offset(old_origin, old_display, new_display, anchor);
-            // Zooming is immediate (and ends any slide, whose frozen page would no longer fit).
-            reader.cancel_transition();
-            reader.zoom = zoom;
-            reader.set_scroll(layout::clamp_offset(off, new_display, &vp));
-            format!(
-                "{} · {}%",
-                reader.fit.label(),
-                (zoom * 100.0).round() as i32
-            )
+            if reader.continuous {
+                let (old_tops, old_heights) = reader.continuous_layout(&vp);
+                let old_doc = old_tops.last().copied().unwrap_or(0.0)
+                    + old_heights.last().copied().unwrap_or(0.0);
+                let old_y = reader.scroll_target.1;
+                let zoom = layout::clamp_zoom(zoom);
+                reader.zoom = zoom;
+                let (new_tops, new_heights) = reader.continuous_layout(&vp);
+                let new_doc = new_tops.last().copied().unwrap_or(0.0)
+                    + new_heights.last().copied().unwrap_or(0.0);
+                reader.scroll_target.1 = if old_doc > vp.height {
+                    old_y / (old_doc - vp.height) * (new_doc - vp.height).max(0.0)
+                } else {
+                    0.0
+                };
+                let ratio = if old_display.0 > 0.0 {
+                    (reader.scroll_target.0 + anchor.0) / old_display.0
+                } else {
+                    0.5
+                };
+                reader.scroll_target.0 = (ratio * vp.width * zoom - anchor.0).max(0.0);
+                reader.off = reader.scroll_target;
+                reader.cancel_transition();
+                format!("continuous · {}%", (zoom * 100.0).round() as i32)
+            } else {
+                let Some(orig) = reader.current().map(Reader::orig_of) else {
+                    return;
+                };
+                let zoom = layout::clamp_zoom(zoom);
+                let old_origin = layout::origin(reader.off, old_display, &vp);
+                let new_display = layout::display_size(reader.fit, zoom, orig, &vp);
+                let off = layout::zoom_anchor_offset(old_origin, old_display, new_display, anchor);
+                reader.cancel_transition();
+                reader.zoom = zoom;
+                reader.set_scroll(layout::clamp_offset(off, new_display, &vp));
+                format!(
+                    "{} · {}%",
+                    reader.fit.label(),
+                    (zoom * 100.0).round() as i32
+                )
+            }
         };
         self.show_hud(message, cx);
     }
@@ -1341,6 +1613,56 @@ impl Yomu {
         );
     }
 
+    fn set_continuous(&mut self, value: Option<bool>, cx: &mut Context<Self>) {
+        let next = value.unwrap_or(!self.library.settings().continuous);
+        self.library.settings_mut().continuous = next;
+        if let Some(reader) = self.reader.as_mut() {
+            reader.continuous = next || reader.webcomics;
+            reader.zoom = 1.0;
+            reader.off = (0.0, 0.0);
+            reader.scroll_target = (0.0, 0.0);
+            reader.arrive = Some(Arrive::Start);
+            reader.cancel_transition();
+        }
+        self.save_library();
+        let webcomics = self.library.settings().webcomics;
+        self.show_hud(
+            if webcomics {
+                "webcomics mode"
+            } else if next {
+                "continuous scrolling"
+            } else {
+                "single page"
+            },
+            cx,
+        );
+    }
+
+    fn set_webcomics(&mut self, value: Option<bool>, cx: &mut Context<Self>) {
+        let next = value.unwrap_or(!self.library.settings().webcomics);
+        self.library.settings_mut().webcomics = next;
+        if let Some(reader) = self.reader.as_mut() {
+            reader.webcomics = next;
+            reader.continuous = next || self.library.settings().continuous;
+            reader.zoom = 1.0;
+            reader.off = (0.0, 0.0);
+            reader.scroll_target = (0.0, 0.0);
+            reader.arrive = Some(Arrive::Start);
+            reader.cancel_transition();
+        }
+        self.save_library();
+        self.show_hud(
+            if next {
+                "webcomics mode"
+            } else if self.library.settings().continuous {
+                "continuous scrolling"
+            } else {
+                "single page"
+            },
+            cx,
+        );
+    }
+
     fn on_wheel(
         &mut self,
         delta: (f32, f32),
@@ -1364,8 +1686,24 @@ impl Yomu {
             return;
         }
 
-        let max = layout::max_offset(display, &vp);
-        if max.1 > EDGE_EPS {
+        let max = if reader.continuous {
+            let (tops, heights) = reader.continuous_layout(&vp);
+            (
+                (display.0 - vp.width).max(0.0),
+                (tops.last().copied().unwrap_or(0.0) + heights.last().copied().unwrap_or(0.0)
+                    - vp.height)
+                    .max(0.0),
+            )
+        } else {
+            layout::max_offset(display, &vp)
+        };
+        if reader.continuous {
+            let target = (reader.scroll_target.1 - dy).clamp(0.0, max.1);
+            reader.scroll_target.1 = target;
+            if !discrete || !reader.animate {
+                reader.off.1 = target;
+            }
+        } else if max.1 > EDGE_EPS {
             // Wheel down gives a negative dy and should move further down the page.
             let at_bottom = reader.scroll_target.1 >= max.1 - EDGE_EPS;
             let at_top = reader.scroll_target.1 <= EDGE_EPS;
@@ -1431,11 +1769,19 @@ impl Yomu {
             moved: true,
             ..drag
         });
-        reader.set_scroll(layout::clamp_offset(
-            (drag.off0.0 - dx, drag.off0.1 - dy),
-            display,
-            &vp,
-        ));
+        let target = (drag.off0.0 - dx, drag.off0.1 - dy);
+        if reader.continuous {
+            let (tops, heights) = reader.continuous_layout(&vp);
+            let max = (
+                (display.0 - vp.width).max(0.0),
+                (tops.last().copied().unwrap_or(0.0) + heights.last().copied().unwrap_or(0.0)
+                    - vp.height)
+                    .max(0.0),
+            );
+            reader.set_scroll((target.0.clamp(0.0, max.0), target.1.clamp(0.0, max.1)));
+        } else {
+            reader.set_scroll(layout::clamp_offset(target, display, &vp));
+        }
         cx.notify();
     }
 
@@ -1477,11 +1823,27 @@ impl Yomu {
 
         // An open menu or dialog gets every key; nothing leaks through to the reader.
         if self.overlay.is_some() {
+            if matches!(self.overlay, Some(Overlay::Series(_))) {
+                self.on_series_key(
+                    &token,
+                    keystroke.key_char.as_deref(),
+                    mods.control,
+                    mods.alt,
+                    cx,
+                );
+                return;
+            }
             self.on_overlay_key(&token, window, cx);
             return;
         }
         let Some(reader) = self.reader.as_mut() else {
-            self.on_library_key(&token, cx);
+            self.on_library_key(
+                &token,
+                keystroke.key_char.as_deref(),
+                mods.control,
+                mods.alt,
+                cx,
+            );
             return;
         };
 
@@ -1583,6 +1945,8 @@ impl Yomu {
                 };
                 self.show_hud(message, cx);
             }
+            Action::SetContinuous(value) => self.set_continuous(value, cx),
+            Action::SetWebcomics(value) => self.set_webcomics(value, cx),
             Action::ToggleInfo => {
                 if let Some(reader) = self.reader.as_mut() {
                     reader.show_info = !reader.show_info;
@@ -1613,7 +1977,11 @@ impl Yomu {
         let vp = viewport_of(window);
         let animate = self.animations_enabled();
 
-        let (wanted, animating): (Vec<(usize, u32)>, bool) = {
+        let (wanted, animating, progress_changed): (
+            Vec<(usize, u32)>,
+            bool,
+            Option<(String, usize)>,
+        ) = {
             let Some(reader) = self.reader.as_mut() else {
                 return false;
             };
@@ -1622,8 +1990,24 @@ impl Yomu {
             let Some(pages) = reader.pages.clone() else {
                 return false;
             };
+            let previous_page = reader.page;
             reader.settle(&vp);
             let animating = reader.advance_animations(dt, &vp);
+            if reader.continuous {
+                reader.settle(&vp);
+            }
+            let progress_changed = if reader.continuous && reader.page != previous_page {
+                let id = reader.book_id.clone();
+                let page = reader.page;
+                if let Some(book) = self.library.get_mut(&id) {
+                    book.current_page = page;
+                    book.opened = true;
+                    book.last_read = Some(now_secs());
+                }
+                Some((id, page))
+            } else {
+                None
+            };
 
             // Keep a bounded window of decoded pages around the current one, and stay under the
             // memory budget even with very large pages.
@@ -1635,7 +2019,32 @@ impl Yomu {
                     bytes: page.bytes,
                 })
                 .collect();
-            for ix in pagecache::plan_eviction(&entries, reader.page, pagecache::BUDGET_BYTES) {
+            let keep: HashSet<usize> = if reader.continuous {
+                let (tops, heights) = reader.continuous_layout(&vp);
+                let low = reader.off.1;
+                let high = low + vp.height;
+                let visible: Vec<usize> = tops
+                    .iter()
+                    .zip(&heights)
+                    .enumerate()
+                    .filter_map(|(ix, (top, height))| {
+                        (*top < high && *top + *height > low).then_some(ix)
+                    })
+                    .collect();
+                let first = visible.first().copied().unwrap_or(reader.page);
+                let last = visible.last().copied().unwrap_or(reader.page);
+                (first.saturating_sub(1)..=(last + 2).min(pages.len().saturating_sub(1))).collect()
+            } else {
+                (reader.page.saturating_sub(pagecache::KEEP_BEHIND)
+                    ..=reader.page + pagecache::KEEP_AHEAD)
+                    .collect()
+            };
+            for ix in pagecache::plan_eviction_with_keep(
+                &entries,
+                reader.page,
+                pagecache::BUDGET_BYTES,
+                &keep,
+            ) {
                 if let Some(page) = reader.images.remove(&ix) {
                     // A page that is still sliding out is freed when its slide ends instead.
                     let leaving = reader
@@ -1667,21 +2076,35 @@ impl Yomu {
                 }
             };
 
-            let wanted = pagecache::prefetch_order(reader.page, pages.len())
+            let wanted_indices: Vec<usize> = if reader.continuous {
+                keep.iter()
+                    .copied()
+                    .filter(|ix| *ix < pages.len())
+                    .collect()
+            } else {
+                pagecache::prefetch_order(reader.page, pages.len())
+            };
+            let wanted = wanted_indices
                 .into_iter()
                 .map(|ix| {
-                    (
-                        ix,
-                        if ix == reader.page {
-                            current_tier
-                        } else {
-                            neighbour_tier
-                        },
-                    )
+                    let tier = if reader.continuous {
+                        let width = vp.width * reader.zoom * vp.scale;
+                        let (w, h) = reader.orig_sizes.get(ix).and_then(|v| *v).unwrap_or((2, 3));
+                        layout::tier_for(width.max(width * h as f32 / w.max(1) as f32))
+                    } else if ix == reader.page {
+                        current_tier
+                    } else {
+                        neighbour_tier
+                    };
+                    (ix, tier)
                 })
                 .collect();
-            (wanted, animating)
+            (wanted, animating, progress_changed)
         };
+
+        if progress_changed.is_some() {
+            self.save_library();
+        }
 
         // Textures released by finished slides are freed on the next frame.
         if let Some(reader) = self.reader.as_mut() {
@@ -1751,6 +2174,21 @@ impl Yomu {
         reader.pending.remove(&ix);
         match result {
             Ok((image, orig, bytes)) => {
+                let old_top = if reader.continuous && ix < reader.page {
+                    let (tops, _) = reader.continuous_layout(&reader.viewport);
+                    tops.get(reader.page).copied()
+                } else {
+                    None
+                };
+                if let Some(size) = reader.orig_sizes.get_mut(ix) {
+                    *size = Some(orig);
+                }
+                if let Some(old_top) = old_top {
+                    let (tops, _) = reader.continuous_layout(&reader.viewport);
+                    let shift = tops.get(reader.page).copied().unwrap_or(old_top) - old_top;
+                    reader.off.1 = (reader.off.1 + shift).max(0.0);
+                    reader.scroll_target.1 = (reader.scroll_target.1 + shift).max(0.0);
+                }
                 if let Some(old) = reader.images.insert(
                     ix,
                     Page {
@@ -1779,6 +2217,7 @@ impl Yomu {
             Overlay::Menu(menu) => self.render_menu(menu, cx),
             Overlay::Confirm(dialog) => self.render_confirm(dialog, cx),
             Overlay::Properties(dialog) => self.render_properties(dialog, cx),
+            Overlay::Series(dialog) => self.render_series_dialog(dialog, cx),
             Overlay::Settings => self.render_settings(cx),
         })
     }
@@ -2000,9 +2439,84 @@ impl Yomu {
             .into_any_element()
     }
 
+    fn render_series_dialog(&self, dialog: &SeriesDialog, cx: &mut Context<Self>) -> AnyElement {
+        self.scrim(true, cx)
+            .child(
+                self.panel(460.)
+                    .child(
+                        div()
+                            .text_lg()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(if dialog.book_ids.len() == 1 {
+                                "Set series"
+                            } else {
+                                "Set series for selected books"
+                            }),
+                    )
+                    .child(div().text_color(rgb(MUTED)).child(
+                        "A folder name is suggested when the books share a parent folder. Edit it, or clear the field to leave them ungrouped.",
+                    ))
+                    .child(
+                        div()
+                            .id("series-name-input")
+                            .w_full()
+                            .min_h(px(36.))
+                            .px_3()
+                            .py_2()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(rgb(ACCENT))
+                            .bg(rgb(BG))
+                            .text_color(rgb(TEXT))
+                            .child(if dialog.value.is_empty() {
+                                "Type a series name…".to_string()
+                            } else {
+                                dialog.value.clone()
+                            }),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .justify_between()
+                            .items_center()
+                            .child(div().text_xs().text_color(rgb(MUTED)).child(
+                                "Type · Enter to save · Esc to cancel · Ctrl+A clears",
+                            ))
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .gap_2()
+                                    .child(panel_button(
+                                        "series-cancel",
+                                        "Cancel",
+                                        ButtonKind::Normal,
+                                        true,
+                                        cx.listener(|this, _: &ClickEvent, _, cx| {
+                                            this.close_overlay(cx)
+                                        }),
+                                    ))
+                                    .child(panel_button(
+                                        "series-save",
+                                        "Save",
+                                        ButtonKind::Primary,
+                                        true,
+                                        cx.listener(|this, _: &ClickEvent, _, cx| {
+                                            this.save_series_dialog(cx)
+                                        }),
+                                    )),
+                            ),
+                    ),
+            )
+            .into_any_element()
+    }
+
     fn render_settings(&self, cx: &mut Context<Self>) -> AnyElement {
         let settings = self.library.settings();
         let opacity = settings.opacity;
+        let continuous = settings.continuous;
+        let webcomics = settings.webcomics;
         let fraction = (opacity - OPACITY_MIN) / (OPACITY_MAX - OPACITY_MIN);
         let is_default = *settings == Settings::default();
         let bounds = self.slider.bounds.clone();
@@ -2096,9 +2610,31 @@ impl Yomu {
                                     ),
                             )
                             .child(track)
+                            .child(panel_button(
+                                "settings-continuous",
+                                if continuous { "Reading mode: Continuous" } else { "Reading mode: Single page" },
+                                ButtonKind::Normal,
+                                true,
+                                cx.listener(|this, _: &ClickEvent, _, cx| {
+                                    this.set_continuous(None, cx);
+                                }),
+                            ))
+                            .child(panel_button(
+                                "settings-webcomics",
+                                if webcomics {
+                                    "Webcomics mode: On"
+                                } else {
+                                    "Webcomics mode: Off"
+                                },
+                                ButtonKind::Normal,
+                                true,
+                                cx.listener(|this, _: &ClickEvent, _, cx| {
+                                    this.set_webcomics(None, cx);
+                                }),
+                            ))
                             .child(div().text_xs().text_color(rgb(MUTED)).child(
-                                "Lower values let the desktop show through the window \
-                                     background. Pages, covers and text stay fully opaque.",
+                                "Continuous mode stacks pages vertically. Single page mode turns pages at the edge. \
+                                     Webcomics mode forces a gapless vertical strip. Lower opacity lets the desktop show through the background.",
                             )),
                     )
                     .child(
@@ -2129,8 +2665,19 @@ impl Yomu {
     }
 
     fn render_library(&self, cx: &mut Context<Self>) -> AnyElement {
-        let books = self.library.books();
-        let count = books.len();
+        let all_books = self.library.books();
+        let count = all_books.len();
+        let books: Vec<&Book> = all_books
+            .iter()
+            .filter(|book| {
+                search::matches(
+                    &book.title,
+                    &book.path,
+                    book.series.as_deref(),
+                    &self.search_query,
+                )
+            })
+            .collect();
         let status: Option<SharedString> = if self.importing {
             Some("Importing…".into())
         } else {
@@ -2140,15 +2687,60 @@ impl Yomu {
         let selected = self.selection.len();
         let subtitle = if selected > 0 {
             format!("{selected} of {count} selected")
+        } else if !self.search_query.trim().is_empty() {
+            format!("{} of {count} books", books.len())
         } else {
             format!("{count} {}", if count == 1 { "book" } else { "books" })
         };
+
+        let search_label = if self.search_query.is_empty() {
+            "Search title or path…".to_string()
+        } else {
+            self.search_query.clone()
+        };
+        let search_field = div()
+            .id("library-search")
+            .w(px(230.))
+            .h(px(32.))
+            .px_3()
+            .flex()
+            .items_center()
+            .rounded_md()
+            .border_1()
+            .border_color(rgb(if self.search_active { ACCENT } else { TRACK }))
+            .bg(rgb(SURFACE))
+            .text_sm()
+            .text_color(rgb(if self.search_query.is_empty() {
+                MUTED
+            } else {
+                TEXT
+            }))
+            .child(div().truncate().child(search_label))
+            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                this.search_active = true;
+                cx.notify();
+            }));
 
         let right = div()
             .flex()
             .flex_row()
             .items_center()
             .gap_3()
+            .child(search_field)
+            .child(button(
+                "group-series",
+                if self.library.settings().group_series {
+                    "Grouped"
+                } else {
+                    "Group by series"
+                },
+                cx.listener(|this, _: &ClickEvent, _, cx| {
+                    let settings = this.library.settings_mut();
+                    settings.group_series = !settings.group_series;
+                    this.save_library();
+                    cx.notify();
+                }),
+            ))
             .children(status.map(|text| {
                 div()
                     .max_w(px(520.))
@@ -2232,7 +2824,7 @@ impl Yomu {
             )
             .child(right);
 
-        let body = if books.is_empty() {
+        let body = if count == 0 {
             div()
                 .flex_1()
                 .flex()
@@ -2249,6 +2841,60 @@ impl Yomu {
                 .child(div().text_sm().text_color(rgb(MUTED)).child(
                     "Drop CBZ files or folders onto this window, or use Add files (Ctrl+O).",
                 ))
+                .into_any_element()
+        } else if books.is_empty() {
+            div()
+                .flex_1()
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .gap_2()
+                .child(
+                    div()
+                        .text_xl()
+                        .text_color(rgb(TEXT))
+                        .child("No matching books"),
+                )
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(rgb(MUTED))
+                        .child("Try another title or source path."),
+                )
+                .into_any_element()
+        } else if self.library.settings().group_series {
+            let mut groups: std::collections::BTreeMap<String, Vec<&Book>> =
+                std::collections::BTreeMap::new();
+            let mut unassigned = Vec::new();
+            for book in &books {
+                match book
+                    .series
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|name| !name.is_empty())
+                {
+                    Some(name) => groups.entry(name.to_string()).or_default().push(book),
+                    None => unassigned.push(*book),
+                }
+            }
+            let mut groups: Vec<_> = groups.into_iter().collect();
+            groups.sort_by(|(a, _), (b, _)| natural_cmp(a, b));
+            let mut sections: Vec<AnyElement> = groups
+                .iter()
+                .map(|(name, members)| self.render_series_section(name, members, cx))
+                .collect();
+            if !unassigned.is_empty() {
+                sections.push(self.render_series_section("Unassigned", &unassigned, cx));
+            }
+            div()
+                .id("grid")
+                .flex_1()
+                .min_h_0()
+                .overflow_y_scroll()
+                .px_6()
+                .pb_6()
+                .child(div().flex().flex_col().gap_4().children(sections))
                 .into_any_element()
         } else {
             div()
@@ -2276,6 +2922,55 @@ impl Yomu {
             .child(header)
             .child(body)
             .into_any_element()
+    }
+
+    fn render_series_section(
+        &self,
+        name: &str,
+        books: &[&Book],
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let key = if name == "Unassigned" {
+            "series:\0unassigned".to_string()
+        } else {
+            format!("series:{name}")
+        };
+        let collapsed = self.collapsed_series.contains(&key);
+        let toggle_key = key.clone();
+        let header = div()
+            .id(SharedString::from(format!("series-heading-{name}")))
+            .w_full()
+            .px_1()
+            .py_2()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .cursor_pointer()
+            .text_sm()
+            .font_weight(FontWeight::SEMIBOLD)
+            .text_color(rgb(TEXT))
+            .child(if collapsed { "▸" } else { "▾" })
+            .child(format!("{name} · {}", books.len()))
+            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                if !this.collapsed_series.insert(toggle_key.clone()) {
+                    this.collapsed_series.remove(&toggle_key);
+                }
+                cx.notify();
+            }));
+        let mut section = div().w_full().flex().flex_col().gap_2().child(header);
+        if !collapsed {
+            section = section.child(
+                div()
+                    .w_full()
+                    .flex()
+                    .flex_row()
+                    .flex_wrap()
+                    .gap_6()
+                    .children(books.iter().map(|book| self.book_card(book, cx))),
+            );
+        }
+        section.into_any_element()
     }
 
     fn book_card(&self, book: &Book, cx: &mut Context<Self>) -> AnyElement {
@@ -2386,6 +3081,30 @@ impl Yomu {
         let mut content: Vec<AnyElement> = Vec::new();
         if let Some(error) = &reader.error {
             content.push(centered(format!("Couldn't open this book: {error}")));
+        } else if reader.continuous {
+            let (tops, heights) = reader.continuous_layout(&vp);
+            let width = vp.width * reader.zoom;
+            let left = (vp.width - width) / 2.0 - reader.off.0;
+            let visible_top = reader.off.1;
+            let visible_bottom = visible_top + vp.height;
+            for (ix, (top, height)) in tops.iter().zip(&heights).enumerate() {
+                if *top + *height < visible_top || *top > visible_bottom {
+                    continue;
+                }
+                if let Some(page) = reader.images.get(&ix) {
+                    content.push(page_layer(
+                        &page.image,
+                        left,
+                        *top - reader.off.1,
+                        (width, *height),
+                    ));
+                } else if let Some(error) = reader.failed.get(&ix) {
+                    content.push(centered(format!(
+                        "Couldn't decode page {}: {error}",
+                        ix + 1
+                    )));
+                }
+            }
         } else {
             let (shift_out, shift_in) = match &reader.transition {
                 Some(transition) => (
@@ -2438,7 +3157,7 @@ impl Yomu {
             pill(
                 div().absolute().bottom_4().left_0().right_0(),
                 format!(
-                    "{} / {}  ·  {}  ·  {}%  ·  {}",
+                    "{} / {}  ·  {}  ·  {}%  ·  {}  ·  {}",
                     reader.page + 1,
                     reader.total,
                     reader.fit.label(),
@@ -2447,6 +3166,13 @@ impl Yomu {
                         "right to left"
                     } else {
                         "left to right"
+                    },
+                    if reader.webcomics {
+                        "webcomics"
+                    } else if reader.continuous {
+                        "continuous"
+                    } else {
+                        "single page"
                     }
                 ),
             )
@@ -2639,7 +3365,10 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
             ("+  -  0  / zi  zo", "zoom in / out / reset"),
             ("ctrl+wheel   drag", "zoom at the pointer   pan the page"),
             ("zt  zz  zb", "scroll to top / middle / bottom"),
-            ("r  i  f", "reading direction, page info, fullscreen"),
+            (
+                "r  v  w  i  f",
+                "direction, continuous mode, webcomics, page info, fullscreen",
+            ),
         ],
     ),
     (
@@ -2650,6 +3379,8 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
             (":rtl  :ltr  :q  :qa", "direction, back to library, quit"),
             (":settings  Ctrl+,", "open the settings"),
             (":animate [on|off]", "page-turn slide and scroll glide"),
+            (":continuous [on|off]", "toggle stacked continuous reading"),
+            (":webcomics [on|off]", "force gapless webcomics strip mode"),
         ],
     ),
 ];
@@ -2921,6 +3652,7 @@ mod tests {
             Some(Overlay::Menu(_)) => "menu",
             Some(Overlay::Confirm(_)) => "confirm",
             Some(Overlay::Properties(_)) => "properties",
+            Some(Overlay::Series(_)) => "series",
             Some(Overlay::Settings) => "settings",
         })
     }
@@ -3869,6 +4601,7 @@ mod tests {
         let book = Book {
             id: "b".into(),
             title: "Test".into(),
+            series: None,
             path: PathBuf::from("/tmp/test.cbz"),
             kind: SourceKind::Archive,
             page_count: pages,

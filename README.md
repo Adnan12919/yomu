@@ -10,6 +10,7 @@ rendering is GPU-accelerated, and it talks to Wayland directly (no webview, no T
 - Multiple selection (Ctrl/Shift-click, Ctrl+A) for removing many books at once
 - Settings panel with a live background-opacity slider (`Ctrl+,`)
 - Fit page / width / height / original size, zoom in and out, pan by dragging
+- Continuous vertical reading mode and gapless webcomics strip mode; single-page mode remains available
 - Vim motions (counts, `gg`, `G`, marks, `:` commands) next to the normal keys
 - Left-to-right by default, like a Western comic; right-to-left (manga) is a preference (`r` or `:rtl`)
 - A short slide between pages and a smooth scroll glide, frame-rate independent, switchable (`:animate off`)
@@ -90,6 +91,7 @@ Ctrl+wheel) work too. Press `?` in the reader for a cheat sheet.
 | `Ctrl`+click, `Shift`+click | Select books (see below) |
 | `Ctrl+A`, `Delete`, `Esc` | Select all, remove the selection, clear the selection |
 | `Ctrl+O` / `Ctrl+Shift+O` | Add files / Add folder |
+| `/`, click the search field, or `Ctrl+F` | Search titles, source paths, and series |
 | `Ctrl+,` or the **Settings** button | Settings (works in the reader too) |
 
 **Moving**
@@ -123,6 +125,8 @@ Counts work on motions: `5j` scrolls five steps, `3J` skips three pages. Marks a
 | `Ctrl` + wheel | Zoom at the pointer |
 | `zt` `zz` `zb` | Scroll to the top / middle / bottom of the page |
 | `r` | Toggle right-to-left / left-to-right |
+| `v` | Toggle continuous vertical scrolling |
+| `w` | Toggle gapless webcomics mode (forces continuous scrolling) |
 | `i` | Show page number, fit mode and zoom |
 | `f`, `F11` | Fullscreen |
 | `?` | Help |
@@ -137,6 +141,8 @@ Counts work on motions: `5j` scrolls five steps, `3J` skips three pages. Marks a
 | `:fit width`, `:fit page`, `:fit height`, `:fit original` | Set the fit mode |
 | `:zoom 150` | Zoom to 150% of the fit size (`:zoom` resets) |
 | `:rtl`, `:ltr` | Reading direction |
+| `:continuous on`, `:continuous off` | Stack pages vertically or return to single-page reading |
+| `:webcomics on`, `:webcomics off` | Force gapless pages or restore the normal reading mode |
 | `:q` | Back to the library |
 | `:qa` | Quit |
 
@@ -155,10 +161,24 @@ Manga readers press `r` once and it sticks.
   Deselect the last one (or press `Esc` / **Cancel**) and clicking opens books again.
 - While books are selected the header shows `N of M selected` with **Select all**, **Remove** and **Cancel**
   in place of the import and settings buttons. `Ctrl+A` selects everything and `Delete` removes the selection.
-- Right-click a selected book for a small bulk menu (**Clear Selection**, **Remove N Books from Library**).
+- Right-click a selected book for a bulk menu (**Clear Selection**, **Set Series for Selected Books…**, **Remove N Books from Library**).
   Right-clicking a book that is not selected drops the selection and shows that book's normal menu.
 - Removal only forgets the books; the comic files are never deleted. It asks first only if some of the selected
   books have progress or marks that would be lost, and it saves once for the whole batch.
+
+## Searching and grouping the library
+
+Click the search field in the library header, press `/`, or press `Ctrl+F`, then type. Search matches a case-insensitive
+substring in the book title, source path, or assigned series. The filter is temporary and does not change library data;
+selection and bulk actions continue to refer to the full library. Press `Enter` to stop typing while keeping the
+filter, or `Esc` to clear the query (press `Esc` again to leave search).
+
+Click **Group by series** in the library header to switch to collapsible series sections; click **Grouped** to
+return to the regular library grid. The choice is saved in `library.json` and defaults to off. Unassigned books
+appear in their own section. Right-click a book and choose **Set Series…** / **Change Series…** to assign one,
+or select several books and choose **Set Series for Selected Books…** from a selected book's context menu.
+The editor suggests the common source parent folder when possible. Clear the name to unassign books. Series
+names are trimmed, repeated whitespace is collapsed, and names that differ only by capitalization share one group.
 
 ## Context menu
 
@@ -166,9 +186,9 @@ Right-click a book. Only the actions that make sense for its state are shown:
 
 | Book state | Menu |
 |------------|------|
-| Not started | Start Reading · Mark as Read · Open File Location · Properties · Remove from Library |
-| In progress | Resume Reading · Start from Beginning · Mark as Read · Reset Progress… · Open File Location · Properties · Remove from Library |
-| Finished | Start from Beginning · Mark as Unread · Open File Location · Properties · Remove from Library |
+| Not started | Start Reading · Mark as Read · Open File Location · Properties · Set Series… · Remove from Library |
+| In progress | Resume Reading · Start from Beginning · Mark as Read · Reset Progress… · Open File Location · Properties · Set Series… · Remove from Library |
+| Finished | Start from Beginning · Mark as Unread · Open File Location · Properties · Set Series… · Remove from Library |
 
 - Navigate with `Up`/`Down` (or `j`/`k`, `Tab`), `Home`/`End`, `Enter` to run, `Esc` to close. Clicking outside closes it
   without clicking the book underneath. The menu slides back inside the window near the edges.
@@ -186,7 +206,13 @@ Right-click a book. Only the actions that make sense for its state are shown:
 
 - **Window background opacity**, 30% to 100%, default 100%. Drag the slider or use `Left`/`Right` (5% steps),
   `Home`/`End`. It applies immediately and is saved when you let go. **Reset to Defaults** asks first and also
-  restores reading direction and page fit; it is greyed out when everything is already at the defaults.
+  restores all preferences; it is greyed out when everything is already at the defaults.
+- **Reading mode**, single page or continuous vertical scrolling. The choice is remembered between launches;
+  use `v`, the Settings panel, or `:continuous [on|off]` in the reader. In continuous mode, `j`/`k`, wheel and touchpad
+  scroll through stacked pages, while `J`/`K` and page-number commands jump between pages.
+- **Webcomics mode** shows pages as one connected vertical strip with no gap between adjacent pages. Toggle it
+  with `w`, the Settings panel, or `:webcomics [on|off]`. It forces continuous scrolling while active, then restores
+  the saved single-page or continuous reading mode when turned off.
 
 Stored preferences are read leniently: a missing or invalid value falls back to its default (out-of-range numbers
 are clamped) instead of affecting your library.
@@ -253,6 +279,11 @@ Two crates from gpui's dependency tree are vendored with small fixes (see the co
 
 ## Development
 
+For coding-agent instructions, architecture, persistence invariants, and change recipes, see
+[AGENTS.md](AGENTS.md), [docs/architecture.md](docs/architecture.md),
+[docs/development.md](docs/development.md), [docs/ui-redesign-plan.md](docs/ui-redesign-plan.md),
+and [ROADMAP.md](ROADMAP.md).
+
 ```sh
 cargo test       # core logic plus UI tests that drive the real views with simulated mouse and keyboard input
 ```
@@ -272,5 +303,5 @@ The code is split so that everything except the window lives in the library crat
 ## Not done yet
 
 - CBR/CB7 (needs a pure-Rust RAR/7z reader; CBR files are rejected with a clear message)
-- Double-page spreads, continuous scroll, pinch zoom
-- Search, sorting options, series grouping
+- Double-page spreads, pinch zoom
+- Sorting options

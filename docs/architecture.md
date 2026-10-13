@@ -1,0 +1,74 @@
+# Architecture
+
+## Runtime shape
+
+The binary starts in `src/main.rs`, initializes gpui and the app window, then owns the `Yomu` application state. The library crate (`src/lib.rs`) exports the core modules and deliberately does not depend on gpui. This keeps most behavior deterministic and testable without creating a window.
+
+```text
+gpui window / Yomu (src/main.rs)
+  ├─ Library + Settings (src/library.rs) ── JSON + covers in XDG data dir
+  ├─ Reader state ── page list from archive.rs
+  │                    └─ async read/decode/scale ── pagecache.rs policy
+  ├─ Input parser (vim.rs) ── actions applied to reader
+  ├─ View geometry (layout.rs) and motion (motion.rs)
+  └─ menu.rs / selection.rs ── UI-independent interaction rules
+```
+
+## Modules and ownership
+
+| Module | Responsibility | Important boundaries |
+|---|---|---|
+| `main.rs` | gpui app/window, library and reader views, key/mouse dispatch, overlays/dialogs, rendering, background-task coordination | UI integration layer; it is large, so prefer extracting pure logic into the core modules when adding reusable behavior. |
+| `archive.rs` | Enumerate and read CBZ/ZIP pages or images in folders | Filters supported image names, ignores hidden/resource-fork files, natural-sorts names, limits archive page inflation. Source types are `Archive` and `Folder`. |
+| `imaging.rs` | Decode supported images, scale for display, create JPEG covers | No gpui dependency. Decoded pixel buffers are BGRA for gpui; original dimensions are retained for layout. Has dimension guardrails. |
+| `library.rs` | Book model/status/progress, settings, JSON load/save, imports, generated covers | `DataDirs` resolves storage. `Library` owns persisted data; comic files remain at their original paths. Format version currently 2. Continuous mode, webcomics mode, and series grouping are lenient settings, defaulting off for older libraries. Each book's optional series name defaults to unassigned when loading older data. |
+| `layout.rs` | Fit modes, zoom bounds/steps, viewport geometry, pan offsets, decode tiers | Pure math. Page indices and geometry do not depend on reading direction except arrival placement. |
+| `vim.rs` | Turn key tokens and command-line input into reader actions | Knows no UI. The UI consumes `Action` values and performs side effects. |
+| `motion.rs` | Frame-time based scroll easing, page-turn transitions, reduced-motion detection | Pure calculations/state machines; avoid tying animation duration to frame count. |
+| `pagecache.rs` | Prefetch order and eviction planning | Pure policy. Current page is preserved even if that alone exceeds the budget. Current constants: 3 ahead, 1 prefetched behind, keep 2 behind/3 ahead, 320 MiB decoded-page budget. |
+| `selection.rs` | Library multi-selection and range anchor semantics | Pure state; return selected IDs in library order at the call site for stable batch operations. |
+| `search.rs` | Case-insensitive title/source-path/series substring matching | Pure helper; query state is transient in the UI and search never changes library ordering or stored books. |
+| `menu.rs` | Context menu actions, navigation, confirmations, properties rows | Pure menu rules; UI decides how entries are drawn and dispatched. |
+| `util.rs` | Natural ordering, FNV-1a IDs, date/size helpers | Shared small helpers. |
+
+## Main data and control flows
+
+### Import
+
+`library::import_paths` expands selected files/folders into candidates, scans image folders with a depth limit, determines source kind, enumerates pages, creates a stable path-derived ID and generates a cover. The resulting books are added to the `Library`, sorted, and saved. An imported book references the original path; it is not copied. Archive and folder page names are naturally sorted.
+
+### Opening and reading
+
+The UI gets the selected `Book`, enumerates its pages with `archive::list_pages`, clamps/restores its saved zero-based page index, and requests bytes and image processing in background work. `imaging::decode_fit_bgra` returns pixels scaled to an appropriate device-pixel tier chosen using layout/zoom. gpui image objects are then used by rendering. Page index updates and progress persistence happen on navigation; direction changes which control means forward/backward but does not change the index model.
+
+`pagecache` determines what should be loaded and retained. A cache change should preserve the current page, bound decoded buffers, and account for image dimensions/bytes. The policy's 320 MiB is a decoded image budget, not a hard bound on all process memory: GPU textures, source bytes, allocator overhead, and transient decode buffers can add to RSS.
+
+### Persistence
+
+Default storage is `$XDG_DATA_HOME/yomu/` (normally `~/.local/share/yomu/`); `YOMU_DATA_DIR` overrides the root. `library.json` contains the version, books, progress, marks, and settings. Generated cover JPEGs live in `covers/<book-id>.jpg`. The comic source is never modified by library operations.
+
+Settings currently live in `library.json`, not a separate config file. `Settings::from_value` defaults missing/invalid fields and clamps opacity. When a default's meaning changes, update the library version/migration deliberately; migrations should be idempotent and covered by tests.
+
+### Input and animation
+
+`vim::Vim` parses tokens and command-line text into `Action`s; `main.rs` applies actions. `layout.rs` calculates fit/zoom/pan; `motion.rs` advances transitions and scroll using elapsed frame time. Respect the environment/desktop reduced-motion policy as well as the stored animation preference.
+
+Continuous mode is owned by `Reader` and persisted in `Settings`. It stacks page images vertically at the current viewport width, keeps known source dimensions separately from evictable decoded textures, estimates unknown pages as portrait until decode completes, and updates the saved current page as the viewport crosses pages. Cache retention follows the visible range plus nearby pages, subject to the existing decoded-memory budget. Webcomics mode is a persisted override that forces this layout and sets the inter-page gap to zero; turning it off restores the saved continuous/single-page preference. Single-page mode retains page-turn behavior.
+
+## Invariants worth preserving
+
+- Library-owned mutations are saved to disk; removal forgets metadata and covers but never deletes source comics.
+- `Book.series` is optional persisted metadata; grouping is an opt-in persisted library setting. Assignment trims and normalizes whitespace, and reuses existing spelling case-insensitively to avoid duplicate groups.
+- Grouped library rendering applies the current search filter before forming collapsible sections; series groups use natural ordering and unassigned books appear last.
+- A zero-based page index is clamped against the enumerated page count, and finished status means the final page is current.
+- Archive/folder sorting is natural (e.g. `2` before `10`) and hidden junk is excluded.
+- Archive entry size and decoded image pixel count have defensive limits.
+- Page rendering consumes BGRA buffers; changing channel order can produce incorrect colors.
+- Input parsing and core state rules remain independent of gpui where practical.
+- Async work must not apply stale results to a different book/page/request. Follow the existing request identity/cancellation checks in `main.rs` when extending it.
+
+## Testing map
+
+Tests are mostly colocated with each module. Pure logic tests cover archive ordering/limits, geometry, status/progress, migration/settings parsing, selection, menu rules, input parsing, page-cache eviction and animation timing. `main.rs` also contains gpui test-support tests for interactions and view state. Inspect nearby tests before extending a behavior; tests may reveal edge cases beyond the README description. `cargo test perf_ -- --ignored --nocapture` runs ignored benchmarks.
+
+The Nix package sets `doCheck = false`; packaging builds do not run the test suite. The development shell's `devenv test` runs `cargo test`.

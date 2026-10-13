@@ -51,6 +51,10 @@ pub enum Action {
     },
     /// `None` toggles.
     SetAnimations(Option<bool>),
+    /// `None` toggles continuous reading mode.
+    SetContinuous(Option<bool>),
+    /// `None` toggles gapless webcomics mode.
+    SetWebcomics(Option<bool>),
     ToggleInfo,
     ToggleHelp,
     ToggleFullscreen,
@@ -210,6 +214,8 @@ impl Vim {
                 vec![]
             }
             "r" => vec![Action::ToggleDirection],
+            "v" => vec![Action::SetContinuous(None)],
+            "w" => vec![Action::SetWebcomics(None)],
             "i" => vec![Action::ToggleInfo],
             "?" => vec![Action::ToggleHelp],
             "f" => vec![Action::ToggleFullscreen],
@@ -349,6 +355,20 @@ pub fn parse_command(line: &str) -> Vec<Action> {
         }
         ("animate" | "animations" | "anim", Some("off" | "false" | "0" | "no")) => {
             vec![Action::SetAnimations(Some(false))]
+        }
+        ("continuous" | "scroll", None) => vec![Action::SetContinuous(None)],
+        ("continuous" | "scroll", Some("on" | "true" | "1" | "yes")) => {
+            vec![Action::SetContinuous(Some(true))]
+        }
+        ("continuous" | "scroll", Some("off" | "false" | "0" | "no")) => {
+            vec![Action::SetContinuous(Some(false))]
+        }
+        ("webcomics" | "webcomic", None) => vec![Action::SetWebcomics(None)],
+        ("webcomics" | "webcomic", Some("on" | "true" | "1" | "yes")) => {
+            vec![Action::SetWebcomics(Some(true))]
+        }
+        ("webcomics" | "webcomic", Some("off" | "false" | "0" | "no")) => {
+            vec![Action::SetWebcomics(Some(false))]
         }
         ("mark", Some(key)) => match single_char(key) {
             Some(c) if c.is_alphabetic() => vec![Action::SetMark(c)],

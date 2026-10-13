@@ -54,6 +54,9 @@ impl DataDirs {
 pub struct Book {
     pub id: String,
     pub title: String,
+    /// Optional user-assigned series. Missing values in existing libraries remain ungrouped.
+    #[serde(default)]
+    pub series: Option<String>,
     pub path: PathBuf,
     pub kind: SourceKind,
     pub page_count: usize,
@@ -153,6 +156,12 @@ pub struct Settings {
     /// Slide between pages and glide when scrolling. Reduced-motion preferences of the desktop
     /// switch this off regardless of the stored value.
     pub animate: bool,
+    /// Stack pages vertically and scroll through the whole book instead of turning pages.
+    pub continuous: bool,
+    /// Force a connected, gapless vertical strip of pages, regardless of the normal reading mode.
+    pub webcomics: bool,
+    /// Show books under their assigned series headings in the library.
+    pub group_series: bool,
     /// Opacity of the window background, `OPACITY_MIN..=OPACITY_MAX`. Page images, covers and
     /// text always stay fully opaque; only the background behind them becomes see-through.
     pub opacity: f32,
@@ -164,6 +173,9 @@ impl Default for Settings {
             rtl: false,
             fit: FitMode::Page,
             animate: true,
+            continuous: false,
+            webcomics: false,
+            group_series: false,
             opacity: OPACITY_MAX,
         }
     }
@@ -186,6 +198,15 @@ impl Settings {
         }
         if let Some(animate) = object.get("animate").and_then(|v| v.as_bool()) {
             settings.animate = animate;
+        }
+        if let Some(continuous) = object.get("continuous").and_then(|v| v.as_bool()) {
+            settings.continuous = continuous;
+        }
+        if let Some(webcomics) = object.get("webcomics").and_then(|v| v.as_bool()) {
+            settings.webcomics = webcomics;
+        }
+        if let Some(group_series) = object.get("group_series").and_then(|v| v.as_bool()) {
+            settings.group_series = group_series;
         }
         if let Some(fit) = object
             .get("fit")
@@ -315,6 +336,27 @@ impl Library {
     pub fn remove(&mut self, id: &str, dirs: &DataDirs) {
         self.books.retain(|b| b.id != id);
         let _ = fs::remove_file(dirs.cover(id));
+    }
+
+    /// Assign or clear a series for several books. Names are trimmed and matching existing
+    /// names are reused case-insensitively so groups do not split over capitalization.
+    pub fn set_series(&mut self, ids: &[String], series: Option<String>) {
+        let series = series
+            .map(|name| name.split_whitespace().collect::<Vec<_>>().join(" "))
+            .filter(|name| !name.is_empty())
+            .map(|name| {
+                self.books
+                    .iter()
+                    .filter_map(|book| book.series.as_ref())
+                    .find(|existing| existing.eq_ignore_ascii_case(&name))
+                    .cloned()
+                    .unwrap_or(name)
+            });
+        for id in ids {
+            if let Some(book) = self.get_mut(id) {
+                book.series = series.clone();
+            }
+        }
     }
 
     fn sort(&mut self) {
@@ -475,6 +517,7 @@ fn build_book(path: &Path, kind: SourceKind, dirs: &DataDirs) -> Result<Book> {
     Ok(Book {
         id,
         title: title_for(path),
+        series: None,
         path: path.to_path_buf(),
         kind,
         page_count: pages.len(),
@@ -606,6 +649,7 @@ mod tests {
         let mut book = Book {
             id: "abc".into(),
             title: "Test".into(),
+            series: None,
             path: tmp.join("x.cbz"),
             kind: SourceKind::Archive,
             page_count: 10,
@@ -660,6 +704,7 @@ mod tests {
         Book {
             id: "b".into(),
             title: "Sample".into(),
+            series: None,
             path: PathBuf::from("/tmp/sample.cbz"),
             kind: SourceKind::Archive,
             page_count: 10,

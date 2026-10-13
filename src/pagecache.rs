@@ -41,12 +41,22 @@ pub fn prefetch_order(current: usize, total: usize) -> Vec<usize> {
 /// Which cached pages to drop: everything outside the keep window, then (if still over `budget`)
 /// the pages furthest from `current`. The current page is never dropped.
 pub fn plan_eviction(entries: &[Entry], current: usize, budget: u64) -> Vec<usize> {
-    let low = current.saturating_sub(KEEP_BEHIND);
-    let high = current + KEEP_AHEAD;
+    let keep: std::collections::HashSet<usize> =
+        (current.saturating_sub(KEEP_BEHIND)..=current + KEEP_AHEAD).collect();
+    plan_eviction_with_keep(entries, current, budget, &keep)
+}
 
+/// Evict decoded pages while preserving an explicit visible/prefetch set. Used by continuous
+/// reading, where the viewport can cover a different number of pages depending on zoom.
+pub fn plan_eviction_with_keep(
+    entries: &[Entry],
+    current: usize,
+    budget: u64,
+    keep: &std::collections::HashSet<usize>,
+) -> Vec<usize> {
     let mut evict: Vec<usize> = entries
         .iter()
-        .filter(|entry| entry.index < low || entry.index > high)
+        .filter(|entry| !keep.contains(&entry.index))
         .map(|entry| entry.index)
         .collect();
 
@@ -56,7 +66,12 @@ pub fn plan_eviction(entries: &[Entry], current: usize, budget: u64) -> Vec<usiz
         .collect();
     let mut total: u64 = remaining.iter().map(|e| e.bytes).sum();
     if total > budget {
-        remaining.sort_by_key(|entry| std::cmp::Reverse(entry.index.abs_diff(current)));
+        remaining.sort_by_key(|entry| {
+            (
+                keep.contains(&entry.index),
+                std::cmp::Reverse(entry.index.abs_diff(current)),
+            )
+        });
         for entry in remaining {
             if total <= budget {
                 break;
