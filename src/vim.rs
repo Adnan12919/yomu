@@ -113,6 +113,16 @@ impl Vim {
         self.cmd.is_some()
     }
 
+    pub fn cmdline_text(&self) -> Option<&str> {
+        self.cmd.as_deref()
+    }
+
+    pub fn replace_cmdline(&mut self, text: String) {
+        if self.cmd.is_some() {
+            self.cmd = Some(text);
+        }
+    }
+
     /// Text for the small status line shown while something is half-typed (`12`, `g`, `:fit w`).
     pub fn status(&self) -> Option<String> {
         if let Some(cmd) = &self.cmd {

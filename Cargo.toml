@@ -2,7 +2,7 @@
 name = "yomu"
 version = "26.10.0"
 edition = "2024"
-rust-version = "1.89"
+rust-version = "1.92"
 description = "A minimal, GPU-accelerated, Wayland-native manga reader with a library"
 license = "MIT"
 
@@ -15,10 +15,11 @@ name = "yomu"
 path = "src/main.rs"
 
 [dependencies]
-gpui = "0.2.2"
+gpui-kit = { version = "=0.7.3", features = ["test-support"] }
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+toml = "0.8"
 dirs = "6"
 # SIMD resampling for page and cover scaling (pure Rust, no C code): several times faster than the
 # image crate's resize, which was the slowest step of showing a large page.
@@ -28,7 +29,6 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png",
 zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
-gpui = { version = "0.2.2", features = ["test-support"] }
 
 [profile.release]
 lto = "thin"
@@ -53,9 +53,3 @@ opt-level = 3
 [profile.dev.package.image-webp]
 opt-level = 3
 
-# xattr 0.2.3 (pulled in by gpui -> zed-async-tar) fails to compile against libc >= 0.2.183
-# because ENOATTR disappeared on Linux. This vendored copy fixes that single constant.
-[patch.crates-io]
-xattr = { path = "vendor/xattr" }
-# Drops the archived proc-macro-error2 from the dependency tree (see vendor/stacksafe-macro/Cargo.toml).
-stacksafe-macro = { path = "vendor/stacksafe-macro" }

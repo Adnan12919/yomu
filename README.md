@@ -1,9 +1,9 @@
 # yomu
 
-A minimal manga reader written entirely in Rust. It is built on [gpui](https://crates.io/crates/gpui), so
+A minimal manga reader written entirely in Rust. It is built on [GPUI Kit](https://gpui-kit.com/), so
 rendering is GPU-accelerated, and it talks to Wayland directly (no webview, no Tauri, no GTK/Qt).
 
-- Library grid with cover art and a reading-progress bar per book
+- Library grid with cover art and a reading-progress bar per book; centered search and a compact top-right action menu
 - Import CBZ/ZIP archives or folders of images (files, folders, or drag and drop)
 - Chrome-free reader: one page, a 2 px progress line at the bottom edge, nothing else until you ask
 - Right-click menu on books (resume, mark read/unread, reset progress, open file location, properties, remove)
@@ -42,7 +42,7 @@ xdg.portal.extraPortals = [ pkgs.xdg-desktop-portal-gtk ];   # or the GNOME port
 ## Installing yomu on NixOS
 
 The package definition is `nix/package.nix`; the flake exposes it as `packages.<system>.default` and as an overlay.
-It is built with nixpkgs' own Rust (the project needs 1.89 or newer; nixos-unstable has 1.98 at the time of writing),
+It is built with nixpkgs' own Rust (the project needs 1.92 or newer; use a current nixos-unstable),
 wraps the binary so it finds Wayland and Vulkan, and installs a desktop entry.
 
 **With a flake-based system configuration (recommended).** Add yomu as an input of your system flake:
@@ -133,7 +133,11 @@ Counts work on motions: `5j` scrolls five steps, `3J` skips three pages. Marks a
 | `Esc`, `q` | Back to the library (`Esc` first cancels a half-typed command) |
 | `Ctrl+Q` | Quit |
 
-**Command line** (`:` then Enter)
+**Command prompt** (press `:` in the reader)
+
+The floating prompt shows matching commands and short descriptions. Use `↑`/`↓` to select, `Tab` or
+`Shift+Tab` to complete, `Enter` to run the draft, and `Esc` to cancel. Unknown commands remain editable
+and show the parser's error message when run.
 
 | Command | Action |
 |---------|--------|
@@ -202,20 +206,33 @@ Right-click a book. Only the actions that make sense for its state are shown:
 
 ## Settings
 
-`Ctrl+,` (or `:settings` in the reader, or the Settings button in the library header):
+`Ctrl+,` (or `:settings` in the reader, or the Settings button in the library header) opens a tabbed panel:
 
 - **Window background opacity**, 30% to 100%, default 100%. Drag the slider or use `Left`/`Right` (5% steps),
   `Home`/`End`. It applies immediately and is saved when you let go. **Reset to Defaults** asks first and also
   restores all preferences; it is greyed out when everything is already at the defaults.
+- **Theme**, cycle through the built-in GPUI Kit themes with the arrows. The app applies the theme immediately,
+  uses its semantic colors throughout the library, reader and dialogs, and remembers it between launches.
+- **Custom themes**, edit `$XDG_CONFIG_HOME/yomu/themes.toml` (usually `~/.config/yomu/themes.toml`) and choose
+  **Reload custom themes**. On first launch yomu creates this file from [themes.example.toml](themes.example.toml).
+  A parse or validation error is shown in Settings and leaves the currently applied theme in place.
 - **Reading mode**, single page or continuous vertical scrolling. The choice is remembered between launches;
   use `v`, the Settings panel, or `:continuous [on|off]` in the reader. In continuous mode, `j`/`k`, wheel and touchpad
   scroll through stacked pages, while `J`/`K` and page-number commands jump between pages.
 - **Webcomics mode** shows pages as one connected vertical strip with no gap between adjacent pages. Toggle it
   with `w`, the Settings panel, or `:webcomics [on|off]`. It forces continuous scrolling while active, then restores
   the saved single-page or continuous reading mode when turned off.
+- **Library** controls series grouping.
+- **Reader** controls reading direction, page fit, animations, single-page or continuous scrolling, and webcomics mode.
+- **Keyboard & Commands** lists the reader shortcuts and `:` commands.
 
 Stored preferences are read leniently: a missing or invalid value falls back to its default (out-of-range numbers
 are clamped) instead of affecting your library.
+
+The custom theme file uses `[[themes]]` entries with `name`, `mode = "dark" | "light"`, and a `[themes.colors]`
+table. Color keys use GPUI Kit theme names and accept `#RRGGBB` or `#RRGGBBAA` values. Supported options also include
+`font_size`, `font_family`, `mono_font_size`, `mono_font_family`, `radius`, `radius_lg`, and `shadow`. The starter
+file lists the supported color tokens and shows their TOML quoting for dotted keys.
 
 ### How opacity works, and its limits
 
@@ -267,15 +284,9 @@ Importing never copies or modifies your comic files.
 
 ## Dependencies
 
-Two crates from gpui's dependency tree are vendored with small fixes (see the comment at the top of each
-`Cargo.toml`), wired up through `[patch.crates-io]`:
-
-- `vendor/xattr`: 0.2.3 does not compile against recent `libc` releases.
-- `vendor/stacksafe-macro`: gpui 0.2.2 pins `stacksafe 0.1.4`, whose macro crate depends on `proc-macro-error2`,
-  which is archived. Upstream already dropped it in `stacksafe-macro` 1.0.2 (it returns `syn::Error` instead), but
-  gpui's exact `=0.1.4` requirement blocks the upgrade, so the vendored copy carries that upstream change. No
-  replacement crate is needed, and neither `proc-macro-error2` nor its helper crate is in `Cargo.lock` any more.
-  Delete the patch entry once gpui moves to `stacksafe` 1.x.
+The UI uses GPUI Kit 0.7.3, which brings its matching GPUI snapshot and requires Rust 1.92 or newer. The old
+`vendor/xattr` and `vendor/stacksafe-macro` compatibility copies are retained in the repository, but are no longer
+patched into the active dependency graph.
 
 ## Development
 
@@ -298,10 +309,11 @@ The code is split so that everything except the window lives in the library crat
 - `src/selection.rs` holds the multi-select rules (toggle, range, select all)
 - `nix/package.nix` is the Nix package; `devenv.nix` / `devenv.yaml` and `flake.nix` are the dev environments
 - `src/library.rs` is the library model, JSON persistence, and the import pipeline
-- `src/main.rs` is the gpui UI
+- `src/main.rs` is the GPUI Kit UI
 
 ## Not done yet
 
 - CBR/CB7 (needs a pure-Rust RAR/7z reader; CBR files are rejected with a clear message)
 - Double-page spreads, pinch zoom
 - Sorting options
+- Inertial scrolling (very low priority roadmap item)

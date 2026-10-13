@@ -1,0 +1,35 @@
+# yomu loads custom themes from $XDG_CONFIG_HOME/yomu/themes.toml.
+# This starter file is copied there on first launch. Changes take effect after
+# selecting Reload custom themes in Settings.
+
+name = "yomu custom themes"
+
+[[themes]]
+name = "Soft Plum"
+mode = "dark"
+radius = 8
+radius_lg = 12
+shadow = true
+
+[themes.colors]
+background = "#17131C"
+foreground = "#F3EDF7"
+"popover.background" = "#201A27"
+"popover.foreground" = "#F3EDF7"
+"primary.background" = "#C8A0D8"
+"primary.foreground" = "#211729"
+"secondary.background" = "#352A3D"
+"secondary.foreground" = "#F3EDF7"
+"muted.background" = "#2D2533"
+"muted.foreground" = "#B9AABE"
+"accent.background" = "#352A3D"
+"accent.foreground" = "#F3EDF7"
+border = "#493B52"
+"input.border" = "#493B52"
+ring = "#C8A0D8"
+"button.background" = "#352A3D"
+"button.foreground" = "#F3EDF7"
+"button.hover.background" = "#493B52"
+"button.primary.background" = "#C8A0D8"
+"button.primary.foreground" = "#211729"
+"button.primary.hover.background" = "#D8B8E4"

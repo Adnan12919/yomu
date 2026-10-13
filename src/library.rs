@@ -150,6 +150,8 @@ pub const LIBRARY_VERSION: u32 = 2;
 /// Preferences that carry over from book to book and between launches.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Settings {
+    /// Name of the GPUI Kit theme selected in Appearance settings.
+    pub theme_name: String,
     /// Right-to-left reading order (manga). Off by default: pages run left to right.
     pub rtl: bool,
     pub fit: FitMode,
@@ -170,6 +172,7 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            theme_name: "Default Dark".to_string(),
             rtl: false,
             fit: FitMode::Page,
             animate: true,
@@ -195,6 +198,11 @@ impl Settings {
         };
         if let Some(rtl) = object.get("rtl").and_then(|v| v.as_bool()) {
             settings.rtl = rtl;
+        }
+        if let Some(theme_name) = object.get("theme_name").and_then(|v| v.as_str()) {
+            if !theme_name.trim().is_empty() {
+                settings.theme_name = theme_name.to_string();
+            }
         }
         if let Some(animate) = object.get("animate").and_then(|v| v.as_bool()) {
             settings.animate = animate;

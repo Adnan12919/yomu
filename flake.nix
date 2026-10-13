@@ -25,7 +25,7 @@
           overlays = [ (import rust-overlay) ];
         };
 
-        # gpui needs a recent compiler (edition 2024), so the dev shell uses rust-overlay's latest
+        # GPUI Kit 0.7.3 needs a recent compiler, so the dev shell uses rust-overlay's latest
         # stable, the same toolchain devenv.nix uses.
         rustToolchain = pkgs.rust-bin.stable.latest.default.override {
           extensions = [ "rust-src" ];

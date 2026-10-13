@@ -2,10 +2,10 @@
 
 ## Runtime shape
 
-The binary starts in `src/main.rs`, initializes gpui and the app window, then owns the `Yomu` application state. The library crate (`src/lib.rs`) exports the core modules and deliberately does not depend on gpui. This keeps most behavior deterministic and testable without creating a window.
+The binary starts in `src/main.rs`, initializes GPUI Kit and the app window, then owns the `Yomu` application state. The library crate (`src/lib.rs`) exports the core modules and deliberately does not depend on GPUI/Kit. This keeps most behavior deterministic and testable without creating a window.
 
 ```text
-gpui window / Yomu (src/main.rs)
+GPUI Kit window / Yomu (src/main.rs)
   ├─ Library + Settings (src/library.rs) ── JSON + covers in XDG data dir
   ├─ Reader state ── page list from archive.rs
   │                    └─ async read/decode/scale ── pagecache.rs policy
@@ -18,7 +18,7 @@ gpui window / Yomu (src/main.rs)
 
 | Module | Responsibility | Important boundaries |
 |---|---|---|
-| `main.rs` | gpui app/window, library and reader views, key/mouse dispatch, overlays/dialogs, rendering, background-task coordination | UI integration layer; it is large, so prefer extracting pure logic into the core modules when adding reusable behavior. |
+| `main.rs` | GPUI Kit app/window, library and reader views, key/mouse dispatch, overlays/dialogs, rendering, background-task coordination | UI integration layer; it is large, so prefer extracting pure logic into the core modules when adding reusable behavior. The library toolbar is transparent with centered search and a top-right action menu; command suggestions are also presented here, while command parsing remains in `vim.rs`. |
 | `archive.rs` | Enumerate and read CBZ/ZIP pages or images in folders | Filters supported image names, ignores hidden/resource-fork files, natural-sorts names, limits archive page inflation. Source types are `Archive` and `Folder`. |
 | `imaging.rs` | Decode supported images, scale for display, create JPEG covers | No gpui dependency. Decoded pixel buffers are BGRA for gpui; original dimensions are retained for layout. Has dimension guardrails. |
 | `library.rs` | Book model/status/progress, settings, JSON load/save, imports, generated covers | `DataDirs` resolves storage. `Library` owns persisted data; comic files remain at their original paths. Format version currently 2. Continuous mode, webcomics mode, and series grouping are lenient settings, defaulting off for older libraries. Each book's optional series name defaults to unassigned when loading older data. |
@@ -47,7 +47,7 @@ The UI gets the selected `Book`, enumerates its pages with `archive::list_pages`
 
 Default storage is `$XDG_DATA_HOME/yomu/` (normally `~/.local/share/yomu/`); `YOMU_DATA_DIR` overrides the root. `library.json` contains the version, books, progress, marks, and settings. Generated cover JPEGs live in `covers/<book-id>.jpg`. The comic source is never modified by library operations.
 
-Settings currently live in `library.json`, not a separate config file. `Settings::from_value` defaults missing/invalid fields and clamps opacity. When a default's meaning changes, update the library version/migration deliberately; migrations should be idempotent and covered by tests.
+Reader and library preferences currently live in `library.json`. `Settings::from_value` defaults missing/invalid fields and clamps opacity. The separate XDG config file `$XDG_CONFIG_HOME/yomu/themes.toml` contains only user-defined theme configs; `themes.example.toml` documents its supported schema. When a default's meaning changes, update the library version/migration deliberately; migrations should be idempotent and covered by tests.
 
 ### Input and animation
 
@@ -65,6 +65,7 @@ Continuous mode is owned by `Reader` and persisted in `Settings`. It stacks page
 - Archive entry size and decoded image pixel count have defensive limits.
 - Page rendering consumes BGRA buffers; changing channel order can produce incorrect colors.
 - Input parsing and core state rules remain independent of gpui where practical.
+- The active GPUI Kit theme is the source of UI colors. Do not reintroduce a fixed Yomu palette. The library toolbar intentionally has no app name, total book count, opaque fill, or bottom rule; keep search centered and actions in the upper-right menu.
 - Async work must not apply stale results to a different book/page/request. Follow the existing request identity/cancellation checks in `main.rs` when extending it.
 
 ## Testing map

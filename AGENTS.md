@@ -1,10 +1,10 @@
 # Agent guide
 
-This file is the starting point for coding agents working on yomu. Read [README.md](README.md) for the complete user-facing behavior and key reference, [docs/architecture.md](docs/architecture.md) for code boundaries and important invariants, and [docs/ui-redesign-plan.md](docs/ui-redesign-plan.md) before changing the GPUI UI or adopting GPUI Kit.
+This file is the starting point for coding agents working on yomu. Read [docs/agent-handoff.md](docs/agent-handoff.md) for the current implementation snapshot and product decisions, [README.md](README.md) for user-facing behavior and shortcuts, and [docs/architecture.md](docs/architecture.md) for code boundaries and invariants. Read [docs/ui-redesign-plan.md](docs/ui-redesign-plan.md) before changing the UI or GPUI Kit integration.
 
 ## Project at a glance
 
-yomu is a Rust desktop comic reader built on gpui. It imports CBZ/ZIP archives and image folders, stores library metadata locally, and decodes/scales pages off the UI thread. It targets Linux (Wayland, with X11 fallback) and uses Nix/devenv for native build dependencies.
+yomu is a Rust desktop comic reader built on GPUI Kit (GPUI). It imports CBZ/ZIP archives and image folders, stores library metadata locally, and decodes/scales pages off the UI thread. It targets Linux (Wayland, with X11 fallback) and uses Nix/devenv for native build dependencies. The user-provided UI reference is `gpui-kit_inspiration.jpg`; current redesign progress and remaining work are recorded in `docs/agent-handoff.md`.
 
 ## Start here
 
@@ -24,7 +24,7 @@ devenv shell
 cargo run
 ```
 
-`nix develop` is the alternative shell. The package is Linux-only and needs Wayland/Vulkan runtime libraries. Rust edition is 2024 and the minimum compiler is 1.89. See README for NixOS graphics and portal prerequisites.
+`nix develop` is the alternative shell. The package is Linux-only and needs Wayland/Vulkan runtime libraries. Rust edition is 2024 and the minimum compiler is 1.92 (required by GPUI Kit 0.7.3's dependency graph). See README for NixOS graphics and portal prerequisites.
 
 Useful project commands:
 

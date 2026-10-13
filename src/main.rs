@@ -3,22 +3,27 @@
 use std::{
     cell::Cell,
     collections::{HashMap, HashSet},
-    path::PathBuf,
+    fs,
+    path::{Path, PathBuf},
     rc::Rc,
     sync::Arc,
     time::{Duration, Instant},
 };
 
-use anyhow::Result;
-use gpui::{
-    AnyElement, App, Application, Bounds, ClickEvent, Context, Corner, ExternalPaths, FocusHandle,
-    FontWeight, KeyBinding, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, ObjectFit, PathPromptOptions, Pixels, Point, RenderImage, Rgba, ScrollDelta,
-    ScrollWheelEvent, SharedString, TitlebarOptions, Window, WindowBackgroundAppearance,
-    WindowBounds, WindowOptions, actions, anchored, canvas, deferred, div, img, prelude::*, px,
-    relative, rgb, rgba, size,
+use anyhow::{Result, anyhow};
+use gpui_kit::component::ColorTokens;
+use gpui_kit::component::button::{Button, ButtonVariants};
+use gpui_kit::component::{Disableable, Sizable};
+use gpui_kit::component::{Theme as KitTheme, ThemeConfig, ThemeRegistry};
+use gpui_kit::{
+    Anchor, AnyElement, App, Bounds, ClickEvent, Context, ExternalPaths, FocusHandle, FontWeight,
+    KeyBinding, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit,
+    PathPromptOptions, Pixels, Point, RenderImage, Rgba, ScrollDelta, ScrollWheelEvent,
+    SharedString, TitlebarOptions, Window, WindowBackgroundAppearance, WindowBounds, WindowOptions,
+    actions, anchored, application, canvas, deferred, div, img, prelude::*, px, relative, size,
 };
 use image::Frame;
+use serde::Deserialize;
 use yomu::{
     archive::{self, SourceKind},
     imaging,
@@ -43,15 +48,238 @@ actions!(
     ]
 );
 
-// Palette
-const BG: u32 = 0x0f0f11;
-const READER_BG: u32 = 0x060607;
-const SURFACE: u32 = 0x1a1a1e;
-const SURFACE_HI: u32 = 0x26262c;
-const TRACK: u32 = 0x2c2c33;
-const TEXT: u32 = 0xe9e7e4;
-const MUTED: u32 = 0x8b8b93;
-const ACCENT: u32 = 0xe2725b;
+/// The small set of semantic Kit tokens used by yomu's custom reader/library composition.
+#[derive(Clone, Copy)]
+struct UiColors {
+    background: gpui_kit::Hsla,
+    surface: gpui_kit::Hsla,
+    surface_hover: gpui_kit::Hsla,
+    border: gpui_kit::Hsla,
+    foreground: gpui_kit::Hsla,
+    muted: gpui_kit::Hsla,
+    accent: gpui_kit::Hsla,
+}
+
+impl UiColors {
+    fn from_tokens(tokens: ColorTokens) -> Self {
+        Self {
+            background: tokens.background,
+            surface: tokens.surface,
+            surface_hover: tokens.secondary,
+            border: tokens.border,
+            foreground: tokens.foreground,
+            muted: tokens.muted_foreground,
+            accent: tokens.primary,
+        }
+    }
+
+    fn from_app(cx: &App) -> Self {
+        cx.try_global::<KitTheme>()
+            .map(|theme| Self::from_tokens(theme.semantic_tokens().colors))
+            .unwrap_or_else(|| Self::from_tokens(ColorTokens::dark()))
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+struct CustomThemeFile {
+    name: String,
+    themes: Vec<CustomThemeDefinition>,
+}
+
+impl Default for CustomThemeFile {
+    fn default() -> Self {
+        Self {
+            name: "yomu custom themes".to_string(),
+            themes: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+struct CustomThemeDefinition {
+    name: String,
+    mode: String,
+    colors: std::collections::BTreeMap<String, String>,
+    font_size: Option<f32>,
+    font_family: Option<String>,
+    mono_font_size: Option<f32>,
+    mono_font_family: Option<String>,
+    radius: Option<usize>,
+    radius_lg: Option<usize>,
+    shadow: Option<bool>,
+}
+
+impl Default for CustomThemeDefinition {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            mode: "dark".to_string(),
+            colors: std::collections::BTreeMap::new(),
+            font_size: None,
+            font_family: None,
+            mono_font_size: None,
+            mono_font_family: None,
+            radius: None,
+            radius_lg: None,
+            shadow: None,
+        }
+    }
+}
+
+const CUSTOM_THEME_COLOR_KEYS: &[&str] = &[
+    "accent.background",
+    "accent.foreground",
+    "background",
+    "border",
+    "button.background",
+    "button.foreground",
+    "button.hover.background",
+    "button.primary.background",
+    "button.primary.foreground",
+    "button.primary.hover.background",
+    "danger.background",
+    "danger.foreground",
+    "foreground",
+    "input.border",
+    "link",
+    "muted.background",
+    "muted.foreground",
+    "popover.background",
+    "popover.foreground",
+    "primary.background",
+    "primary.foreground",
+    "primary.hover.background",
+    "ring",
+    "scrollbar.background",
+    "secondary.background",
+    "secondary.foreground",
+    "secondary.hover.background",
+];
+
+fn parse_custom_themes(
+    contents: &str,
+    built_in_names: &HashSet<String>,
+) -> Result<HashMap<String, Rc<ThemeConfig>>> {
+    let file: CustomThemeFile =
+        toml::from_str(contents).map_err(|error| anyhow!("parsing themes.toml: {error}"))?;
+    let mut names = HashSet::new();
+    let mut themes = HashMap::new();
+
+    for definition in file.themes {
+        let name = definition.name.trim();
+        if name.is_empty() {
+            return Err(anyhow!("each custom theme needs a non-empty name"));
+        }
+        if built_in_names.contains(name) {
+            return Err(anyhow!(
+                "custom theme name “{name}” conflicts with a built-in theme"
+            ));
+        }
+        if !names.insert(name.to_string()) {
+            return Err(anyhow!("duplicate custom theme name “{name}”"));
+        }
+        if definition.mode != "dark" && definition.mode != "light" {
+            return Err(anyhow!("theme “{name}” mode must be `dark` or `light`"));
+        }
+        if definition.colors.is_empty() {
+            return Err(anyhow!("theme “{name}” needs at least one color override"));
+        }
+        for (key, value) in &definition.colors {
+            if !CUSTOM_THEME_COLOR_KEYS.contains(&key.as_str()) {
+                return Err(anyhow!("unsupported color token `{key}` in theme “{name}”"));
+            }
+            let digits = value.strip_prefix('#').unwrap_or("");
+            if !matches!(digits.len(), 6 | 8)
+                || !digits.bytes().all(|byte| byte.is_ascii_hexdigit())
+            {
+                return Err(anyhow!(
+                    "color `{key}` in theme “{name}” must use #RRGGBB or #RRGGBBAA"
+                ));
+            }
+        }
+
+        let config_value = serde_json::json!({
+            "name": name,
+            "mode": definition.mode,
+            "colors": definition.colors,
+            "font.size": definition.font_size,
+            "font.family": definition.font_family,
+            "mono_font.size": definition.mono_font_size,
+            "mono_font.family": definition.mono_font_family,
+            "radius": definition.radius,
+            "radius.lg": definition.radius_lg,
+            "shadow": definition.shadow,
+        });
+        let config: ThemeConfig = serde_json::from_value(config_value)
+            .map_err(|error| anyhow!("invalid theme “{name}”: {error}"))?;
+        themes.insert(name.to_string(), Rc::new(config));
+    }
+
+    if themes.is_empty() {
+        let set_name = file.name.trim();
+        let set_name = if set_name.is_empty() {
+            "custom theme set"
+        } else {
+            set_name
+        };
+        return Err(anyhow!(
+            "{set_name} must define at least one [[themes]] entry"
+        ));
+    }
+    Ok(themes)
+}
+
+fn custom_theme_path(_data_dirs: &DataDirs) -> Result<PathBuf> {
+    #[cfg(test)]
+    {
+        Ok(_data_dirs
+            .library_file()
+            .parent()
+            .unwrap_or(Path::new("."))
+            .join("themes.toml"))
+    }
+    #[cfg(not(test))]
+    {
+        let config_dir = dirs::config_dir()
+            .ok_or_else(|| anyhow!("could not determine the user's configuration directory"))?;
+        Ok(config_dir.join("yomu").join("themes.toml"))
+    }
+}
+
+fn ensure_custom_theme_file(path: &Path) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("custom theme path has no parent directory"))?;
+    fs::create_dir_all(parent)?;
+    match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+    {
+        Ok(mut file) => {
+            use std::io::Write as _;
+            file.write_all(include_bytes!("../themes.example.toml"))?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error.into()),
+    }
+    Ok(())
+}
+
+fn built_in_theme_names(cx: &App) -> HashSet<String> {
+    cx.try_global::<ThemeRegistry>()
+        .map(|registry| registry.themes().keys().map(ToString::to_string).collect())
+        .unwrap_or_default()
+}
+
+fn load_custom_themes(path: &Path, cx: &App) -> Result<HashMap<String, Rc<ThemeConfig>>> {
+    let contents =
+        fs::read_to_string(path).map_err(|error| anyhow!("reading {}: {error}", path.display()))?;
+    let built_in_names = built_in_theme_names(cx);
+    parse_custom_themes(&contents, &built_in_names)
+}
 
 const CARD_W: f32 = 180.0;
 const CARD_H: f32 = 270.0;
@@ -424,13 +652,28 @@ struct SeriesDialog {
     value: String,
 }
 
+#[derive(Default)]
+struct LibraryMenu {
+    selected: usize,
+}
+
 /// At most one menu or dialog is open at a time; it sits on top of whatever view is showing.
 enum Overlay {
     Menu(BookMenu),
+    LibraryMenu(LibraryMenu),
     Confirm(ConfirmDialog),
     Properties(PropertiesDialog),
     Series(SeriesDialog),
     Settings,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+enum SettingsTab {
+    #[default]
+    Appearance,
+    Library,
+    Reader,
+    Keyboard,
 }
 
 struct Slider {
@@ -439,16 +682,28 @@ struct Slider {
     dragging: bool,
 }
 
-fn with_alpha(color: u32, alpha: f32) -> Rgba {
-    let mut color = rgb(color);
+fn with_alpha(color: gpui_kit::Hsla, alpha: f32) -> Rgba {
+    let mut color: Rgba = color.into();
     color.a = alpha;
     color
+}
+
+fn overlay_shade(colors: UiColors) -> gpui_kit::Hsla {
+    if colors.background.l > 0.5 {
+        colors.foreground
+    } else {
+        colors.background
+    }
 }
 
 struct Yomu {
     focus_handle: FocusHandle,
     dirs: Arc<DataDirs>,
     library: Library,
+    colors: UiColors,
+    custom_themes: HashMap<String, Rc<ThemeConfig>>,
+    custom_theme_path: PathBuf,
+    theme_status: Option<String>,
     reader: Option<Reader>,
     /// Images that are no longer shown. Their GPU textures are freed on the next render,
     /// because that is where we have access to the `Window`.
@@ -466,6 +721,8 @@ struct Yomu {
     #[cfg(test)]
     frame_dt: Option<f32>,
     overlay: Option<Overlay>,
+    settings_tab: SettingsTab,
+    command_selection: usize,
     overlay_closed_at: Option<Instant>,
     /// Books picked for bulk actions in the library.
     selection: Selection,
@@ -493,10 +750,50 @@ impl Yomu {
                 Some(SharedString::from(format!("{err:#}"))),
             ),
         };
+        let custom_theme_path = custom_theme_path(&dirs).unwrap_or_else(|error| {
+            eprintln!("yomu: cannot determine custom theme path: {error:#}");
+            dirs.library_file()
+                .parent()
+                .unwrap_or(Path::new("."))
+                .join("themes.toml")
+        });
+        let mut theme_status = None;
+        let mut custom_themes = HashMap::new();
+        match ensure_custom_theme_file(&custom_theme_path).and_then(|()| {
+            let contents = fs::read_to_string(&custom_theme_path)?;
+            let built_in_names = built_in_theme_names(cx);
+            parse_custom_themes(&contents, &built_in_names)
+        }) {
+            Ok(themes) => custom_themes = themes,
+            Err(error) => theme_status = Some(format!("Custom theme file: {error:#}")),
+        }
+        let selected_theme = library.settings().theme_name.as_str();
+        let selected_config = custom_themes.get(selected_theme).cloned().or_else(|| {
+            cx.try_global::<ThemeRegistry>()
+                .and_then(|registry| registry.themes().get(selected_theme).cloned())
+        });
+        if let Some(config) = selected_config {
+            KitTheme::update(cx, |theme| theme.apply_config(&config));
+        } else if selected_theme != "Default Dark" {
+            if let Some(config) = cx
+                .try_global::<ThemeRegistry>()
+                .and_then(|registry| registry.themes().get("Default Dark").cloned())
+            {
+                KitTheme::update(cx, |theme| theme.apply_config(&config));
+                theme_status.get_or_insert_with(|| {
+                    format!("Theme “{selected_theme}” was unavailable; using Default Dark")
+                });
+            }
+        }
+        let colors = UiColors::from_app(cx);
         let state = Self {
             focus_handle: cx.focus_handle(),
             dirs,
             library,
+            colors,
+            custom_themes,
+            custom_theme_path,
+            theme_status,
             reader: None,
             garbage: Vec::new(),
             toast,
@@ -509,6 +806,8 @@ impl Yomu {
             #[cfg(test)]
             frame_dt: None,
             overlay: None,
+            settings_tab: SettingsTab::Appearance,
+            command_selection: 0,
             overlay_closed_at: None,
             selection: Selection::new(),
             search_query: String::new(),
@@ -876,6 +1175,7 @@ impl Yomu {
     fn reset_settings(&mut self, cx: &mut Context<Self>) {
         *self.library.settings_mut() = Settings::default();
         let defaults = self.library.settings().clone();
+        self.apply_theme(&defaults.theme_name, cx);
         if let Some(reader) = self.reader.as_mut() {
             reader.rtl = defaults.rtl;
             reader.fit = defaults.fit;
@@ -888,6 +1188,74 @@ impl Yomu {
         self.save_library();
         self.slider.dragging = false;
         self.overlay = Some(Overlay::Settings);
+        cx.notify();
+    }
+
+    fn apply_theme(&mut self, name: &str, cx: &mut Context<Self>) {
+        let config = self.custom_themes.get(name).cloned().or_else(|| {
+            cx.try_global::<ThemeRegistry>()
+                .and_then(|registry| registry.themes().get(name).cloned())
+        });
+        let Some(config) = config else {
+            self.show_toast(format!("Theme “{name}” is unavailable"), cx);
+            return;
+        };
+        KitTheme::update(cx, |theme| theme.apply_config(&config));
+        self.library.settings_mut().theme_name = name.to_string();
+        self.colors = UiColors::from_app(cx);
+        self.save_library();
+        cx.notify();
+    }
+
+    fn cycle_theme(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let mut names: Vec<String> = cx
+            .try_global::<ThemeRegistry>()
+            .map(|registry| {
+                registry
+                    .sorted_themes()
+                    .iter()
+                    .map(|theme| theme.name.to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        names.extend(self.custom_themes.keys().cloned());
+        names.sort_by_key(|name| name.to_lowercase());
+        if names.is_empty() {
+            return;
+        }
+        let current = self.library.settings().theme_name.as_str();
+        let index = names.iter().position(|name| name == current).unwrap_or(0) as isize;
+        let next = (index + delta).rem_euclid(names.len() as isize) as usize;
+        self.apply_theme(&names[next], cx);
+    }
+
+    fn reload_custom_themes(&mut self, cx: &mut Context<Self>) {
+        let themes = match ensure_custom_theme_file(&self.custom_theme_path)
+            .and_then(|()| load_custom_themes(&self.custom_theme_path, cx))
+        {
+            Ok(themes) => themes,
+            Err(error) => {
+                self.theme_status = Some(format!("Custom theme file error: {error:#}"));
+                cx.notify();
+                return;
+            }
+        };
+
+        let selected = self.library.settings().theme_name.clone();
+        let was_custom = self.custom_themes.contains_key(&selected);
+        self.custom_themes = themes;
+        self.theme_status = Some(format!(
+            "Loaded {} custom theme(s) from {}",
+            self.custom_themes.len(),
+            self.custom_theme_path.display()
+        ));
+
+        if let Some(config) = self.custom_themes.get(&selected).cloned() {
+            KitTheme::update(cx, |theme| theme.apply_config(&config));
+            self.colors = UiColors::from_app(cx);
+        } else if was_custom {
+            self.apply_theme("Default Dark", cx);
+        }
         cx.notify();
     }
 
@@ -943,6 +1311,13 @@ impl Yomu {
     }
 
     fn on_overlay_key(&mut self, token: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if matches!(token, "enter" | "space")
+            && let Some(Overlay::LibraryMenu(menu)) = self.overlay.as_ref()
+        {
+            let selected = menu.selected;
+            self.run_library_menu_action(selected, window, cx);
+            return;
+        }
         match self.overlay.as_mut() {
             Some(Overlay::Menu(menu)) => match token {
                 "escape" => self.close_overlay(cx),
@@ -974,6 +1349,26 @@ impl Yomu {
                 }
                 _ => {}
             },
+            Some(Overlay::LibraryMenu(menu)) => match token {
+                "escape" => self.close_overlay(cx),
+                "down" | "j" | "tab" | "C-n" => {
+                    menu.selected = (menu.selected + 1) % 5;
+                    cx.notify();
+                }
+                "up" | "k" | "S-tab" | "C-p" => {
+                    menu.selected = (menu.selected + 4) % 5;
+                    cx.notify();
+                }
+                "home" => {
+                    menu.selected = 0;
+                    cx.notify();
+                }
+                "end" => {
+                    menu.selected = 4;
+                    cx.notify();
+                }
+                _ => {}
+            },
             Some(Overlay::Confirm(_)) => match token {
                 "enter" | "y" => self.confirm_accept(window, cx),
                 "escape" | "n" | "q" => self.close_overlay(cx),
@@ -1001,6 +1396,27 @@ impl Yomu {
                 }
             }
             None => {}
+        }
+    }
+
+    fn run_library_menu_action(
+        &mut self,
+        selected: usize,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.overlay = None;
+        match selected {
+            0 => self.import_dialog(false, cx),
+            1 => self.import_dialog(true, cx),
+            2 => self.open_settings(cx),
+            3 => {
+                self.library.settings_mut().group_series = !self.library.settings().group_series;
+                self.save_library();
+                cx.notify();
+            }
+            4 => cx.quit(),
+            _ => {}
         }
     }
 
@@ -1280,7 +1696,7 @@ impl Yomu {
         self.selection.clear();
         self.search_active = false;
         window.set_window_title(&book.title);
-        window.focus(&self.focus_handle);
+        window.focus(&self.focus_handle, cx);
 
         let settings = self.library.settings().clone();
         self.reader = Some(Reader::new(&book, &settings));
@@ -1315,6 +1731,7 @@ impl Yomu {
         let Some(reader) = self.reader.as_mut() else {
             return;
         };
+
         if reader.book_id != book_id {
             return;
         }
@@ -1344,7 +1761,7 @@ impl Yomu {
         self.last_frame = None;
         self.hud = None;
         window.set_window_title("yomu");
-        window.focus(&self.focus_handle);
+        window.focus(&self.focus_handle, cx);
         self.save_library();
         cx.notify();
     }
@@ -1613,6 +2030,18 @@ impl Yomu {
         );
     }
 
+    fn set_animations(&mut self, value: Option<bool>, cx: &mut Context<Self>) {
+        let enabled = value.unwrap_or(!self.library.settings().animate);
+        self.library.settings_mut().animate = enabled;
+        self.save_library();
+        let message = match (enabled, self.reduce_motion) {
+            (true, true) => "animations on (the desktop asks for reduced motion, so they stay off)",
+            (true, false) => "animations on",
+            (false, _) => "animations off",
+        };
+        self.show_hud(message, cx);
+    }
+
     fn set_continuous(&mut self, value: Option<bool>, cx: &mut Context<Self>) {
         let next = value.unwrap_or(!self.library.settings().continuous);
         self.library.settings_mut().continuous = next;
@@ -1847,6 +2276,29 @@ impl Yomu {
             return;
         };
 
+        if let Some(draft) = reader.vim.cmdline_text().map(str::to_owned)
+            && matches!(token.as_str(), "up" | "down" | "tab" | "S-tab")
+        {
+            let suggestions = command_suggestions(&draft);
+            if !suggestions.is_empty() {
+                let count = suggestions.len();
+                let backwards = token == "up" || token == "S-tab";
+                self.command_selection = if backwards {
+                    self.command_selection.wrapping_add(count).wrapping_sub(1) % count
+                } else {
+                    (self.command_selection + 1) % count
+                };
+                if token == "tab" || token == "S-tab" {
+                    reader
+                        .vim
+                        .replace_cmdline(suggestions[self.command_selection].0.clone());
+                    self.command_selection = 0;
+                }
+            }
+            cx.notify();
+            return;
+        }
+
         if reader.show_help
             && !reader.vim.in_cmdline()
             && matches!(token.as_str(), "escape" | "?" | "q")
@@ -1858,6 +2310,7 @@ impl Yomu {
 
         let vp = viewport_of(window);
         let actions = reader.vim.feed(&token);
+        self.command_selection = 0;
         cx.notify();
         for action in actions {
             self.apply(action, vp, window, cx);
@@ -1932,19 +2385,7 @@ impl Yomu {
                 }
             }
             Action::SetDirection { rtl } => self.set_direction(rtl, cx),
-            Action::SetAnimations(value) => {
-                let enabled = value.unwrap_or(!self.library.settings().animate);
-                self.library.settings_mut().animate = enabled;
-                self.save_library();
-                let message = match (enabled, self.reduce_motion) {
-                    (true, true) => {
-                        "animations on (the desktop asks for reduced motion, so they stay off)"
-                    }
-                    (true, false) => "animations on",
-                    (false, _) => "animations off",
-                };
-                self.show_hud(message, cx);
-            }
+            Action::SetAnimations(value) => self.set_animations(value, cx),
             Action::SetContinuous(value) => self.set_continuous(value, cx),
             Action::SetWebcomics(value) => self.set_webcomics(value, cx),
             Action::ToggleInfo => {
@@ -2215,6 +2656,7 @@ impl Yomu {
     fn render_overlay(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         Some(match self.overlay.as_ref()? {
             Overlay::Menu(menu) => self.render_menu(menu, cx),
+            Overlay::LibraryMenu(menu) => self.render_library_menu(menu, cx),
             Overlay::Confirm(dialog) => self.render_confirm(dialog, cx),
             Overlay::Properties(dialog) => self.render_properties(dialog, cx),
             Overlay::Series(dialog) => self.render_series_dialog(dialog, cx),
@@ -2224,7 +2666,7 @@ impl Yomu {
 
     /// Full-window layer behind a dialog: swallows clicks meant for the view underneath and
     /// closes the dialog when clicked. `dim` darkens the view behind it.
-    fn scrim(&self, dim: bool, cx: &mut Context<Self>) -> gpui::Div {
+    fn scrim(&self, dim: bool, cx: &mut Context<Self>) -> gpui_kit::Div {
         // Explicit insets matter: an absolutely positioned child without them is placed after the
         // in-flow content (below the window) instead of covering it.
         div()
@@ -2235,7 +2677,10 @@ impl Yomu {
             .flex()
             .items_center()
             .justify_center()
-            .bg(rgba(if dim { 0x0000_008c } else { 0x0000_0000 }))
+            .bg(with_alpha(
+                overlay_shade(self.colors),
+                if dim { 0.55 } else { 0.0 },
+            ))
             .occlude()
             .on_mouse_down(
                 MouseButton::Left,
@@ -2254,12 +2699,12 @@ impl Yomu {
             .flex_col()
             .p_1()
             .rounded_md()
-            .bg(rgb(SURFACE))
+            .bg(self.colors.surface)
             .border_1()
-            .border_color(rgb(TRACK))
+            .border_color(self.colors.border)
             .shadow_lg()
             .text_sm()
-            .text_color(rgb(TEXT))
+            .text_color(self.colors.foreground)
             .on_mouse_down(MouseButton::Left, |_: &MouseDownEvent, _, cx| {
                 cx.stop_propagation()
             })
@@ -2269,7 +2714,9 @@ impl Yomu {
 
         for (ix, entry) in menu.entries.iter().enumerate() {
             list = match entry {
-                Entry::Separator => list.child(div().h(px(1.)).mx_2().my_1().bg(rgb(TRACK))),
+                Entry::Separator => {
+                    list.child(div().h(px(1.)).mx_2().my_1().bg(self.colors.border))
+                }
                 Entry::Item(item) => list.child(self.menu_item(menu, ix, item, cx)),
             };
         }
@@ -2297,12 +2744,102 @@ impl Yomu {
                 .child(
                     anchored()
                         .position(menu.position)
-                        .anchor(Corner::TopLeft)
+                        .anchor(Anchor::TopLeft)
                         .snap_to_window_with_margin(px(8.))
                         .child(list),
                 ),
         )
         .with_priority(1)
+        .into_any_element()
+    }
+
+    fn render_library_menu(&self, menu: &LibraryMenu, cx: &mut Context<Self>) -> AnyElement {
+        let entries = [
+            ("Add files", "Import CBZ and ZIP comics"),
+            ("Add folder", "Import a folder of images"),
+            ("Settings", "Themes and reader preferences"),
+            (
+                if self.library.settings().group_series {
+                    "Ungroup series"
+                } else {
+                    "Group by series"
+                },
+                "Organize books into collapsible series",
+            ),
+            ("Quit", "Close yomu"),
+        ];
+        let mut list = div()
+            .w(px(260.))
+            .flex()
+            .flex_col()
+            .gap_1()
+            .p_2()
+            .rounded_lg()
+            .bg(self.colors.surface)
+            .border_1()
+            .border_color(self.colors.border)
+            .shadow_lg()
+            .on_mouse_down(MouseButton::Left, |_: &MouseDownEvent, _, cx| {
+                cx.stop_propagation()
+            })
+            .on_mouse_down(MouseButton::Right, |_: &MouseDownEvent, _, cx| {
+                cx.stop_propagation()
+            });
+        for (index, (label, description)) in entries.into_iter().enumerate() {
+            let selected = menu.selected == index;
+            list = list.child(
+                div()
+                    .id(SharedString::from(format!("library-menu-{index}")))
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.))
+                    .px_3()
+                    .py_2()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .when(selected, |row| row.bg(self.colors.surface_hover))
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(self.colors.foreground)
+                            .child(label),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(self.colors.muted)
+                            .child(description),
+                    )
+                    .on_mouse_move(cx.listener(move |this, _: &MouseMoveEvent, _, cx| {
+                        if let Some(Overlay::LibraryMenu(menu)) = this.overlay.as_mut() {
+                            menu.selected = index;
+                            cx.notify();
+                        }
+                    }))
+                    .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                        this.run_library_menu_action(index, window, cx);
+                    })),
+            );
+        }
+
+        deferred(
+            div()
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full()
+                .occlude()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _: &MouseDownEvent, _, cx| this.close_overlay(cx)),
+                )
+                .on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(|this, _: &MouseDownEvent, _, cx| this.close_overlay(cx)),
+                )
+                .child(div().absolute().top(px(52.)).right(px(18.)).child(list)),
+        )
+        .with_priority(2)
         .into_any_element()
     }
 
@@ -2323,24 +2860,31 @@ impl Yomu {
             .child(item.label.clone());
 
         if !item.enabled {
-            return base.text_color(rgb(MUTED)).opacity(0.6).into_any_element();
+            return base
+                .text_color(self.colors.muted)
+                .opacity(0.6)
+                .into_any_element();
         }
 
         let action = item.action;
         let book_id = menu.book_id.clone();
-        base.text_color(rgb(if item.danger { ACCENT } else { TEXT }))
-            .cursor_pointer()
-            .when(menu.selected == Some(ix), |row| row.bg(rgb(SURFACE_HI)))
-            .on_mouse_move(
-                cx.listener(move |this, _: &MouseMoveEvent, _, cx| this.menu_hover(ix, cx)),
-            )
-            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                this.run_book_action(action, &book_id, window, cx);
-            }))
-            .into_any_element()
+        base.text_color(if item.danger {
+            self.colors.accent
+        } else {
+            self.colors.foreground
+        })
+        .cursor_pointer()
+        .when(menu.selected == Some(ix), |row| {
+            row.bg(self.colors.surface_hover)
+        })
+        .on_mouse_move(cx.listener(move |this, _: &MouseMoveEvent, _, cx| this.menu_hover(ix, cx)))
+        .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+            this.run_book_action(action, &book_id, window, cx);
+        }))
+        .into_any_element()
     }
 
-    fn panel(&self, width: f32) -> gpui::Div {
+    fn panel(&self, width: f32) -> gpui_kit::Div {
         div()
             .w(px(width))
             .max_w_full()
@@ -2349,12 +2893,12 @@ impl Yomu {
             .gap_4()
             .p_6()
             .rounded_lg()
-            .bg(rgb(SURFACE))
+            .bg(self.colors.surface)
             .border_1()
-            .border_color(rgb(TRACK))
+            .border_color(self.colors.border)
             .shadow_lg()
             .text_sm()
-            .text_color(rgb(TEXT))
+            .text_color(self.colors.foreground)
             .on_mouse_down(MouseButton::Left, |_: &MouseDownEvent, _, cx| {
                 cx.stop_propagation()
             })
@@ -2373,7 +2917,11 @@ impl Yomu {
                             .font_weight(FontWeight::SEMIBOLD)
                             .child(dialog.title.clone()),
                     )
-                    .child(div().text_color(rgb(MUTED)).child(dialog.message.clone()))
+                    .child(
+                        div()
+                            .text_color(self.colors.muted)
+                            .child(dialog.message.clone()),
+                    )
                     .child(
                         div()
                             .flex()
@@ -2384,6 +2932,7 @@ impl Yomu {
                                 "confirm-cancel",
                                 "Cancel",
                                 ButtonKind::Normal,
+                                self.colors,
                                 true,
                                 cx.listener(|this, _: &ClickEvent, _, cx| this.close_overlay(cx)),
                             ))
@@ -2391,6 +2940,7 @@ impl Yomu {
                                 "confirm-accept",
                                 dialog.confirm_label,
                                 ButtonKind::Primary,
+                                self.colors,
                                 true,
                                 cx.listener(|this, _: &ClickEvent, window, cx| {
                                     this.confirm_accept(window, cx);
@@ -2411,7 +2961,7 @@ impl Yomu {
                     div()
                         .w(px(84.))
                         .flex_none()
-                        .text_color(rgb(MUTED))
+                        .text_color(self.colors.muted)
                         .child(label.clone()),
                 )
                 .child(div().flex_1().min_w_0().truncate().child(value.clone()))
@@ -2432,6 +2982,7 @@ impl Yomu {
                         "properties-close",
                         "Close",
                         ButtonKind::Normal,
+                        self.colors,
                         true,
                         cx.listener(|this, _: &ClickEvent, _, cx| this.close_overlay(cx)),
                     ))),
@@ -2453,7 +3004,7 @@ impl Yomu {
                                 "Set series for selected books"
                             }),
                     )
-                    .child(div().text_color(rgb(MUTED)).child(
+                    .child(div().text_color(self.colors.muted).child(
                         "A folder name is suggested when the books share a parent folder. Edit it, or clear the field to leave them ungrouped.",
                     ))
                     .child(
@@ -2465,9 +3016,9 @@ impl Yomu {
                             .py_2()
                             .rounded_md()
                             .border_1()
-                            .border_color(rgb(ACCENT))
-                            .bg(rgb(BG))
-                            .text_color(rgb(TEXT))
+                            .border_color(self.colors.accent)
+                            .bg(self.colors.background)
+                            .text_color(self.colors.foreground)
                             .child(if dialog.value.is_empty() {
                                 "Type a series name…".to_string()
                             } else {
@@ -2480,7 +3031,7 @@ impl Yomu {
                             .flex_row()
                             .justify_between()
                             .items_center()
-                            .child(div().text_xs().text_color(rgb(MUTED)).child(
+                            .child(div().text_xs().text_color(self.colors.muted).child(
                                 "Type · Enter to save · Esc to cancel · Ctrl+A clears",
                             ))
                             .child(
@@ -2492,6 +3043,7 @@ impl Yomu {
                                         "series-cancel",
                                         "Cancel",
                                         ButtonKind::Normal,
+                                        self.colors,
                                         true,
                                         cx.listener(|this, _: &ClickEvent, _, cx| {
                                             this.close_overlay(cx)
@@ -2501,6 +3053,7 @@ impl Yomu {
                                         "series-save",
                                         "Save",
                                         ButtonKind::Primary,
+                                        self.colors,
                                         true,
                                         cx.listener(|this, _: &ClickEvent, _, cx| {
                                             this.save_series_dialog(cx)
@@ -2515,8 +3068,15 @@ impl Yomu {
     fn render_settings(&self, cx: &mut Context<Self>) -> AnyElement {
         let settings = self.library.settings();
         let opacity = settings.opacity;
+        let theme_name = settings.theme_name.clone();
+        let theme_path = self.custom_theme_path.display().to_string();
+        let theme_status = self.theme_status.clone();
         let continuous = settings.continuous;
         let webcomics = settings.webcomics;
+        let rtl = settings.rtl;
+        let fit = settings.fit;
+        let animate = settings.animate;
+        let grouped = settings.group_series;
         let fraction = (opacity - OPACITY_MIN) / (OPACITY_MAX - OPACITY_MIN);
         let is_default = *settings == Settings::default();
         let bounds = self.slider.bounds.clone();
@@ -2548,13 +3108,13 @@ impl Yomu {
                     .w(px(SLIDER_W - KNOB))
                     .h(px(4.))
                     .rounded_full()
-                    .bg(rgb(TRACK))
+                    .bg(self.colors.border)
                     .child(
                         div()
                             .h_full()
                             .w(relative(fraction))
                             .rounded_full()
-                            .bg(rgb(ACCENT)),
+                            .bg(self.colors.accent),
                     ),
             )
             .child(
@@ -2564,10 +3124,99 @@ impl Yomu {
                     .left(px(fraction * (SLIDER_W - KNOB)))
                     .size(px(KNOB))
                     .rounded_full()
-                    .bg(rgb(TEXT)),
+                    .bg(self.colors.foreground),
             );
 
         // No dimming scrim here: you want to see the window behind the panel while dragging.
+        let tab_button = |tab, label| {
+            let selected = self.settings_tab == tab;
+            let id = match tab {
+                SettingsTab::Appearance => "settings-tab-appearance",
+                SettingsTab::Library => "settings-tab-library",
+                SettingsTab::Reader => "settings-tab-reader",
+                SettingsTab::Keyboard => "settings-tab-keyboard",
+            };
+            panel_button(
+                id,
+                label,
+                if selected {
+                    ButtonKind::Primary
+                } else {
+                    ButtonKind::Normal
+                },
+                self.colors,
+                true,
+                cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    this.settings_tab = tab;
+                    cx.notify();
+                }),
+            )
+        };
+        let appearance_tab = tab_button(SettingsTab::Appearance, "Appearance");
+        let library_tab = tab_button(SettingsTab::Library, "Library");
+        let reader_tab = tab_button(SettingsTab::Reader, "Reader");
+        let keyboard_tab = tab_button(SettingsTab::Keyboard, "Keyboard & Commands");
+
+        let body = match self.settings_tab {
+            SettingsTab::Appearance => div()
+                .flex().flex_col().gap_3()
+                .child(div().font_weight(FontWeight::SEMIBOLD).child("Theme"))
+                .child(div().flex().flex_row().items_center().gap_2()
+                    .child(panel_button("settings-theme-previous", "‹", ButtonKind::Normal, self.colors, true,
+                        cx.listener(|this, _: &ClickEvent, _, cx| this.cycle_theme(-1, cx))))
+                    .child(div().flex_1().text_center().text_color(self.colors.muted).child(theme_name))
+                    .child(panel_button("settings-theme-next", "›", ButtonKind::Normal, self.colors, true,
+                        cx.listener(|this, _: &ClickEvent, _, cx| this.cycle_theme(1, cx))))
+                )
+                .child(div().flex().flex_row().items_center().justify_between().gap_2()
+                    .child(div().min_w_0().text_xs().text_color(self.colors.muted).truncate().child(theme_path))
+                    .child(panel_button("settings-theme-reload", "Reload custom themes", ButtonKind::Normal,
+                        self.colors, true, cx.listener(|this, _: &ClickEvent, _, cx| this.reload_custom_themes(cx)))))
+                .children(theme_status.map(|status| div().text_xs().text_color(self.colors.muted).child(status)))
+                .child(div().flex().justify_between().child("Window background opacity")
+                    .child(div().text_color(self.colors.muted).child(format!("{}%", (opacity * 100.0).round() as u32))))
+                .child(track)
+                .into_any_element(),
+            SettingsTab::Library => div().flex().flex_col().gap_3()
+                .child(div().font_weight(FontWeight::SEMIBOLD).child("Library"))
+                .child(panel_button("settings-group-series", if grouped { "Series grouping: On" } else { "Series grouping: Off" },
+                    ButtonKind::Normal, self.colors, true, cx.listener(|this, _: &ClickEvent, _, cx| {
+                        this.library.settings_mut().group_series = !this.library.settings().group_series;
+                        this.save_library();
+                        cx.notify();
+                    })))
+                .child(div().text_xs().text_color(self.colors.muted).child("Group books with matching series names under collapsible headings in the library."))
+                .into_any_element(),
+            SettingsTab::Reader => div().flex().flex_col().gap_3()
+                .child(div().font_weight(FontWeight::SEMIBOLD).child("Reader"))
+                .child(panel_button("settings-direction", if rtl { "Reading direction: Right to left" } else { "Reading direction: Left to right" },
+                    ButtonKind::Normal, self.colors, true, cx.listener(move |this, _: &ClickEvent, _, cx| this.set_direction(!rtl, cx))))
+                .child(panel_button("settings-fit", format!("Page fit: {} (click to cycle)", fit.label()),
+                    ButtonKind::Normal, self.colors, true, cx.listener(move |this, _: &ClickEvent, _, cx| this.set_fit(fit.next(), cx))))
+                    .child(panel_button("settings-animations", if animate { "Page animations: On" } else { "Page animations: Off" },
+                    ButtonKind::Normal, self.colors, true, cx.listener(|this, _: &ClickEvent, _, cx| this.set_animations(None, cx))))
+                .child(panel_button("settings-continuous", if continuous { "Reading mode: Continuous" } else { "Reading mode: Single page" },
+                    ButtonKind::Normal, self.colors, true, cx.listener(|this, _: &ClickEvent, _, cx| this.set_continuous(None, cx))))
+                .child(panel_button("settings-webcomics", if webcomics { "Webcomics mode: On" } else { "Webcomics mode: Off" },
+                    ButtonKind::Normal, self.colors, true, cx.listener(|this, _: &ClickEvent, _, cx| this.set_webcomics(None, cx))))
+                .child(div().text_xs().text_color(self.colors.muted).child("Webcomics mode forces a gapless vertical strip. Turning it off restores the selected single-page or continuous mode."))
+                .into_any_element(),
+            SettingsTab::Keyboard => {
+                let mut content = div().flex().flex_col().gap_3().child(div().font_weight(FontWeight::SEMIBOLD).child("Keyboard & Commands"));
+                for (section, rows) in HELP {
+                    let mut group = div().flex().flex_col().gap_1()
+                        .child(div().text_xs().font_weight(FontWeight::SEMIBOLD).text_color(self.colors.muted).child(*section));
+                    for (keys, description) in *rows {
+                        group = group.child(div().flex().justify_between().gap_4()
+                            .child(div().min_w(px(150.)).text_color(self.colors.accent).child(*keys))
+                            .child(div().flex_1().text_color(self.colors.foreground).child(*description)));
+                    }
+                    content = content.child(group);
+                }
+                content.into_any_element()
+            }
+        };
+
         self.scrim(false, cx)
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
                 if !this.slider.dragging {
@@ -2584,7 +3233,7 @@ impl Yomu {
                 cx.listener(|this, _: &MouseUpEvent, _, cx| this.end_slider_drag(cx)),
             )
             .child(
-                self.panel(SLIDER_W + 48.)
+                self.panel(640.)
                     .child(
                         div()
                             .text_lg()
@@ -2594,49 +3243,14 @@ impl Yomu {
                     .child(
                         div()
                             .flex()
-                            .flex_col()
+                            .flex_row()
                             .gap_2()
-                            .child(
-                                div()
-                                    .flex()
-                                    .flex_row()
-                                    .justify_between()
-                                    .child("Window background opacity")
-                                    .child(
-                                        div().text_color(rgb(MUTED)).child(format!(
-                                            "{}%",
-                                            (opacity * 100.0).round() as u32
-                                        )),
-                                    ),
-                            )
-                            .child(track)
-                            .child(panel_button(
-                                "settings-continuous",
-                                if continuous { "Reading mode: Continuous" } else { "Reading mode: Single page" },
-                                ButtonKind::Normal,
-                                true,
-                                cx.listener(|this, _: &ClickEvent, _, cx| {
-                                    this.set_continuous(None, cx);
-                                }),
-                            ))
-                            .child(panel_button(
-                                "settings-webcomics",
-                                if webcomics {
-                                    "Webcomics mode: On"
-                                } else {
-                                    "Webcomics mode: Off"
-                                },
-                                ButtonKind::Normal,
-                                true,
-                                cx.listener(|this, _: &ClickEvent, _, cx| {
-                                    this.set_webcomics(None, cx);
-                                }),
-                            ))
-                            .child(div().text_xs().text_color(rgb(MUTED)).child(
-                                "Continuous mode stacks pages vertically. Single page mode turns pages at the edge. \
-                                     Webcomics mode forces a gapless vertical strip. Lower opacity lets the desktop show through the background.",
-                            )),
+                            .child(appearance_tab)
+                            .child(library_tab)
+                            .child(reader_tab)
+                            .child(keyboard_tab),
                     )
+                    .child(div().min_h(px(250.)).child(body))
                     .child(
                         div()
                             .flex()
@@ -2647,6 +3261,7 @@ impl Yomu {
                                 "settings-reset",
                                 "Reset to Defaults",
                                 ButtonKind::Normal,
+                                self.colors,
                                 !is_default,
                                 cx.listener(|this, _: &ClickEvent, _, cx| {
                                     this.request_reset_settings(cx)
@@ -2656,6 +3271,7 @@ impl Yomu {
                                 "settings-done",
                                 "Done",
                                 ButtonKind::Primary,
+                                self.colors,
                                 true,
                                 cx.listener(|this, _: &ClickEvent, _, cx| this.close_overlay(cx)),
                             )),
@@ -2685,13 +3301,6 @@ impl Yomu {
         };
 
         let selected = self.selection.len();
-        let subtitle = if selected > 0 {
-            format!("{selected} of {count} selected")
-        } else if !self.search_query.trim().is_empty() {
-            format!("{} of {count} books", books.len())
-        } else {
-            format!("{count} {}", if count == 1 { "book" } else { "books" })
-        };
 
         let search_label = if self.search_query.is_empty() {
             "Search title or path…".to_string()
@@ -2700,62 +3309,41 @@ impl Yomu {
         };
         let search_field = div()
             .id("library-search")
-            .w(px(230.))
-            .h(px(32.))
+            .w(px(360.))
+            .max_w(px(520.))
+            .h(px(38.))
             .px_3()
             .flex()
             .items_center()
+            .gap_2()
             .rounded_md()
             .border_1()
-            .border_color(rgb(if self.search_active { ACCENT } else { TRACK }))
-            .bg(rgb(SURFACE))
-            .text_sm()
-            .text_color(rgb(if self.search_query.is_empty() {
-                MUTED
+            .border_color(if self.search_active {
+                self.colors.accent
             } else {
-                TEXT
-            }))
-            .child(div().truncate().child(search_label))
+                self.colors.border
+            })
+            .bg(with_alpha(self.colors.surface, 0.78))
+            .text_sm()
+            .text_color(if self.search_query.is_empty() {
+                self.colors.muted
+            } else {
+                self.colors.foreground
+            })
+            .child(div().text_lg().child("⌕"))
+            .child(div().flex_1().truncate().child(search_label))
             .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                 this.search_active = true;
                 cx.notify();
             }));
 
-        let right = div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap_3()
-            .child(search_field)
-            .child(button(
-                "group-series",
-                if self.library.settings().group_series {
-                    "Grouped"
-                } else {
-                    "Group by series"
-                },
-                cx.listener(|this, _: &ClickEvent, _, cx| {
-                    let settings = this.library.settings_mut();
-                    settings.group_series = !settings.group_series;
-                    this.save_library();
-                    cx.notify();
-                }),
-            ))
-            .children(status.map(|text| {
-                div()
-                    .max_w(px(520.))
-                    .text_sm()
-                    .text_color(rgb(MUTED))
-                    .truncate()
-                    .child(text)
-            }));
-        // While books are selected the header offers what you can do with the selection instead
-        // of importing and settings; Esc or Cancel goes back.
-        let right = if selected > 0 {
-            let right = if selected < count {
-                right.child(button(
+        let selection_controls = if selected > 0 {
+            let controls = div().flex().flex_row().items_center().gap_2();
+            let controls = if selected < count {
+                controls.child(button(
                     "select-all",
                     "Select all",
+                    self.colors,
                     cx.listener(|this, _: &ClickEvent, _, cx| {
                         let order = this.library_order();
                         this.selection.select_all(&order);
@@ -2763,66 +3351,58 @@ impl Yomu {
                     }),
                 ))
             } else {
-                right
+                controls
             };
-            right
-                .child(button_colored(
-                    "select-remove",
-                    "Remove",
-                    ACCENT,
-                    cx.listener(|this, _: &ClickEvent, _, cx| this.request_remove_selected(cx)),
-                ))
-                .child(button(
-                    "select-cancel",
-                    "Cancel",
-                    cx.listener(|this, _: &ClickEvent, _, cx| {
-                        this.selection.clear();
-                        cx.notify();
-                    }),
-                ))
+            Some(
+                controls
+                    .child(button_colored(
+                        "select-remove",
+                        "Remove",
+                        self.colors.accent,
+                        self.colors,
+                        cx.listener(|this, _: &ClickEvent, _, cx| this.request_remove_selected(cx)),
+                    ))
+                    .child(button(
+                        "select-cancel",
+                        "Cancel",
+                        self.colors,
+                        cx.listener(|this, _: &ClickEvent, _, cx| {
+                            this.selection.clear();
+                            cx.notify();
+                        }),
+                    )),
+            )
         } else {
-            right
-                .child(button(
-                    "add-files",
-                    "Add files",
-                    cx.listener(|this, _: &ClickEvent, _, cx| this.import_dialog(false, cx)),
-                ))
-                .child(button(
-                    "add-folder",
-                    "Add folder",
-                    cx.listener(|this, _: &ClickEvent, _, cx| this.import_dialog(true, cx)),
-                ))
-                .child(button(
-                    "settings",
-                    "Settings",
-                    cx.listener(|this, _: &ClickEvent, _, cx| this.open_settings(cx)),
-                ))
+            None
         };
 
         let header = div()
+            .relative()
             .flex()
             .flex_row()
             .flex_none()
             .items_center()
-            .justify_between()
-            .h(px(56.))
+            .h(px(72.))
             .px_6()
+            .children(selection_controls.map(|controls| div().absolute().left_6().child(controls)))
             .child(
                 div()
+                    .absolute()
+                    .left_0()
+                    .right_0()
                     .flex()
-                    .flex_row()
-                    .items_baseline()
-                    .gap_3()
-                    .child(
-                        div()
-                            .text_lg()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(rgb(TEXT))
-                            .child("yomu"),
-                    )
-                    .child(div().text_sm().text_color(rgb(MUTED)).child(subtitle)),
+                    .justify_center()
+                    .child(search_field),
             )
-            .child(right);
+            .child(div().flex_1().flex().justify_end().child(button(
+                "library-menu-toggle",
+                "☰",
+                self.colors,
+                cx.listener(|this, _: &ClickEvent, _, cx| {
+                    this.overlay = Some(Overlay::LibraryMenu(LibraryMenu::default()));
+                    cx.notify();
+                }),
+            )));
 
         let body = if count == 0 {
             div()
@@ -2835,10 +3415,10 @@ impl Yomu {
                 .child(
                     div()
                         .text_xl()
-                        .text_color(rgb(TEXT))
+                        .text_color(self.colors.foreground)
                         .child("Your library is empty"),
                 )
-                .child(div().text_sm().text_color(rgb(MUTED)).child(
+                .child(div().text_sm().text_color(self.colors.muted).child(
                     "Drop CBZ files or folders onto this window, or use Add files (Ctrl+O).",
                 ))
                 .into_any_element()
@@ -2853,13 +3433,13 @@ impl Yomu {
                 .child(
                     div()
                         .text_xl()
-                        .text_color(rgb(TEXT))
+                        .text_color(self.colors.foreground)
                         .child("No matching books"),
                 )
                 .child(
                     div()
                         .text_sm()
-                        .text_color(rgb(MUTED))
+                        .text_color(self.colors.muted)
                         .child("Try another title or source path."),
                 )
                 .into_any_element()
@@ -2917,10 +3497,21 @@ impl Yomu {
 
         div()
             .size_full()
+            .relative()
             .flex()
             .flex_col()
             .child(header)
             .child(body)
+            .children(status.map(|text| {
+                div()
+                    .absolute()
+                    .bottom_5()
+                    .left_0()
+                    .right_0()
+                    .flex()
+                    .justify_center()
+                    .child(pill(div(), text, self.colors))
+            }))
             .into_any_element()
     }
 
@@ -2949,7 +3540,7 @@ impl Yomu {
             .cursor_pointer()
             .text_sm()
             .font_weight(FontWeight::SEMIBOLD)
-            .text_color(rgb(TEXT))
+            .text_color(self.colors.foreground)
             .child(if collapsed { "▸" } else { "▾" })
             .child(format!("{name} · {}", books.len()))
             .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
@@ -2998,9 +3589,13 @@ impl Yomu {
             .flex_none()
             .rounded_md()
             .overflow_hidden()
-            .bg(rgb(SURFACE))
+            .bg(self.colors.surface)
             .border_2()
-            .border_color(if selected { rgb(ACCENT) } else { rgb(SURFACE) })
+            .border_color(if selected {
+                self.colors.accent
+            } else {
+                self.colors.surface
+            })
             .child(
                 img(self.dirs.cover(&book.id))
                     .w_full()
@@ -3014,20 +3609,20 @@ impl Yomu {
                     .top_0()
                     .left_0()
                     .size_full()
-                    .bg(rgba(0xe2725b38))
+                    .bg(with_alpha(self.colors.accent, 0.22))
             }));
 
         let progress_bar = div()
             .h(px(3.))
             .w_full()
             .rounded_full()
-            .bg(rgb(TRACK))
+            .bg(self.colors.border)
             .child(
                 div()
                     .h_full()
                     .w(relative(progress))
                     .rounded_full()
-                    .bg(rgb(ACCENT)),
+                    .bg(self.colors.accent),
             );
 
         div()
@@ -3036,9 +3631,17 @@ impl Yomu {
             .flex_none()
             .flex()
             .flex_col()
-            .gap_2()
+            .rounded_lg()
+            .border_1()
+            .border_color(if selected {
+                self.colors.accent
+            } else {
+                self.colors.border
+            })
+            .bg(self.colors.surface)
+            .overflow_hidden()
             .cursor_pointer()
-            .hover(|style| style.opacity(0.88))
+            .hover(|style| style.opacity(0.92))
             // `on_click` only ever fires for the left button, so right-clicking never opens a book.
             .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                 if this.overlay_recently_closed() {
@@ -3061,14 +3664,21 @@ impl Yomu {
             .child(cover)
             .child(
                 div()
-                    .text_sm()
-                    .font_weight(FontWeight::MEDIUM)
-                    .text_color(rgb(TEXT))
-                    .truncate()
-                    .child(SharedString::from(book.title.clone())),
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .p_3()
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(self.colors.foreground)
+                            .truncate()
+                            .child(SharedString::from(book.title.clone())),
+                    )
+                    .child(progress_bar)
+                    .child(div().text_xs().text_color(self.colors.muted).child(status)),
             )
-            .child(progress_bar)
-            .child(div().text_xs().text_color(rgb(MUTED)).child(status))
             .into_any_element()
     }
 
@@ -3080,7 +3690,10 @@ impl Yomu {
         // turn the outgoing and incoming pages are both drawn, shifted along the same strip.
         let mut content: Vec<AnyElement> = Vec::new();
         if let Some(error) = &reader.error {
-            content.push(centered(format!("Couldn't open this book: {error}")));
+            content.push(centered(
+                format!("Couldn't open this book: {error}"),
+                self.colors,
+            ));
         } else if reader.continuous {
             let (tops, heights) = reader.continuous_layout(&vp);
             let width = vp.width * reader.zoom;
@@ -3099,10 +3712,10 @@ impl Yomu {
                         (width, *height),
                     ));
                 } else if let Some(error) = reader.failed.get(&ix) {
-                    content.push(centered(format!(
-                        "Couldn't decode page {}: {error}",
-                        ix + 1
-                    )));
+                    content.push(centered(
+                        format!("Couldn't decode page {}: {error}", ix + 1),
+                        self.colors,
+                    ));
                 }
             }
         } else {
@@ -3128,12 +3741,12 @@ impl Yomu {
                 content.push(page_layer(&page.image, left + shift_in, top, display));
             } else if reader.outgoing.is_none() {
                 if let Some(error) = reader.failed.get(&reader.page) {
-                    content.push(centered(format!(
-                        "Couldn't decode page {}: {error}",
-                        reader.page + 1
-                    )));
+                    content.push(centered(
+                        format!("Couldn't decode page {}: {error}", reader.page + 1),
+                        self.colors,
+                    ));
                 } else if reader.pages.is_none() {
-                    content.push(centered("Opening…"));
+                    content.push(centered("Opening…", self.colors));
                 }
                 // otherwise: blank for the moment it takes the first page to decode
             }
@@ -3145,7 +3758,7 @@ impl Yomu {
             .bottom_0()
             .h(px(2.))
             .w(relative(fraction))
-            .bg(rgb(ACCENT));
+            .bg(self.colors.accent);
         // Manga fills right to left; western comics left to right.
         let progress_line = if reader.rtl {
             progress_line.right_0()
@@ -3175,36 +3788,121 @@ impl Yomu {
                         "single page"
                     }
                 ),
+                self.colors,
             )
         });
-        let hud = self
-            .hud
-            .clone()
-            .map(|text| pill(div().absolute().top_4().left_0().right_0(), text));
-
-        let vim_status = reader.vim.status().map(|text| {
-            let text = if reader.vim.in_cmdline() {
-                format!("{text}▏")
-            } else {
-                text
-            };
-            div()
-                .absolute()
-                .bottom_0()
-                .left_0()
-                .px_3()
-                .py_1()
-                .bg(rgba(0x000000d9))
-                .text_sm()
-                .text_color(rgb(TEXT))
-                .child(text)
+        let hud = self.hud.clone().map(|text| {
+            pill(
+                div().absolute().top_4().left_0().right_0(),
+                text,
+                self.colors,
+            )
         });
+
+        let vim_status = if let Some(input) = reader.vim.cmdline_text() {
+            let suggestions = command_suggestions(input);
+            let mut prompt = div()
+                .w(px(560.))
+                .max_w_full()
+                .flex()
+                .flex_col()
+                .rounded_lg()
+                .border_1()
+                .border_color(self.colors.border)
+                .bg(self.colors.surface)
+                .text_sm();
+            if !suggestions.is_empty() {
+                let mut rows = div().flex().flex_col().p_1();
+                for (index, (completion, label, description)) in suggestions.iter().enumerate() {
+                    let selected = index == self.command_selection;
+                    let completion = completion.clone();
+                    rows = rows.child(
+                        div()
+                            .id(SharedString::from(format!("command-suggestion-{index}")))
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap_4()
+                            .px_2()
+                            .py_1()
+                            .rounded_md()
+                            .cursor_pointer()
+                            .when(selected, |row| row.bg(with_alpha(self.colors.accent, 0.18)))
+                            .child(div().text_color(self.colors.accent).child(label.clone()))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .text_right()
+                                    .text_color(self.colors.muted)
+                                    .child(*description),
+                            )
+                            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                if let Some(reader) = this.reader.as_mut() {
+                                    reader.vim.replace_cmdline(completion.clone());
+                                }
+                                this.command_selection = 0;
+                                cx.notify();
+                            })),
+                    );
+                }
+                prompt = prompt.child(rows);
+            }
+            prompt = prompt.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .border_t_1()
+                    .border_color(self.colors.border)
+                    .px_3()
+                    .py_2()
+                    .child(
+                        div()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(self.colors.accent)
+                            .child(":"),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_color(self.colors.foreground)
+                            .child(format!("{input}▏")),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(self.colors.muted)
+                            .child("↑↓ select · Tab complete · Enter run · Esc cancel"),
+                    ),
+            );
+            Some(
+                div()
+                    .absolute()
+                    .bottom_6()
+                    .left_0()
+                    .right_0()
+                    .flex()
+                    .justify_center()
+                    .child(prompt),
+            )
+        } else {
+            reader.vim.status().map(|text| {
+                pill(
+                    div().absolute().bottom_4().left_0().right_0(),
+                    text,
+                    self.colors,
+                )
+            })
+        };
 
         div()
             .size_full()
             .relative()
             .overflow_hidden()
-            .bg(with_alpha(READER_BG, self.library.settings().opacity))
+            .bg(with_alpha(
+                self.colors.background,
+                self.library.settings().opacity,
+            ))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, event: &MouseDownEvent, _, _| {
@@ -3239,7 +3937,7 @@ impl Yomu {
             .children(info)
             .children(hud)
             .children(vim_status)
-            .children(reader.show_help.then(help_overlay))
+            .children(reader.show_help.then(|| help_overlay(self.colors)))
             .into_any_element()
     }
 }
@@ -3275,9 +3973,9 @@ impl Render for Yomu {
         // The reader paints its own background, so the root only has one in the library;
         // two translucent layers would add up to a different opacity than the setting says.
         let root_bg = if reading {
-            rgba(0x0000_0000)
+            with_alpha(self.colors.background, 0.0)
         } else {
-            with_alpha(BG, self.library.settings().opacity)
+            with_alpha(self.colors.background, self.library.settings().opacity)
         };
         let overlay = self.render_overlay(cx);
 
@@ -3286,7 +3984,7 @@ impl Render for Yomu {
             .track_focus(&self.focus_handle)
             .size_full()
             .bg(root_bg)
-            .text_color(rgb(TEXT))
+            .text_color(self.colors.foreground)
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 this.on_key(event, window, cx);
             }))
@@ -3320,27 +4018,27 @@ fn page_layer(image: &Arc<RenderImage>, left: f32, top: f32, display: (f32, f32)
         .into_any_element()
 }
 
-fn centered(text: impl Into<SharedString>) -> AnyElement {
+fn centered(text: impl Into<SharedString>, colors: UiColors) -> AnyElement {
     div()
         .size_full()
         .flex()
         .items_center()
         .justify_center()
-        .text_color(rgb(MUTED))
+        .text_color(colors.muted)
         .child(text.into())
         .into_any_element()
 }
 
 /// A small rounded label centred horizontally inside `row` (an absolutely positioned div).
-fn pill(row: gpui::Div, text: impl Into<SharedString>) -> gpui::Div {
+fn pill(row: gpui_kit::Div, text: impl Into<SharedString>, colors: UiColors) -> gpui_kit::Div {
     row.flex().justify_center().child(
         div()
             .px_3()
             .py_1()
             .rounded_full()
-            .bg(rgba(0x000000b3))
+            .bg(with_alpha(colors.background, 0.7))
             .text_sm()
-            .text_color(rgb(TEXT))
+            .text_color(colors.foreground)
             .child(text.into()),
     )
 }
@@ -3385,7 +4083,77 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
     ),
 ];
 
-fn help_overlay() -> AnyElement {
+/// (completed command text, display text, short explanation)
+fn command_suggestions(input: &str) -> Vec<(String, String, &'static str)> {
+    const COMMANDS: &[(&str, &str)] = &[
+        ("fit", "Choose page fit mode"),
+        ("zoom", "Set zoom percentage or reset"),
+        ("rtl", "Read right to left"),
+        ("ltr", "Read left to right"),
+        ("animate", "Toggle page animations"),
+        ("continuous", "Toggle continuous scrolling"),
+        ("webcomics", "Toggle gapless webcomics mode"),
+        ("goto", "Jump to a page number"),
+        ("mark", "Set a letter mark"),
+        ("settings", "Open Settings"),
+        ("info", "Toggle page information"),
+        ("help", "Show keyboard help"),
+        ("fullscreen", "Toggle fullscreen"),
+        ("q", "Return to the library"),
+        ("qa", "Quit yomu"),
+    ];
+    const FITS: &[(&str, &str)] = &[
+        ("page", "Fit the whole page"),
+        ("width", "Fit the page width"),
+        ("height", "Fit the page height"),
+        ("original", "Show at original size"),
+    ];
+    const TOGGLES: &[(&str, &str)] = &[("on", "Enable"), ("off", "Disable")];
+    const ZOOM: &[(&str, &str)] = &[
+        ("reset", "Reset zoom"),
+        ("150", "Set zoom to 150% (edit the number as needed)"),
+    ];
+
+    let trimmed = input.trim_start();
+    let mut words = trimmed.split_whitespace();
+    let command = words.next().unwrap_or_default();
+    let has_separator = trimmed.ends_with(char::is_whitespace);
+    if let Some((_, _)) = COMMANDS.iter().find(|(name, _)| *name == command)
+        && (has_separator || input.contains(' '))
+    {
+        let args = if command == "fit" {
+            FITS
+        } else if matches!(command, "animate" | "continuous" | "webcomics") {
+            TOGGLES
+        } else if command == "zoom" {
+            ZOOM
+        } else {
+            &[]
+        };
+        let partial = words.next().unwrap_or_default();
+        return args
+            .iter()
+            .filter(|(value, _)| value.starts_with(partial))
+            .map(|(value, description)| {
+                (
+                    format!("{command} {value}"),
+                    (*value).to_string(),
+                    *description,
+                )
+            })
+            .collect();
+    }
+
+    let prefix = if has_separator { "" } else { command };
+    COMMANDS
+        .iter()
+        .filter(|(name, _)| name.starts_with(prefix))
+        .take(7)
+        .map(|(name, description)| (format!("{name} "), (*name).to_string(), *description))
+        .collect()
+}
+
+fn help_overlay(colors: UiColors) -> AnyElement {
     let mut panel = div()
         .w(px(600.))
         .max_w_full()
@@ -3394,7 +4162,7 @@ fn help_overlay() -> AnyElement {
         .gap_3()
         .p_6()
         .rounded_lg()
-        .bg(rgba(0x0f0f11f2))
+        .bg(with_alpha(colors.surface, 0.95))
         .text_sm();
 
     for (title, rows) in HELP {
@@ -3407,7 +4175,7 @@ fn help_overlay() -> AnyElement {
                     div()
                         .text_xs()
                         .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(rgb(MUTED))
+                        .text_color(colors.muted)
                         .child(*title),
                 )
                 .children(rows.iter().map(|(keys, what)| {
@@ -3419,17 +4187,17 @@ fn help_overlay() -> AnyElement {
                             div()
                                 .w(px(190.))
                                 .flex_none()
-                                .text_color(rgb(ACCENT))
+                                .text_color(colors.accent)
                                 .child(*keys),
                         )
-                        .child(div().text_color(rgb(TEXT)).child(*what))
+                        .child(div().text_color(colors.foreground).child(*what))
                 })),
         );
     }
     panel = panel.child(
         div()
             .text_xs()
-            .text_color(rgb(MUTED))
+            .text_color(colors.muted)
             .child("Press ? or Esc to close"),
     );
 
@@ -3441,7 +4209,7 @@ fn help_overlay() -> AnyElement {
         .flex()
         .items_center()
         .justify_center()
-        .bg(rgba(0x000000a6))
+        .bg(with_alpha(overlay_shade(colors), 0.65))
         .child(panel)
         .into_any_element()
 }
@@ -3457,66 +4225,57 @@ fn panel_button(
     id: &'static str,
     label: impl Into<SharedString>,
     kind: ButtonKind,
+    _colors: UiColors,
     enabled: bool,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> AnyElement {
-    let (background, hover, foreground) = match kind {
-        ButtonKind::Normal => (SURFACE_HI, TRACK, TEXT),
-        ButtonKind::Primary => (ACCENT, 0xea8a74, 0x1a1a1e),
-    };
-    let base = div()
-        .id(id)
-        .px_3()
-        .py_1()
-        .rounded_md()
-        .bg(rgb(background))
-        .text_sm()
-        .text_color(rgb(foreground))
-        .child(label.into());
-    if enabled {
-        base.cursor_pointer()
-            .hover(move |style| style.bg(rgb(hover)))
-            .on_click(on_click)
-            .into_any_element()
-    } else {
-        base.opacity(0.4).into_any_element()
+    let button = Button::new(id)
+        .label(label)
+        .small()
+        .disabled(!enabled)
+        .on_click(on_click);
+    match kind {
+        ButtonKind::Normal => button.secondary().outline().into_any_element(),
+        ButtonKind::Primary => button.primary().into_any_element(),
     }
 }
 
 fn button(
     id: &'static str,
     label: &'static str,
+    colors: UiColors,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
-    button_colored(id, label, TEXT, on_click)
+    button_colored(id, label, colors.foreground, colors, on_click)
 }
 
 /// A header button with a custom text colour (the accent for destructive actions).
 fn button_colored(
     id: &'static str,
     label: &'static str,
-    color: u32,
+    _color: gpui_kit::Hsla,
+    _colors: UiColors,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
-    let base = div()
-        .id(id)
-        .px_3()
-        .py_1()
-        .rounded_md()
-        .bg(rgb(SURFACE))
-        .text_sm()
-        .text_color(rgb(color))
-        .cursor_pointer()
-        .hover(|style| style.bg(rgb(SURFACE_HI)))
-        .on_click(on_click)
-        .child(label);
+    let button = Button::new(id).label(label).small().on_click(on_click);
+    let button = if label == "Remove" {
+        button.danger()
+    } else {
+        button.secondary()
+    };
     #[cfg(test)]
-    let base = base.debug_selector(|| id.into());
-    base
+    {
+        div().debug_selector(|| id.into()).child(button)
+    }
+    #[cfg(not(test))]
+    {
+        button
+    }
 }
 
 fn main() {
-    Application::new().run(|cx: &mut App| {
+    application().run(|cx: &mut App| {
+        gpui_kit::init(cx);
         // The reader handles its own keys (vim-style, see `vim.rs`); only these are bindings.
         cx.bind_keys([
             KeyBinding::new("ctrl-o", ImportFiles, Some("Library")),
@@ -3527,7 +4286,7 @@ fn main() {
         ]);
 
         cx.on_action(|_: &Quit, cx: &mut App| cx.quit());
-        cx.on_window_closed(|cx| {
+        cx.on_window_closed(|cx, _window_id| {
             if cx.windows().is_empty() {
                 cx.quit();
             }
@@ -3553,7 +4312,7 @@ fn main() {
             |window, cx| {
                 let view = cx.new(Yomu::new);
                 let focus = view.read(cx).focus_handle.clone();
-                window.focus(&focus);
+                window.focus(&focus, cx);
                 view
             },
         )
@@ -3569,7 +4328,7 @@ mod tests {
     //! presses go through hit-testing and key dispatch exactly as they do in the running app.
 
     use super::*;
-    use gpui::{Entity, Modifiers, TestAppContext, VisualTestContext, point};
+    use gpui_kit::{Entity, Modifiers, TestAppContext, VisualTestContext, point};
     use std::{
         fs,
         io::{Cursor, Write},
@@ -3627,7 +4386,7 @@ mod tests {
         cx.update(|cx| cx.bind_keys([KeyBinding::new("ctrl-,", OpenSettings, None)]));
         cx.add_window_view(move |window, cx| {
             let yomu = Yomu::with_dirs(dirs, cx);
-            window.focus(&yomu.focus_handle);
+            window.focus(&yomu.focus_handle, cx);
             yomu
         })
     }
@@ -3650,6 +4409,7 @@ mod tests {
         view.read_with(cx, |this, _| match this.overlay {
             None => "none",
             Some(Overlay::Menu(_)) => "menu",
+            Some(Overlay::LibraryMenu(_)) => "library-menu",
             Some(Overlay::Confirm(_)) => "confirm",
             Some(Overlay::Properties(_)) => "properties",
             Some(Overlay::Series(_)) => "series",
@@ -3728,7 +4488,7 @@ mod tests {
     // Context menu: actions
     // ---------------------------------------------------------------------------------------
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn mark_as_read_then_unread_updates_and_persists(cx: &mut TestAppContext) {
         let fx = fixture("markread");
         let (view, cx) = launch(&fx, cx);
@@ -3758,7 +4518,7 @@ mod tests {
         assert!(!book(&view, cx, &id).opened);
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn reset_progress_asks_first_and_keeps_marks(cx: &mut TestAppContext) {
         let fx = fixture("reset");
         let (view, cx) = launch(&fx, cx);
@@ -3797,7 +4557,7 @@ mod tests {
         assert_eq!(on_disk.marks.get("a"), Some(&2));
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn remove_never_deletes_the_file_and_confirms_only_when_progress_would_be_lost(
         cx: &mut TestAppContext,
     ) {
@@ -3828,7 +4588,7 @@ mod tests {
         assert_eq!(view.read_with(cx, |this, _| this.library.books().len()), 1);
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn resume_and_start_from_beginning_open_the_reader(cx: &mut TestAppContext) {
         let fx = fixture("resume");
         let (view, cx) = launch(&fx, cx);
@@ -3851,7 +4611,7 @@ mod tests {
         assert_eq!(saved(&fx, &id).unwrap().current_page, 0);
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn missing_file_disables_file_actions_and_reports_it(cx: &mut TestAppContext) {
         let fx = fixture("missing");
         let (view, cx) = launch(&fx, cx);
@@ -3885,7 +4645,7 @@ mod tests {
         assert_eq!(overlay_kind(&view, cx), "confirm");
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn properties_dialog_lists_book_information(cx: &mut TestAppContext) {
         let fx = fixture("props");
         let (view, cx) = launch(&fx, cx);
@@ -3909,7 +4669,7 @@ mod tests {
     // Context menu: mouse and keyboard
     // ---------------------------------------------------------------------------------------
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn right_click_opens_the_menu_and_never_opens_the_book(cx: &mut TestAppContext) {
         let fx = fixture("rightclick");
         let (view, cx) = launch(&fx, cx);
@@ -3933,7 +4693,7 @@ mod tests {
         assert_eq!(reading(&view, cx), Some(0));
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn clicking_outside_closes_the_menu_without_clicking_through(cx: &mut TestAppContext) {
         let fx = fixture("outside");
         let (view, cx) = launch(&fx, cx);
@@ -3954,7 +4714,7 @@ mod tests {
         assert_eq!(reading(&view, cx), None);
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn menu_items_can_be_clicked(cx: &mut TestAppContext) {
         let fx = fixture("itemclick");
         let (view, cx) = launch(&fx, cx);
@@ -3970,7 +4730,7 @@ mod tests {
         assert!(book(&view, cx, &id).is_finished());
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn menu_stays_inside_the_window_near_every_edge(cx: &mut TestAppContext) {
         let fx = fixture("edges");
         let (view, cx) = launch(&fx, cx);
@@ -4012,7 +4772,7 @@ mod tests {
         );
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn menu_keyboard_navigation(cx: &mut TestAppContext) {
         let fx = fixture("menukeys");
         let (view, cx) = launch(&fx, cx);
@@ -4051,7 +4811,7 @@ mod tests {
         assert_eq!(overlay_kind(&view, cx), "none");
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn keys_do_not_leak_to_the_reader_while_a_dialog_is_open(cx: &mut TestAppContext) {
         let fx = fixture("leak");
         let (view, cx) = launch(&fx, cx);
@@ -4086,7 +4846,7 @@ mod tests {
     // Settings
     // ---------------------------------------------------------------------------------------
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn settings_open_with_shortcut_and_header_button_and_close_with_escape(
         cx: &mut TestAppContext,
     ) {
@@ -4104,7 +4864,7 @@ mod tests {
         assert_eq!(overlay_kind(&view, cx), "none");
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn opacity_keys_apply_immediately_and_persist(cx: &mut TestAppContext) {
         let fx = fixture("opacitykeys");
         let (view, cx) = launch(&fx, cx);
@@ -4131,7 +4891,7 @@ mod tests {
         assert_eq!(opacity(&view, cx), OPACITY_MAX, "cannot go above 100%");
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn slider_follows_the_mouse_and_saves_when_released(cx: &mut TestAppContext) {
         let fx = fixture("slider");
         let (view, cx) = launch(&fx, cx);
@@ -4189,7 +4949,7 @@ mod tests {
         );
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn window_appearance_switches_between_opaque_and_transparent(cx: &mut TestAppContext) {
         let fx = fixture("appearance");
         let (view, cx) = launch(&fx, cx);
@@ -4215,7 +4975,7 @@ mod tests {
         assert_eq!(applied(&view, cx), Some(true));
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn reset_to_defaults_confirms_and_restores_everything(cx: &mut TestAppContext) {
         let fx = fixture("resetsettings");
         let (view, cx) = launch(&fx, cx);
@@ -4254,7 +5014,7 @@ mod tests {
         assert_eq!(saved_settings(&fx), Settings::default());
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn reset_also_updates_an_open_reader(cx: &mut TestAppContext) {
         let fx = fixture("resetreader");
         let (view, cx) = launch(&fx, cx);
@@ -4277,7 +5037,7 @@ mod tests {
         assert_eq!(fit, FitMode::Page);
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn settings_survive_a_restart(cx: &mut TestAppContext) {
         let fx = fixture("restart");
         {
@@ -4293,7 +5053,7 @@ mod tests {
         assert!(book(&view, cx, &fx.ids[2]).is_finished());
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn corrupt_preferences_do_not_lose_the_library(cx: &mut TestAppContext) {
         let fx = fixture("corrupt");
         let text = fs::read_to_string(fx.dirs.library_file()).unwrap();
@@ -4331,7 +5091,7 @@ mod tests {
         view.read_with(cx, |this, _| this.library.books().len())
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn ctrl_click_selects_without_opening_and_plain_clicks_then_toggle(cx: &mut TestAppContext) {
         let fx = fixture("selectclick");
         let (view, cx) = launch(&fx, cx);
@@ -4358,7 +5118,7 @@ mod tests {
         assert!(selected(&view, cx).is_empty());
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn shift_click_selects_a_range(cx: &mut TestAppContext) {
         let fx = fixture("shiftclick");
         let (view, cx) = launch(&fx, cx);
@@ -4369,7 +5129,7 @@ mod tests {
         assert_eq!(reading(&view, cx), None);
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn select_all_and_escape(cx: &mut TestAppContext) {
         let fx = fixture("selectall");
         let (view, cx) = launch(&fx, cx);
@@ -4385,7 +5145,7 @@ mod tests {
         );
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn delete_removes_the_selection_at_once_when_nothing_is_lost(cx: &mut TestAppContext) {
         let fx = fixture("bulkdelete");
         let (view, cx) = launch(&fx, cx);
@@ -4412,7 +5172,7 @@ mod tests {
         assert_eq!(toast.as_deref(), Some("Removed 2 books from the library"));
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn bulk_removal_asks_first_when_progress_would_be_lost(cx: &mut TestAppContext) {
         let fx = fixture("bulkconfirm");
         let (view, cx) = launch(&fx, cx);
@@ -4441,7 +5201,7 @@ mod tests {
         assert_eq!(Library::load(&fx.dirs).unwrap().books().len(), 0);
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn delete_with_nothing_selected_does_nothing(cx: &mut TestAppContext) {
         let fx = fixture("deletenothing");
         let (view, cx) = launch(&fx, cx);
@@ -4450,7 +5210,7 @@ mod tests {
         assert_eq!(overlay_kind(&view, cx), "none");
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn header_buttons_manage_the_selection(cx: &mut TestAppContext) {
         let fx = fixture("headerbuttons");
         let (view, cx) = launch(&fx, cx);
@@ -4481,7 +5241,7 @@ mod tests {
         assert!(selected(&view, cx).is_empty());
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn right_click_on_a_selected_book_offers_bulk_actions(cx: &mut TestAppContext) {
         let fx = fixture("bulkmenu");
         let (view, cx) = launch(&fx, cx);
@@ -4517,7 +5277,7 @@ mod tests {
         assert_eq!(Library::load(&fx.dirs).unwrap().books()[0].id, fx.ids[1]);
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn right_click_on_an_unselected_book_drops_the_selection(cx: &mut TestAppContext) {
         let fx = fixture("rightunselected");
         let (view, cx) = launch(&fx, cx);
@@ -4540,7 +5300,7 @@ mod tests {
         assert_eq!(menu_labels(&view, cx)[0], "Start Reading");
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn removing_one_book_updates_the_selection_and_opening_clears_it(cx: &mut TestAppContext) {
         let fx = fixture("pruneselection");
         let (view, cx) = launch(&fx, cx);
@@ -4562,7 +5322,7 @@ mod tests {
         );
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn selection_keys_do_not_leak_into_the_reader(cx: &mut TestAppContext) {
         let fx = fixture("readerkeys");
         let (view, cx) = launch(&fx, cx);
@@ -4926,7 +5686,7 @@ mod tests {
         with_reader(view, cx, |r| r.page)
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn left_to_right_navigation_in_both_directions_at_the_start_middle_and_end(
         cx: &mut TestAppContext,
     ) {
@@ -4971,7 +5731,7 @@ mod tests {
         assert_eq!(saved(&fx, &fx.ids[0]).unwrap().current_page, 2);
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn right_to_left_is_an_option_and_mirrors_left_right(cx: &mut TestAppContext) {
         let fx = fixture("rtl");
         let (view, cx) = launch(&fx, cx);
@@ -5005,7 +5765,7 @@ mod tests {
         assert!(with_reader(&view, cx, |r| r.rtl));
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn clicking_the_screen_edges_and_the_wheel_follow_the_reading_direction(
         cx: &mut TestAppContext,
     ) {
@@ -5053,7 +5813,7 @@ mod tests {
         }
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn decoded_pages_stay_in_a_small_window_whatever_the_direction(cx: &mut TestAppContext) {
         for rtl in [false, true] {
             let fx = fixture(if rtl { "cache-rtl" } else { "cache-ltr" });
@@ -5085,7 +5845,7 @@ mod tests {
 
     // ---- page-turn slide through the app ----
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn a_page_turn_slides_then_settles_and_position_is_never_behind(cx: &mut TestAppContext) {
         let fx = fixture("slide");
         let (view, cx) = launch(&fx, cx);
@@ -5135,7 +5895,7 @@ mod tests {
         settle_animations(&view, cx);
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn rapid_page_turns_never_desync_the_position_from_the_picture(cx: &mut TestAppContext) {
         let fx = fixture("rapid");
         let (view, cx) = launch(&fx, cx);
@@ -5173,7 +5933,7 @@ mod tests {
         assert_eq!(saved(&fx, &id).unwrap().current_page, 4);
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn zooming_fitting_and_resizing_do_not_slide(cx: &mut TestAppContext) {
         let fx = fixture("noslide");
         let (view, cx) = launch(&fx, cx);
@@ -5208,7 +5968,7 @@ mod tests {
         }
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn switching_comics_starts_clean(cx: &mut TestAppContext) {
         let fx = fixture("switch");
         let (view, cx) = launch(&fx, cx);
@@ -5226,7 +5986,7 @@ mod tests {
         );
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn reduced_motion_and_the_animate_command_turn_animation_off(cx: &mut TestAppContext) {
         let fx = fixture("reduced");
         let (view, cx) = launch(&fx, cx);
@@ -5272,7 +6032,7 @@ mod tests {
 
     // ---- smooth scrolling through the app ----
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn keyboard_scrolling_glides_accumulates_and_leaves_the_app_idle(cx: &mut TestAppContext) {
         let fx = fixture("glide");
         let (view, cx) = launch(&fx, cx);
@@ -5321,7 +6081,7 @@ mod tests {
         assert_eq!(with_reader(&view, cx, |r| r.off.1), base + LINE_STEP);
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn touchpad_deltas_are_followed_one_to_one_and_wheel_notches_glide(cx: &mut TestAppContext) {
         let fx = fixture("wheel");
         let (view, cx) = launch(&fx, cx);
@@ -5356,7 +6116,7 @@ mod tests {
         );
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn scrolling_with_reduced_motion_is_immediate(cx: &mut TestAppContext) {
         let fx = fixture("glide-off");
         let (view, cx) = launch(&fx, cx);
@@ -5375,7 +6135,7 @@ mod tests {
         assert_eq!(with_reader(&view, cx, |r| r.off.1), base + 3.0 * LINE_STEP);
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn the_whole_session_leaves_no_leaked_state(cx: &mut TestAppContext) {
         let fx = fixture("leaks");
         let (view, cx) = launch(&fx, cx);
@@ -5495,7 +6255,7 @@ mod tests {
         println!("slide + glide state update: {per_frame:.0} ns per frame (sink {sink:.1})");
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     #[ignore = "prints timings"]
     fn perf_frames_during_a_slide(cx: &mut TestAppContext) {
         let fx = fixture("perf");

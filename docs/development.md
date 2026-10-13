@@ -2,7 +2,7 @@
 
 ## Environment
 
-Use `devenv shell` on the primary NixOS setup, or `nix develop`. Both provide a current stable Rust toolchain (edition 2024; minimum Rust 1.89), pkg-config, CMake, and gpui's Linux runtime libraries. The app uses gpui and Vulkan/Wayland; on NixOS, enable graphics drivers and an XDG desktop portal for file dialogs. See the README for full host setup and packaging instructions.
+Use `devenv shell` on the primary NixOS setup, or `nix develop`. Both provide a current stable Rust toolchain (edition 2024; minimum Rust 1.92), pkg-config, CMake, and GPUI Kit's Linux runtime libraries. The app uses GPUI Kit (GPUI) and Vulkan/Wayland; on NixOS, enable graphics drivers and an XDG desktop portal for file dialogs. See the README for full host setup and packaging instructions.
 
 The code is Linux-targeted. `nix/package.nix` wraps runtime library lookup and installs `packaging/yomu.desktop`. Keep runtime dependencies synchronized between `devenv.nix`, the flake dev shell, and the package when changing native requirements.
 
@@ -52,6 +52,6 @@ Update all relevant dependency lists: `devenv.nix`, `flake.nix`, and `nix/packag
 
 ## State of the project
 
-`problems.md` is a user-owned issue notebook; do not edit it as part of unrelated implementation work. It can contain already implemented items, so check the code and README before treating an entry as open. Continuous vertical scrolling is implemented and selectable in Settings or with `v` / `:continuous [on|off]`. Webcomics mode is implemented as a persisted gapless override, toggleable with `w` / `:webcomics [on|off]`. Library search is implemented in the header and matches title, source path, or series. Series grouping is implemented as an opt-in persisted library view with assignment from single-book and bulk context menus. Current documented product gaps are CBR/CB7, double-page spreads, pinch zoom, and sorting options (see README's “Not done yet”).
+`problems.md` is a user-owned issue notebook; do not edit it as part of unrelated implementation work. It can contain already implemented items, so check the code and README before treating an entry as open. Continuous vertical scrolling is implemented and selectable in Settings or with `v` / `:continuous [on|off]`. Webcomics mode is implemented as a persisted gapless override, toggleable with `w` / `:webcomics [on|off]`. Library search is implemented in a centered transparent toolbar and matches title, source path, or series. The upper-right hamburger provides import, Settings, series grouping, and quit actions; the toolbar omits the app name and total count. Series grouping is an opt-in persisted library view with assignment from single-book and bulk context menus. Current documented product gaps are CBR/CB7, double-page spreads, pinch zoom, sorting options, and very-low-priority inertial scrolling (see README's “Not done yet” and [agent handoff](agent-handoff.md)).
 
-There is no separate settings/config file today; preferences are serialized in `library.json`. Avoid introducing a second source of truth without a migration and ownership plan.
+Reader and library preferences are serialized in `library.json`; custom themes are configured separately in `$XDG_CONFIG_HOME/yomu/themes.toml`. Do not move existing preferences into the theme file or create a competing source of truth without a migration and ownership plan. The settings tab state itself is transient.

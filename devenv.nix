@@ -18,8 +18,8 @@ let
   ];
 in
 {
-  # gpui needs a recent compiler (edition 2024, Rust 1.89+): the latest stable from rust-overlay,
-  # which is also what flake.nix's dev shell uses.
+  # GPUI Kit 0.7.3 and its selected dependency graph require Rust 1.92+.
+  # Use the latest stable, matching flake.nix's dev shell.
   languages.rust = {
     enable = true;
     channel = "stable";
