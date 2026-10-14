@@ -14,3 +14,9 @@
 14. add toggle to enable or disable smooth scrolling.
 15. implement webtoons mode with a command where it will switch to continous scrolling & will remove any gap/paddings between pages making them look like a long strip of 1 image.
 16. better ui/ux design for modern feeling app with minimal distraction and ui clutter.
+
+
+the context menu is not closed after clicking outside it.
+the icons colors still doesn't match that of the text coloring.
+there should be a hover border ring glow whenever we hover over items.
+also the hover or selection like noctalia launcher.

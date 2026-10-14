@@ -4,23 +4,29 @@ use std::{
     cell::Cell,
     collections::{HashMap, HashSet},
     fs,
+    hash::{Hash, Hasher},
     path::{Path, PathBuf},
     rc::Rc,
-    sync::Arc,
+    sync::{Arc, mpsc},
     time::{Duration, Instant},
 };
 
 use anyhow::{Result, anyhow};
+use gpui_kit::assets::IconName;
 use gpui_kit::component::ColorTokens;
-use gpui_kit::component::button::{Button, ButtonVariants};
+use gpui_kit::component::Icon;
+use gpui_kit::component::button::{Button, ButtonRounded, ButtonVariants};
 use gpui_kit::component::{Disableable, Sizable};
 use gpui_kit::component::{Theme as KitTheme, ThemeConfig, ThemeRegistry};
+use gpui_kit::popup::{PopupAnchor, PopupConstraintAdjustment, PopupGravity, PopupOptions};
 use gpui_kit::{
-    Anchor, AnyElement, App, Bounds, ClickEvent, Context, ExternalPaths, FocusHandle, FontWeight,
-    KeyBinding, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit,
-    PathPromptOptions, Pixels, Point, RenderImage, Rgba, ScrollDelta, ScrollWheelEvent,
-    SharedString, TitlebarOptions, Window, WindowBackgroundAppearance, WindowBounds, WindowOptions,
-    actions, anchored, application, canvas, deferred, div, img, prelude::*, px, relative, size,
+    Anchor, Animation, AnimationExt, AnyElement, AnyWindowHandle, App, Bounds, ClickEvent, Context,
+    Entity, ExternalPaths, FocusHandle, FontWeight, KeyBinding, KeyDownEvent, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit, PathPromptOptions, Pixels, Point,
+    RenderImage, Rgba, ScrollDelta, ScrollWheelEvent, SharedString, Styled, Subscription,
+    TitlebarOptions, Window, WindowBackgroundAppearance, WindowBounds, WindowKind, WindowOptions,
+    actions, anchored, application, canvas, deferred, div, ease_out_quint, img, point, prelude::*,
+    px, relative, size,
 };
 use image::Frame;
 use serde::Deserialize;
@@ -33,7 +39,7 @@ use yomu::{
     motion::{self, PageTransition},
     pagecache, search,
     selection::Selection,
-    util::{natural_cmp, now_secs},
+    util::now_secs,
     vim::{self, Action, Amount, Dir, Vim},
 };
 
@@ -58,6 +64,9 @@ struct UiColors {
     foreground: gpui_kit::Hsla,
     muted: gpui_kit::Hsla,
     accent: gpui_kit::Hsla,
+    danger: gpui_kit::Hsla,
+    danger_hover: gpui_kit::Hsla,
+    widget_opacity: f32,
 }
 
 impl UiColors {
@@ -70,12 +79,20 @@ impl UiColors {
             foreground: tokens.foreground,
             muted: tokens.muted_foreground,
             accent: tokens.primary,
+            danger: tokens.destructive,
+            danger_hover: tokens.destructive,
+            widget_opacity: 1.0,
         }
     }
 
     fn from_app(cx: &App) -> Self {
         cx.try_global::<KitTheme>()
-            .map(|theme| Self::from_tokens(theme.semantic_tokens().colors))
+            .map(|theme| {
+                let mut colors = Self::from_tokens(theme.semantic_tokens().colors);
+                colors.danger = theme.danger;
+                colors.danger_hover = theme.danger_hover;
+                colors
+            })
             .unwrap_or_else(|| Self::from_tokens(ColorTokens::dark()))
     }
 }
@@ -246,6 +263,13 @@ fn custom_theme_path(_data_dirs: &DataDirs) -> Result<PathBuf> {
             .ok_or_else(|| anyhow!("could not determine the user's configuration directory"))?;
         Ok(config_dir.join("yomu").join("themes.toml"))
     }
+}
+
+fn custom_theme_fingerprint(path: &Path) -> Option<u64> {
+    let contents = fs::read(path).ok()?;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    contents.hash(&mut hasher);
+    Some(hasher.finish())
 }
 
 fn ensure_custom_theme_file(path: &Path) -> Result<()> {
@@ -622,11 +646,21 @@ impl Reader {
     }
 }
 
+#[derive(Clone)]
 struct BookMenu {
     book_id: String,
     entries: Vec<Entry>,
     position: Point<Pixels>,
     selected: Option<usize>,
+}
+
+struct NativeBookMenu {
+    parent: Entity<Yomu>,
+    parent_window: AnyWindowHandle,
+    menu: BookMenu,
+    colors: UiColors,
+    selected: Option<usize>,
+    _release_subscription: Option<Subscription>,
 }
 
 enum ConfirmAction {
@@ -682,10 +716,68 @@ struct Slider {
     dragging: bool,
 }
 
+struct LibraryGroup<'a> {
+    key: String,
+    name: String,
+    first_seen: usize,
+    books: Vec<&'a Book>,
+}
+
+enum ImportEvent {
+    Book(Book),
+    Finished(library::ImportReport),
+}
+
 fn with_alpha(color: gpui_kit::Hsla, alpha: f32) -> Rgba {
     let mut color: Rgba = color.into();
     color.a = alpha;
     color
+}
+
+fn directory_groups(books: &[Book]) -> Vec<LibraryGroup<'_>> {
+    let mut buckets: std::collections::BTreeMap<String, (String, usize, Vec<&Book>)> =
+        std::collections::BTreeMap::new();
+    for (index, book) in books.iter().enumerate() {
+        let manual_series = book
+            .series
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty());
+        let (key, name) = if let Some(series) = manual_series {
+            (
+                format!("series:{}", series.to_lowercase()),
+                series.to_string(),
+            )
+        } else {
+            let parent = book.path.parent().unwrap_or_else(|| Path::new("."));
+            let display = parent
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| parent.display().to_string());
+            (format!("directory:{}", parent.display()), display)
+        };
+        buckets
+            .entry(key)
+            .and_modify(|(_, _, members)| members.push(book))
+            .or_insert_with(|| (name, index, vec![book]));
+    }
+
+    let mut groups: Vec<_> = buckets
+        .into_iter()
+        .filter_map(|(key, (name, first_seen, members))| {
+            if members.len() < 2 {
+                return None;
+            }
+            Some(LibraryGroup {
+                key,
+                name,
+                first_seen,
+                books: members,
+            })
+        })
+        .collect();
+    groups.sort_by_key(|group| group.first_seen);
+    groups
 }
 
 fn overlay_shade(colors: UiColors) -> gpui_kit::Hsla {
@@ -713,6 +805,8 @@ struct Yomu {
     hud: Option<SharedString>,
     hud_seq: u64,
     importing: bool,
+    importing_title: Option<String>,
+    imported_count: usize,
     /// The desktop asks for reduced motion (see `motion::detect_reduced_motion`).
     reduce_motion: bool,
     /// When the previous animated frame was drawn; `None` while nothing is animating.
@@ -721,6 +815,9 @@ struct Yomu {
     #[cfg(test)]
     frame_dt: Option<f32>,
     overlay: Option<Overlay>,
+    /// True when the context menu is an independent xdg_popup window.
+    native_context_popup: bool,
+    native_context_popup_window: Option<AnyWindowHandle>,
     settings_tab: SettingsTab,
     command_selection: usize,
     overlay_closed_at: Option<Instant>,
@@ -729,7 +826,9 @@ struct Yomu {
     /// Transient library filter; it is not part of persisted reader settings.
     search_query: String,
     search_active: bool,
-    collapsed_series: HashSet<String>,
+    search_caret_visible: bool,
+    search_blink_seq: u64,
+    open_group: Option<String>,
     slider: Slider,
     /// Which background appearance the window currently has (`None` before the first frame).
     applied_opaque: Option<bool>,
@@ -785,7 +884,8 @@ impl Yomu {
                 });
             }
         }
-        let colors = UiColors::from_app(cx);
+        let mut colors = UiColors::from_app(cx);
+        colors.widget_opacity = library.settings().opacity;
         let state = Self {
             focus_handle: cx.focus_handle(),
             dirs,
@@ -801,24 +901,33 @@ impl Yomu {
             hud: None,
             hud_seq: 0,
             importing: false,
+            importing_title: None,
+            imported_count: 0,
             reduce_motion: false,
             last_frame: None,
             #[cfg(test)]
             frame_dt: None,
             overlay: None,
+            native_context_popup: false,
+            native_context_popup_window: None,
             settings_tab: SettingsTab::Appearance,
             command_selection: 0,
             overlay_closed_at: None,
             selection: Selection::new(),
             search_query: String::new(),
             search_active: false,
-            collapsed_series: HashSet::new(),
+            search_caret_visible: false,
+            search_blink_seq: 0,
+            open_group: None,
             slider: Slider {
                 bounds: Rc::new(Cell::new(None)),
                 dragging: false,
             },
             applied_opaque: None,
         };
+
+        #[cfg(not(test))]
+        state.watch_custom_theme_file(cx);
 
         // Asking the desktop about reduced motion can take a moment (it may spawn `gsettings`),
         // so do it off the UI thread. Tests skip it to stay independent of the machine.
@@ -842,6 +951,69 @@ impl Yomu {
     /// Whether page turns and scrolling should animate right now.
     fn animations_enabled(&self) -> bool {
         self.library.settings().animate && !self.reduce_motion
+    }
+
+    /// Raised widget surfaces stay more opaque than the window glass behind them, making each
+    /// card or popup read as a separate pane while still following the user's opacity setting.
+    fn widget_surface(&self, color: gpui_kit::Hsla) -> Rgba {
+        with_alpha(color, (self.colors.widget_opacity + 0.10).min(1.0))
+    }
+
+    fn widget_hover(&self, color: gpui_kit::Hsla) -> Rgba {
+        with_alpha(color, (self.colors.widget_opacity + 0.10).min(1.0))
+    }
+
+    /// Keep menus translucent at every window opacity so compositor effects can show through.
+    fn menu_surface(&self) -> Rgba {
+        with_alpha(
+            self.colors.surface,
+            (self.colors.widget_opacity + 0.10).min(0.92),
+        )
+    }
+
+    /// Watch the generated custom theme file so Noctalia palette changes apply without a manual
+    /// reload. Hashing is done on the background executor; the small TOML is parsed on change.
+    #[cfg(not(test))]
+    fn watch_custom_theme_file(&self, cx: &mut Context<Self>) {
+        let path = self.custom_theme_path.clone();
+        cx.spawn(async move |this, cx| {
+            let mut last_hash = custom_theme_fingerprint(&path);
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(750))
+                    .await;
+                let check_path = path.clone();
+                let next_hash = cx
+                    .background_executor()
+                    .spawn(async move { custom_theme_fingerprint(&check_path) })
+                    .await;
+                if next_hash.is_none() || next_hash == last_hash {
+                    continue;
+                }
+
+                // Noctalia may replace the file atomically; debounce until the new contents
+                // remain stable so a partial write is never applied.
+                cx.background_executor()
+                    .timer(Duration::from_millis(200))
+                    .await;
+                let check_path = path.clone();
+                let stable_hash = cx
+                    .background_executor()
+                    .spawn(async move { custom_theme_fingerprint(&check_path) })
+                    .await;
+                if stable_hash != next_hash {
+                    continue;
+                }
+                if this
+                    .update(cx, |this, cx| this.reload_custom_themes(cx))
+                    .is_err()
+                {
+                    break;
+                }
+                last_hash = stable_hash;
+            }
+        })
+        .detach();
     }
 
     /// An input just started an animation: start the frame clock now so the first frame already
@@ -927,6 +1099,7 @@ impl Yomu {
 
     /// Escape / click outside. Cancelling the "reset settings?" question goes back to Settings.
     fn close_overlay(&mut self, cx: &mut Context<Self>) {
+        self.close_native_context_popup(cx);
         let back_to_settings = matches!(
             &self.overlay,
             Some(Overlay::Confirm(dialog)) if matches!(dialog.action, ConfirmAction::ResetSettings)
@@ -942,11 +1115,25 @@ impl Yomu {
         cx.notify();
     }
 
+    fn close_native_context_popup(&mut self, cx: &mut Context<Self>) {
+        let Some(popup) = self.native_context_popup_window.take() else {
+            self.native_context_popup = false;
+            return;
+        };
+        let _ = cx.update_window(popup, |_, window, _| window.remove_window());
+        self.native_context_popup = false;
+        if matches!(self.overlay, Some(Overlay::Menu(_))) {
+            self.dismiss();
+        }
+        cx.notify();
+    }
+
     fn overlay_recently_closed(&self) -> bool {
         self.overlay_closed_at
             .is_some_and(|closed| closed.elapsed() < CLICK_GUARD)
     }
 
+    #[cfg(test)]
     fn open_book_menu(&mut self, id: &str, position: Point<Pixels>, cx: &mut Context<Self>) {
         let Some(book) = self.library.get(id) else {
             return;
@@ -1203,6 +1390,7 @@ impl Yomu {
         KitTheme::update(cx, |theme| theme.apply_config(&config));
         self.library.settings_mut().theme_name = name.to_string();
         self.colors = UiColors::from_app(cx);
+        self.colors.widget_opacity = self.library.settings().opacity;
         self.save_library();
         cx.notify();
     }
@@ -1253,6 +1441,7 @@ impl Yomu {
         if let Some(config) = self.custom_themes.get(&selected).cloned() {
             KitTheme::update(cx, |theme| theme.apply_config(&config));
             self.colors = UiColors::from_app(cx);
+            self.colors.widget_opacity = self.library.settings().opacity;
         } else if was_custom {
             self.apply_theme("Default Dark", cx);
         }
@@ -1261,6 +1450,7 @@ impl Yomu {
 
     fn set_opacity(&mut self, value: f32, persist: bool, cx: &mut Context<Self>) {
         self.library.settings_mut().set_opacity(value);
+        self.colors.widget_opacity = self.library.settings().opacity;
         if persist {
             self.save_library();
         }
@@ -1412,6 +1602,7 @@ impl Yomu {
             2 => self.open_settings(cx),
             3 => {
                 self.library.settings_mut().group_series = !self.library.settings().group_series;
+                self.open_group = None;
                 self.save_library();
                 cx.notify();
             }
@@ -1491,26 +1682,68 @@ impl Yomu {
             return;
         }
         self.importing = true;
+        self.imported_count = 0;
+        self.importing_title = None;
         cx.notify();
 
         let dirs = self.dirs.clone();
         let existing = self.library.ids();
-        let task = cx
-            .background_executor()
-            .spawn(async move { library::import_paths(&paths, &dirs, &existing) });
+        let (sender, receiver) = mpsc::channel();
+        cx.background_executor()
+            .spawn(async move {
+                let report =
+                    library::import_paths_with_progress(&paths, &dirs, &existing, |book| {
+                        let _ = sender.send(ImportEvent::Book(book.clone()));
+                    });
+                let _ = sender.send(ImportEvent::Finished(report));
+            })
+            .detach();
 
         cx.spawn(async move |this, cx| {
-            let report = task.await;
-            this.update(cx, |this, cx| {
-                let summary = report.summary();
-                for book in report.added {
-                    this.library.add(book);
+            loop {
+                match receiver.try_recv() {
+                    Ok(ImportEvent::Book(book)) => {
+                        this.update(cx, |this, cx| {
+                            let title = book.title.clone();
+                            if this.library.add(book) {
+                                this.save_library();
+                                this.imported_count += 1;
+                            }
+                            this.importing_title = Some(title);
+                            cx.notify();
+                        })
+                        .ok();
+                        // Leave a frame for the newly inserted cover/title before showing the
+                        // next completed volume, even when several finish almost together.
+                        cx.background_executor()
+                            .timer(Duration::from_millis(16))
+                            .await;
+                    }
+                    Ok(ImportEvent::Finished(report)) => {
+                        this.update(cx, |this, cx| {
+                            this.importing = false;
+                            this.importing_title = None;
+                            this.show_toast(report.summary(), cx);
+                        })
+                        .ok();
+                        break;
+                    }
+                    Err(mpsc::TryRecvError::Empty) => {
+                        cx.background_executor()
+                            .timer(Duration::from_millis(40))
+                            .await;
+                    }
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        this.update(cx, |this, cx| {
+                            this.importing = false;
+                            this.importing_title = None;
+                            cx.notify();
+                        })
+                        .ok();
+                        break;
+                    }
                 }
-                this.save_library();
-                this.importing = false;
-                this.show_toast(summary, cx);
-            })
-            .ok();
+            }
         })
         .detach();
     }
@@ -1560,18 +1793,125 @@ impl Yomu {
 
     /// Right-click on a book: a book inside a multi-book selection gets the bulk menu; anywhere
     /// else the selection is dropped (like a file manager) and the book gets its own menu.
-    fn open_context_menu(&mut self, id: &str, position: Point<Pixels>, cx: &mut Context<Self>) {
-        if self.selection.contains(id) && self.selection.len() > 1 {
-            self.overlay = Some(Overlay::Menu(BookMenu {
-                book_id: id.to_string(),
-                entries: menu::selection_menu(self.selection.len()),
-                position,
-                selected: None,
-            }));
-            cx.notify();
+    fn open_context_menu(
+        &mut self,
+        id: &str,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.native_context_popup {
+            self.close_native_context_popup(cx);
+        }
+        let entries = if self.selection.contains(id) && self.selection.len() > 1 {
+            menu::selection_menu(self.selection.len())
         } else {
             self.selection.clear();
-            self.open_book_menu(id, position, cx);
+            let Some(book) = self.library.get(id) else {
+                return;
+            };
+            menu::book_menu(book, book.path.exists())
+        };
+        let menu = BookMenu {
+            book_id: id.to_string(),
+            entries,
+            position,
+            selected: None,
+        };
+        self.overlay = Some(Overlay::Menu(menu.clone()));
+        #[cfg(not(test))]
+        if self.open_native_context_popup(menu, window, cx) {
+            return;
+        }
+        self.native_context_popup = false;
+        cx.notify();
+    }
+
+    #[cfg(not(test))]
+    fn open_native_context_popup(
+        &mut self,
+        menu: BookMenu,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let parent_window = window.window_handle();
+        let parent = cx.entity();
+        let height = menu
+            .entries
+            .iter()
+            .map(|entry| match entry {
+                Entry::Item(_) => 28.0,
+                Entry::Separator => 5.0,
+            })
+            .sum::<f32>()
+            + 12.0;
+        let options = WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(Bounds {
+                origin: point(px(0.), px(0.)),
+                size: size(px(MENU_W), px(height)),
+            })),
+            titlebar: None,
+            focus: true,
+            show: true,
+            kind: WindowKind::AnchoredPopup(PopupOptions {
+                parent: parent_window,
+                anchor_rect: Bounds {
+                    origin: menu.position,
+                    size: size(px(1.), px(1.)),
+                },
+                anchor: PopupAnchor::TopLeft,
+                gravity: PopupGravity::BottomRight,
+                constraint_adjustment: PopupConstraintAdjustment::SLIDE_X
+                    | PopupConstraintAdjustment::SLIDE_Y
+                    | PopupConstraintAdjustment::FLIP_X
+                    | PopupConstraintAdjustment::FLIP_Y,
+                offset: point(px(2.), px(2.)),
+                grab: true,
+            }),
+            is_resizable: false,
+            is_movable: false,
+            window_background: WindowBackgroundAppearance::Transparent,
+            ..Default::default()
+        };
+
+        self.native_context_popup = true;
+        let colors = self.colors;
+        let opened = cx.open_window(options, move |_, cx| {
+            cx.new(|cx| {
+                let mut popup = NativeBookMenu {
+                    parent: parent.clone(),
+                    parent_window,
+                    menu,
+                    colors,
+                    selected: None,
+                    _release_subscription: None,
+                };
+                let parent = parent.clone();
+                popup._release_subscription = Some(cx.on_release(move |_, app| {
+                    let _ = parent.update(app, |state, cx| {
+                        state.native_context_popup = false;
+                        state.native_context_popup_window = None;
+                        if matches!(state.overlay, Some(Overlay::Menu(_))) {
+                            state.dismiss();
+                        }
+                        cx.notify();
+                    });
+                }));
+                popup
+            })
+        });
+        match opened {
+            Ok(handle) => {
+                self.native_context_popup_window = Some(handle.into());
+                true
+            }
+            Err(error) => {
+                eprintln!(
+                    "yomu: native context popup unavailable; using in-window menu: {error:#}"
+                );
+                self.native_context_popup = false;
+                false
+            }
         }
     }
 
@@ -1625,23 +1965,22 @@ impl Yomu {
         cx: &mut Context<Self>,
     ) {
         if matches!(token, "C-f" | "/" | "slash") {
-            self.search_active = true;
-            cx.notify();
+            self.activate_search(cx);
             return;
         }
         if self.search_active {
             match token {
                 "escape" => {
                     if self.search_query.is_empty() {
-                        self.search_active = false;
+                        self.deactivate_search(cx);
                     } else {
                         self.search_query.clear();
+                        self.search_caret_visible = true;
+                        cx.notify();
                     }
-                    cx.notify();
                 }
                 "enter" => {
-                    self.search_active = false;
-                    cx.notify();
+                    self.deactivate_search(cx);
                 }
                 "backspace" => {
                     self.search_query.pop();
@@ -1678,6 +2017,42 @@ impl Yomu {
             "delete" => self.request_remove_selected(cx),
             _ => {}
         }
+    }
+
+    fn activate_search(&mut self, cx: &mut Context<Self>) {
+        self.search_active = true;
+        self.search_caret_visible = true;
+        self.search_blink_seq = self.search_blink_seq.wrapping_add(1);
+        let sequence = self.search_blink_seq;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(530))
+                    .await;
+                let active = this
+                    .update(cx, |this, cx| {
+                        if this.search_blink_seq != sequence || !this.search_active {
+                            return false;
+                        }
+                        this.search_caret_visible = !this.search_caret_visible;
+                        cx.notify();
+                        true
+                    })
+                    .unwrap_or(false);
+                if !active {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn deactivate_search(&mut self, cx: &mut Context<Self>) {
+        self.search_active = false;
+        self.search_caret_visible = false;
+        self.search_blink_seq = self.search_blink_seq.wrapping_add(1);
+        cx.notify();
     }
 
     // ------------------------------------------------------------------------------------
@@ -2655,6 +3030,9 @@ impl Yomu {
 
     fn render_overlay(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         Some(match self.overlay.as_ref()? {
+            Overlay::Menu(_) if self.native_context_popup => deferred(self.scrim(false, cx))
+                .with_priority(1)
+                .into_any_element(),
             Overlay::Menu(menu) => self.render_menu(menu, cx),
             Overlay::LibraryMenu(menu) => self.render_library_menu(menu, cx),
             Overlay::Confirm(dialog) => self.render_confirm(dialog, cx),
@@ -2679,7 +3057,11 @@ impl Yomu {
             .justify_center()
             .bg(with_alpha(
                 overlay_shade(self.colors),
-                if dim { 0.55 } else { 0.0 },
+                if dim {
+                    0.25 + self.colors.widget_opacity * 0.30
+                } else {
+                    0.0
+                },
             ))
             .occlude()
             .on_mouse_down(
@@ -2698,8 +3080,8 @@ impl Yomu {
             .flex()
             .flex_col()
             .p_1()
-            .rounded_md()
-            .bg(self.colors.surface)
+            .rounded_lg()
+            .bg(self.menu_surface())
             .border_1()
             .border_color(self.colors.border)
             .shadow_lg()
@@ -2746,7 +3128,7 @@ impl Yomu {
                         .position(menu.position)
                         .anchor(Anchor::TopLeft)
                         .snap_to_window_with_margin(px(8.))
-                        .child(list),
+                        .child(self.animate_popup("book-context-menu", list)),
                 ),
         )
         .with_priority(1)
@@ -2755,18 +3137,27 @@ impl Yomu {
 
     fn render_library_menu(&self, menu: &LibraryMenu, cx: &mut Context<Self>) -> AnyElement {
         let entries = [
-            ("Add files", "Import CBZ and ZIP comics"),
-            ("Add folder", "Import a folder of images"),
-            ("Settings", "Themes and reader preferences"),
+            (IconName::FilePlus, "Add files", "Import CBZ and ZIP comics"),
             (
-                if self.library.settings().group_series {
-                    "Ungroup series"
-                } else {
-                    "Group by series"
-                },
-                "Organize books into collapsible series",
+                IconName::FolderPlus,
+                "Add folder",
+                "Import a folder of images",
             ),
-            ("Quit", "Close yomu"),
+            (
+                IconName::Settings,
+                "Settings",
+                "Themes and reader preferences",
+            ),
+            (
+                IconName::Folder,
+                if self.library.settings().group_series {
+                    "Show individual volumes"
+                } else {
+                    "Group into folders"
+                },
+                "Group volumes by source folder or assigned series",
+            ),
+            (IconName::LogOut, "Quit", "Close yomu"),
         ];
         let mut list = div()
             .w(px(260.))
@@ -2775,7 +3166,7 @@ impl Yomu {
             .gap_1()
             .p_2()
             .rounded_lg()
-            .bg(self.colors.surface)
+            .bg(self.menu_surface())
             .border_1()
             .border_color(self.colors.border)
             .shadow_lg()
@@ -2785,30 +3176,40 @@ impl Yomu {
             .on_mouse_down(MouseButton::Right, |_: &MouseDownEvent, _, cx| {
                 cx.stop_propagation()
             });
-        for (index, (label, description)) in entries.into_iter().enumerate() {
+        for (index, (icon, label, description)) in entries.into_iter().enumerate() {
             let selected = menu.selected == index;
             list = list.child(
                 div()
                     .id(SharedString::from(format!("library-menu-{index}")))
                     .flex()
-                    .flex_col()
-                    .gap(px(2.))
+                    .flex_row()
+                    .items_center()
+                    .gap_3()
                     .px_3()
                     .py_2()
-                    .rounded_md()
+                    .rounded_lg()
                     .cursor_pointer()
-                    .when(selected, |row| row.bg(self.colors.surface_hover))
+                    .when(selected, |row| {
+                        row.bg(self.widget_hover(self.colors.surface_hover))
+                    })
+                    .child(Icon::new(icon).size_4().text_color(self.colors.accent))
                     .child(
                         div()
-                            .text_sm()
-                            .text_color(self.colors.foreground)
-                            .child(label),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(self.colors.muted)
-                            .child(description),
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.))
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .text_color(self.colors.foreground)
+                                    .child(label),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(self.colors.muted)
+                                    .child(description),
+                            ),
                     )
                     .on_mouse_move(cx.listener(move |this, _: &MouseMoveEvent, _, cx| {
                         if let Some(Overlay::LibraryMenu(menu)) = this.overlay.as_mut() {
@@ -2837,7 +3238,13 @@ impl Yomu {
                     MouseButton::Right,
                     cx.listener(|this, _: &MouseDownEvent, _, cx| this.close_overlay(cx)),
                 )
-                .child(div().absolute().top(px(52.)).right(px(18.)).child(list)),
+                .child(
+                    div()
+                        .absolute()
+                        .top(px(52.))
+                        .right(px(18.))
+                        .child(self.animate_popup("library-menu-popup", list)),
+                ),
         )
         .with_priority(2)
         .into_any_element()
@@ -2850,13 +3257,39 @@ impl Yomu {
         item: &Item,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let icon = match item.action {
+            BookAction::Open => IconName::BookOpen,
+            BookAction::StartOver | BookAction::ResetProgress => IconName::RotateCcw,
+            BookAction::MarkRead => IconName::CircleCheck,
+            BookAction::MarkUnread => IconName::CircleX,
+            BookAction::RevealFile => IconName::FolderOpen,
+            BookAction::Properties => IconName::Info,
+            BookAction::SetSeries => IconName::Library,
+            BookAction::Remove | BookAction::RemoveSelected => IconName::Trash,
+            BookAction::ClearSelection => IconName::X,
+        };
+        let icon_color = self.colors.foreground;
         let base = div()
             .id(SharedString::from(format!("menu-item-{ix}")))
             .h(px(28.))
             .px_3()
             .flex()
             .items_center()
-            .rounded_sm()
+            .gap_2()
+            .rounded_lg()
+            .child(
+                div()
+                    .w(px(20.))
+                    .h(px(20.))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded_md()
+                    .bg(with_alpha(self.colors.accent, 0.24))
+                    .text_color(self.colors.foreground)
+                    .child(Icon::new(icon).size_4().text_color(icon_color)),
+            )
             .child(item.label.clone());
 
         if !item.enabled {
@@ -2869,13 +3302,13 @@ impl Yomu {
         let action = item.action;
         let book_id = menu.book_id.clone();
         base.text_color(if item.danger {
-            self.colors.accent
+            self.colors.danger
         } else {
             self.colors.foreground
         })
         .cursor_pointer()
         .when(menu.selected == Some(ix), |row| {
-            row.bg(self.colors.surface_hover)
+            row.bg(self.widget_hover(self.colors.surface_hover))
         })
         .on_mouse_move(cx.listener(move |this, _: &MouseMoveEvent, _, cx| this.menu_hover(ix, cx)))
         .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
@@ -2893,7 +3326,7 @@ impl Yomu {
             .gap_4()
             .p_6()
             .rounded_lg()
-            .bg(self.colors.surface)
+            .bg(self.widget_surface(self.colors.surface))
             .border_1()
             .border_color(self.colors.border)
             .shadow_lg()
@@ -2907,10 +3340,31 @@ impl Yomu {
             })
     }
 
+    fn animate_popup<E>(&self, id: &'static str, surface: E) -> gpui_kit::AnimationElement<E>
+    where
+        E: IntoElement + Styled + 'static,
+    {
+        surface.with_animation(
+            id,
+            Animation::new(Duration::from_millis(if self.reduce_motion {
+                1
+            } else {
+                180
+            }))
+            .with_easing(ease_out_quint()),
+            |surface, progress| {
+                surface
+                    .opacity(progress)
+                    .relative()
+                    .top(px((1.0 - progress) * 9.0))
+            },
+        )
+    }
+
     fn render_confirm(&self, dialog: &ConfirmDialog, cx: &mut Context<Self>) -> AnyElement {
         self.scrim(true, cx)
             .child(
-                self.panel(380.)
+                self.animate_popup("confirm-dialog", self.panel(380.))
                     .child(
                         div()
                             .text_lg()
@@ -2969,7 +3423,7 @@ impl Yomu {
 
         self.scrim(true, cx)
             .child(
-                self.panel(480.)
+                self.animate_popup("properties-dialog", self.panel(480.))
                     .child(
                         div()
                             .text_lg()
@@ -2993,7 +3447,7 @@ impl Yomu {
     fn render_series_dialog(&self, dialog: &SeriesDialog, cx: &mut Context<Self>) -> AnyElement {
         self.scrim(true, cx)
             .child(
-                self.panel(460.)
+                self.animate_popup("series-dialog", self.panel(460.))
                     .child(
                         div()
                             .text_lg()
@@ -3014,10 +3468,10 @@ impl Yomu {
                             .min_h(px(36.))
                             .px_3()
                             .py_2()
-                            .rounded_md()
+                            .rounded_lg()
                             .border_1()
                             .border_color(self.colors.accent)
-                            .bg(self.colors.background)
+                            .bg(self.widget_surface(self.colors.background))
                             .text_color(self.colors.foreground)
                             .child(if dialog.value.is_empty() {
                                 "Type a series name…".to_string()
@@ -3179,26 +3633,27 @@ impl Yomu {
                 .into_any_element(),
             SettingsTab::Library => div().flex().flex_col().gap_3()
                 .child(div().font_weight(FontWeight::SEMIBOLD).child("Library"))
-                .child(panel_button("settings-group-series", if grouped { "Series grouping: On" } else { "Series grouping: Off" },
-                    ButtonKind::Normal, self.colors, true, cx.listener(|this, _: &ClickEvent, _, cx| {
+                .child(panel_button("settings-group-series", if grouped { "Folder grouping: On" } else { "Folder grouping: Off" },
+                    if grouped { ButtonKind::Primary } else { ButtonKind::Normal }, self.colors, true, cx.listener(|this, _: &ClickEvent, _, cx| {
                         this.library.settings_mut().group_series = !this.library.settings().group_series;
+                        this.open_group = None;
                         this.save_library();
                         cx.notify();
                     })))
-                .child(div().text_xs().text_color(self.colors.muted).child("Group books with matching series names under collapsible headings in the library."))
+                .child(div().text_xs().text_color(self.colors.muted).child("Group volumes from the same directory into folder cards. A manually assigned series takes precedence; clearing it restores the directory group."))
                 .into_any_element(),
             SettingsTab::Reader => div().flex().flex_col().gap_3()
                 .child(div().font_weight(FontWeight::SEMIBOLD).child("Reader"))
                 .child(panel_button("settings-direction", if rtl { "Reading direction: Right to left" } else { "Reading direction: Left to right" },
-                    ButtonKind::Normal, self.colors, true, cx.listener(move |this, _: &ClickEvent, _, cx| this.set_direction(!rtl, cx))))
+                    if rtl { ButtonKind::Primary } else { ButtonKind::Normal }, self.colors, true, cx.listener(move |this, _: &ClickEvent, _, cx| this.set_direction(!rtl, cx))))
                 .child(panel_button("settings-fit", format!("Page fit: {} (click to cycle)", fit.label()),
                     ButtonKind::Normal, self.colors, true, cx.listener(move |this, _: &ClickEvent, _, cx| this.set_fit(fit.next(), cx))))
                     .child(panel_button("settings-animations", if animate { "Page animations: On" } else { "Page animations: Off" },
-                    ButtonKind::Normal, self.colors, true, cx.listener(|this, _: &ClickEvent, _, cx| this.set_animations(None, cx))))
+                    if animate { ButtonKind::Primary } else { ButtonKind::Normal }, self.colors, true, cx.listener(|this, _: &ClickEvent, _, cx| this.set_animations(None, cx))))
                 .child(panel_button("settings-continuous", if continuous { "Reading mode: Continuous" } else { "Reading mode: Single page" },
-                    ButtonKind::Normal, self.colors, true, cx.listener(|this, _: &ClickEvent, _, cx| this.set_continuous(None, cx))))
+                    if continuous { ButtonKind::Primary } else { ButtonKind::Normal }, self.colors, true, cx.listener(|this, _: &ClickEvent, _, cx| this.set_continuous(None, cx))))
                 .child(panel_button("settings-webcomics", if webcomics { "Webcomics mode: On" } else { "Webcomics mode: Off" },
-                    ButtonKind::Normal, self.colors, true, cx.listener(|this, _: &ClickEvent, _, cx| this.set_webcomics(None, cx))))
+                    if webcomics { ButtonKind::Primary } else { ButtonKind::Normal }, self.colors, true, cx.listener(|this, _: &ClickEvent, _, cx| this.set_webcomics(None, cx))))
                 .child(div().text_xs().text_color(self.colors.muted).child("Webcomics mode forces a gapless vertical strip. Turning it off restores the selected single-page or continuous mode."))
                 .into_any_element(),
             SettingsTab::Keyboard => {
@@ -3233,7 +3688,7 @@ impl Yomu {
                 cx.listener(|this, _: &MouseUpEvent, _, cx| this.end_slider_drag(cx)),
             )
             .child(
-                self.panel(640.)
+                self.animate_popup("settings-dialog", self.panel(640.))
                     .child(
                         div()
                             .text_lg()
@@ -3295,18 +3750,32 @@ impl Yomu {
             })
             .collect();
         let status: Option<SharedString> = if self.importing {
-            Some("Importing…".into())
+            Some(
+                self.importing_title
+                    .as_ref()
+                    .map(|title| format!("{} imported · {title}", self.imported_count))
+                    .unwrap_or_else(|| "Scanning folder…".to_string())
+                    .into(),
+            )
         } else {
             self.toast.clone()
         };
 
         let selected = self.selection.len();
 
-        let search_label = if self.search_query.is_empty() {
-            "Search title or path…".to_string()
-        } else {
-            self.search_query.clone()
-        };
+        let search_value = div()
+            .flex_1()
+            .flex()
+            .items_center()
+            .child(self.search_query.clone())
+            .children((self.search_active && self.search_caret_visible).then(|| {
+                div()
+                    .ml(px(1.))
+                    .w(px(1.5))
+                    .h(px(18.))
+                    .rounded_full()
+                    .bg(self.colors.accent)
+            }));
         let search_field = div()
             .id("library-search")
             .w(px(360.))
@@ -3316,14 +3785,14 @@ impl Yomu {
             .flex()
             .items_center()
             .gap_2()
-            .rounded_md()
+            .rounded_lg()
             .border_1()
             .border_color(if self.search_active {
                 self.colors.accent
             } else {
                 self.colors.border
             })
-            .bg(with_alpha(self.colors.surface, 0.78))
+            .bg(self.widget_surface(self.colors.surface))
             .text_sm()
             .text_color(if self.search_query.is_empty() {
                 self.colors.muted
@@ -3331,11 +3800,22 @@ impl Yomu {
                 self.colors.foreground
             })
             .child(div().text_lg().child("⌕"))
-            .child(div().flex_1().truncate().child(search_label))
+            .child(search_value)
+            .on_mouse_down(MouseButton::Left, |_: &MouseDownEvent, _, cx| {
+                cx.stop_propagation()
+            })
+            .on_mouse_down(MouseButton::Right, |_: &MouseDownEvent, _, cx| {
+                cx.stop_propagation()
+            })
             .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                this.search_active = true;
-                cx.notify();
+                this.activate_search(cx);
             }));
+        let search_field: AnyElement = if self.search_active {
+            self.animate_popup("library-search-focus", search_field)
+                .into_any_element()
+        } else {
+            search_field.into_any_element()
+        };
 
         let selection_controls = if selected > 0 {
             let controls = div().flex().flex_row().items_center().gap_2();
@@ -3358,7 +3838,6 @@ impl Yomu {
                     .child(button_colored(
                         "select-remove",
                         "Remove",
-                        self.colors.accent,
                         self.colors,
                         cx.listener(|this, _: &ClickEvent, _, cx| this.request_remove_selected(cx)),
                     ))
@@ -3394,9 +3873,10 @@ impl Yomu {
                     .justify_center()
                     .child(search_field),
             )
-            .child(div().flex_1().flex().justify_end().child(button(
+            .child(div().flex_1().flex().justify_end().child(icon_button(
                 "library-menu-toggle",
-                "☰",
+                "Open menu",
+                IconName::Menu,
                 self.colors,
                 cx.listener(|this, _: &ClickEvent, _, cx| {
                     this.overlay = Some(Overlay::LibraryMenu(LibraryMenu::default()));
@@ -3444,38 +3924,89 @@ impl Yomu {
                 )
                 .into_any_element()
         } else if self.library.settings().group_series {
-            let mut groups: std::collections::BTreeMap<String, Vec<&Book>> =
-                std::collections::BTreeMap::new();
-            let mut unassigned = Vec::new();
-            for book in &books {
-                match book
-                    .series
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|name| !name.is_empty())
-                {
-                    Some(name) => groups.entry(name.to_string()).or_default().push(book),
-                    None => unassigned.push(*book),
-                }
-            }
-            let mut groups: Vec<_> = groups.into_iter().collect();
-            groups.sort_by(|(a, _), (b, _)| natural_cmp(a, b));
-            let mut sections: Vec<AnyElement> = groups
+            let groups = directory_groups(all_books);
+            let visible_groups: Vec<_> = groups
                 .iter()
-                .map(|(name, members)| self.render_series_section(name, members, cx))
+                .filter_map(|group| {
+                    let members: Vec<_> = group
+                        .books
+                        .iter()
+                        .copied()
+                        .filter(|book| books.iter().any(|visible| visible.id == book.id))
+                        .collect();
+                    (!members.is_empty()).then_some((group, members))
+                })
                 .collect();
-            if !unassigned.is_empty() {
-                sections.push(self.render_series_section("Unassigned", &unassigned, cx));
+            if let Some(open_key) = self.open_group.as_deref()
+                && let Some((group, members)) = visible_groups
+                    .iter()
+                    .find(|(group, _)| group.key == open_key)
+            {
+                let mut content = div().flex().flex_col().gap_4().child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_3()
+                        .child(icon_button(
+                            "group-back",
+                            "Back to library",
+                            IconName::ArrowLeft,
+                            self.colors,
+                            cx.listener(|this, _: &ClickEvent, _, cx| {
+                                this.open_group = None;
+                                cx.notify();
+                            }),
+                        ))
+                        .child(
+                            div()
+                                .text_lg()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(self.colors.foreground)
+                                .child(format!("{} · {}", group.name, members.len())),
+                        ),
+                );
+                content = content.child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .flex_wrap()
+                        .gap_6()
+                        .children(members.iter().map(|book| self.book_card(book, cx))),
+                );
+                div()
+                    .id("grid")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .px_6()
+                    .pb_6()
+                    .child(content)
+                    .into_any_element()
+            } else {
+                let grouped_ids: HashSet<_> = visible_groups
+                    .iter()
+                    .flat_map(|(_, members)| members.iter().map(|book| book.id.as_str()))
+                    .collect();
+                let loose_books: Vec<_> = books
+                    .iter()
+                    .copied()
+                    .filter(|book| !grouped_ids.contains(book.id.as_str()))
+                    .collect();
+                let mut cards: Vec<AnyElement> = visible_groups
+                    .iter()
+                    .map(|(group, members)| self.group_card(group, members, cx))
+                    .collect();
+                cards.extend(loose_books.iter().map(|book| self.book_card(book, cx)));
+                div()
+                    .id("grid")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .px_6()
+                    .pb_6()
+                    .child(div().flex().flex_row().flex_wrap().gap_6().children(cards))
+                    .into_any_element()
             }
-            div()
-                .id("grid")
-                .flex_1()
-                .min_h_0()
-                .overflow_y_scroll()
-                .px_6()
-                .pb_6()
-                .child(div().flex().flex_col().gap_4().children(sections))
-                .into_any_element()
         } else {
             div()
                 .id("grid")
@@ -3515,53 +4046,69 @@ impl Yomu {
             .into_any_element()
     }
 
-    fn render_series_section(
+    fn group_card(
         &self,
-        name: &str,
+        group: &LibraryGroup<'_>,
         books: &[&Book],
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let key = if name == "Unassigned" {
-            "series:\0unassigned".to_string()
-        } else {
-            format!("series:{name}")
-        };
-        let collapsed = self.collapsed_series.contains(&key);
-        let toggle_key = key.clone();
-        let header = div()
-            .id(SharedString::from(format!("series-heading-{name}")))
-            .w_full()
-            .px_1()
-            .py_2()
+        let first = books[0];
+        let group_key = group.key.clone();
+        div()
+            .id(SharedString::from(format!("folder-{}", group.key)))
+            .w(px(CARD_W))
+            .flex_none()
             .flex()
-            .flex_row()
-            .items_center()
-            .gap_2()
+            .flex_col()
+            .rounded_lg()
+            .border_1()
+            .border_color(self.colors.border)
+            .bg(self.widget_surface(self.colors.surface))
+            .overflow_hidden()
             .cursor_pointer()
-            .text_sm()
-            .font_weight(FontWeight::SEMIBOLD)
-            .text_color(self.colors.foreground)
-            .child(if collapsed { "▸" } else { "▾" })
-            .child(format!("{name} · {}", books.len()))
+            .hover(|style| style.opacity(0.94))
             .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                if !this.collapsed_series.insert(toggle_key.clone()) {
-                    this.collapsed_series.remove(&toggle_key);
-                }
+                this.open_group = Some(group_key.clone());
                 cx.notify();
-            }));
-        let mut section = div().w_full().flex().flex_col().gap_2().child(header);
-        if !collapsed {
-            section = section.child(
+            }))
+            .child(
                 div()
-                    .w_full()
-                    .flex()
-                    .flex_row()
-                    .flex_wrap()
-                    .gap_6()
-                    .children(books.iter().map(|book| self.book_card(book, cx))),
-            );
-        }
-        section.into_any_element()
+                    .relative()
+                    .w(px(CARD_W))
+                    .h(px(CARD_H))
+                    .overflow_hidden()
+                    .rounded_lg()
+                    .bg(self.widget_surface(self.colors.surface))
+                    .child(
+                        img(self.dirs.cover(&first.id))
+                            .w_full()
+                            .h_full()
+                            .object_fit(ObjectFit::Cover),
+                    )
+                    .child(
+                        div()
+                            .absolute()
+                            .top_2()
+                            .right_2()
+                            .px_2()
+                            .py_1()
+                            .rounded_lg()
+                            .bg(self.widget_surface(self.colors.background))
+                            .text_xs()
+                            .text_color(self.colors.foreground)
+                            .child(format!("{} volumes", books.len())),
+                    ),
+            )
+            .child(
+                div()
+                    .p_3()
+                    .text_sm()
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(self.colors.foreground)
+                    .truncate()
+                    .child(group.name.clone()),
+            )
+            .into_any_element()
     }
 
     fn book_card(&self, book: &Book, cx: &mut Context<Self>) -> AnyElement {
@@ -3587,9 +4134,9 @@ impl Yomu {
             .w(px(CARD_W))
             .h(px(CARD_H))
             .flex_none()
-            .rounded_md()
+            .rounded_lg()
             .overflow_hidden()
-            .bg(self.colors.surface)
+            .bg(self.widget_surface(self.colors.surface))
             .border_2()
             .border_color(if selected {
                 self.colors.accent
@@ -3616,7 +4163,7 @@ impl Yomu {
             .h(px(3.))
             .w_full()
             .rounded_full()
-            .bg(self.colors.border)
+            .bg(self.colors.surface_hover)
             .child(
                 div()
                     .h_full()
@@ -3638,7 +4185,7 @@ impl Yomu {
             } else {
                 self.colors.border
             })
-            .bg(self.colors.surface)
+            .bg(self.widget_surface(self.colors.surface))
             .overflow_hidden()
             .cursor_pointer()
             .hover(|style| style.opacity(0.92))
@@ -3657,8 +4204,12 @@ impl Yomu {
             }))
             .on_mouse_down(
                 MouseButton::Right,
-                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                    this.open_context_menu(&menu_id, event.position, cx);
+                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                    this.open_context_menu(&menu_id, event.position, window, cx);
+                    // The root window also listens for right-clicks to dismiss an
+                    // already-open popup. Do not let this opening click bubble up
+                    // and immediately close the popup we just created.
+                    cx.stop_propagation();
                 }),
             )
             .child(cover)
@@ -3809,7 +4360,7 @@ impl Yomu {
                 .rounded_lg()
                 .border_1()
                 .border_color(self.colors.border)
-                .bg(self.colors.surface)
+                .bg(self.widget_surface(self.colors.surface))
                 .text_sm();
             if !suggestions.is_empty() {
                 let mut rows = div().flex().flex_col().p_1();
@@ -3825,9 +4376,14 @@ impl Yomu {
                             .gap_4()
                             .px_2()
                             .py_1()
-                            .rounded_md()
+                            .rounded_lg()
                             .cursor_pointer()
-                            .when(selected, |row| row.bg(with_alpha(self.colors.accent, 0.18)))
+                            .when(selected, |row| {
+                                row.bg(with_alpha(
+                                    self.colors.accent,
+                                    (self.library.settings().opacity + 0.10).min(1.0),
+                                ))
+                            })
                             .child(div().text_color(self.colors.accent).child(label.clone()))
                             .child(
                                 div()
@@ -3883,7 +4439,7 @@ impl Yomu {
                     .right_0()
                     .flex()
                     .justify_center()
-                    .child(prompt),
+                    .child(self.animate_popup("reader-command-prompt", prompt)),
             )
         } else {
             reader.vim.status().map(|text| {
@@ -3942,6 +4498,113 @@ impl Yomu {
     }
 }
 
+impl Render for NativeBookMenu {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let opacity = (self.colors.widget_opacity + 0.10).min(0.92);
+        let mut list = div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .p_1()
+            .rounded_lg()
+            .overflow_hidden()
+            .bg(with_alpha(self.colors.surface, opacity))
+            .border_1()
+            .border_color(self.colors.border)
+            .shadow_lg()
+            .text_sm()
+            .text_color(self.colors.foreground)
+            .on_key_down(cx.listener(|_, event: &KeyDownEvent, popup, _| {
+                if event.keystroke.key == "escape" {
+                    popup.remove_window();
+                }
+            }));
+
+        for (ix, entry) in self.menu.entries.iter().enumerate() {
+            match entry {
+                Entry::Separator => {
+                    list = list.child(div().h(px(1.)).mx_2().my_1().bg(self.colors.border));
+                }
+                Entry::Item(item) => {
+                    let icon = match item.action {
+                        BookAction::Open => IconName::BookOpen,
+                        BookAction::StartOver | BookAction::ResetProgress => IconName::RotateCcw,
+                        BookAction::MarkRead => IconName::CircleCheck,
+                        BookAction::MarkUnread => IconName::CircleX,
+                        BookAction::RevealFile => IconName::FolderOpen,
+                        BookAction::Properties => IconName::Info,
+                        BookAction::SetSeries => IconName::Library,
+                        BookAction::Remove | BookAction::RemoveSelected => IconName::Trash,
+                        BookAction::ClearSelection => IconName::X,
+                    };
+                    let icon_color = self.colors.foreground;
+                    let selected = self.selected == Some(ix);
+                    let enabled = item.enabled;
+                    let action = item.action;
+                    let id = self.menu.book_id.clone();
+                    let parent = self.parent.clone();
+                    let parent_window = self.parent_window;
+                    let row = div()
+                        .id(SharedString::from(format!("native-menu-item-{ix}")))
+                        .h(px(28.))
+                        .px_3()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .rounded_lg()
+                        .when(selected && enabled, |row| {
+                            row.bg(with_alpha(self.colors.surface_hover, opacity))
+                        })
+                        .child(
+                            div()
+                                .w(px(20.))
+                                .h(px(20.))
+                                .flex_none()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .rounded_md()
+                                .bg(with_alpha(self.colors.accent, 0.24))
+                                .text_color(self.colors.foreground)
+                                .child(Icon::new(icon).size_4().text_color(icon_color)),
+                        )
+                        .child(item.label.clone())
+                        .text_color(if !enabled {
+                            self.colors.muted
+                        } else if item.danger {
+                            self.colors.danger
+                        } else {
+                            self.colors.foreground
+                        })
+                        .when(!enabled, |row| row.opacity(0.6));
+                    let row = if enabled {
+                        row.cursor_pointer()
+                            .on_mouse_move(cx.listener(move |this, _: &MouseMoveEvent, _, cx| {
+                                if this.selected != Some(ix) {
+                                    this.selected = Some(ix);
+                                    cx.notify();
+                                }
+                            }))
+                            .on_click(cx.listener(move |_, _: &ClickEvent, popup, cx| {
+                                let _ = cx.update_window(parent_window, |_, main_window, app| {
+                                    let _ = parent.update(app, |state, state_cx| {
+                                        state.run_book_action(action, &id, main_window, state_cx);
+                                    });
+                                });
+                                popup.remove_window();
+                            }))
+                    } else {
+                        row
+                    };
+                    list = list.child(row);
+                }
+            }
+        }
+
+        list
+    }
+}
+
 impl Render for Yomu {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         for image in self.garbage.drain(..) {
@@ -3983,11 +4646,32 @@ impl Render for Yomu {
             .key_context(if reading { "Reader" } else { "Library" })
             .track_focus(&self.focus_handle)
             .size_full()
+            .rounded_lg()
+            .overflow_hidden()
             .bg(root_bg)
             .text_color(self.colors.foreground)
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 this.on_key(event, window, cx);
             }))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                    if this.native_context_popup {
+                        this.close_native_context_popup(cx);
+                    }
+                    if this.search_active {
+                        this.deactivate_search(cx);
+                    }
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                    if this.native_context_popup {
+                        this.close_native_context_popup(cx);
+                    }
+                }),
+            )
             .on_action(cx.listener(|_, _: &ToggleFullscreen, window, _| window.toggle_fullscreen()))
             .on_action(cx.listener(|this, _: &ImportFiles, _, cx| this.import_dialog(false, cx)))
             .on_action(cx.listener(|this, _: &ImportFolder, _, cx| this.import_dialog(true, cx)))
@@ -4036,7 +4720,10 @@ fn pill(row: gpui_kit::Div, text: impl Into<SharedString>, colors: UiColors) -> 
             .px_3()
             .py_1()
             .rounded_full()
-            .bg(with_alpha(colors.background, 0.7))
+            .bg(with_alpha(
+                colors.background,
+                (colors.widget_opacity + 0.10).min(1.0),
+            ))
             .text_sm()
             .text_color(colors.foreground)
             .child(text.into()),
@@ -4162,7 +4849,10 @@ fn help_overlay(colors: UiColors) -> AnyElement {
         .gap_3()
         .p_6()
         .rounded_lg()
-        .bg(with_alpha(colors.surface, 0.95))
+        .bg(with_alpha(
+            colors.surface,
+            (colors.widget_opacity + 0.10).min(1.0),
+        ))
         .text_sm();
 
     for (title, rows) in HELP {
@@ -4209,7 +4899,10 @@ fn help_overlay(colors: UiColors) -> AnyElement {
         .flex()
         .items_center()
         .justify_center()
-        .bg(with_alpha(overlay_shade(colors), 0.65))
+        .bg(with_alpha(
+            overlay_shade(colors),
+            (0.5 + colors.widget_opacity * 0.15).min(0.65),
+        ))
         .child(panel)
         .into_any_element()
 }
@@ -4225,18 +4918,27 @@ fn panel_button(
     id: &'static str,
     label: impl Into<SharedString>,
     kind: ButtonKind,
-    _colors: UiColors,
+    colors: UiColors,
     enabled: bool,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> AnyElement {
+    let alpha = (colors.widget_opacity + 0.10).min(1.0);
     let button = Button::new(id)
         .label(label)
+        .rounded(ButtonRounded::Large)
         .small()
         .disabled(!enabled)
         .on_click(on_click);
     match kind {
-        ButtonKind::Normal => button.secondary().outline().into_any_element(),
-        ButtonKind::Primary => button.primary().into_any_element(),
+        ButtonKind::Normal => button
+            .secondary()
+            .outline()
+            .bg(with_alpha(colors.surface, alpha))
+            .into_any_element(),
+        ButtonKind::Primary => button
+            .primary()
+            .bg(with_alpha(colors.accent, alpha))
+            .into_any_element(),
     }
 }
 
@@ -4246,23 +4948,70 @@ fn button(
     colors: UiColors,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
-    button_colored(id, label, colors.foreground, colors, on_click)
+    button_colored(id, label, colors, on_click)
 }
 
-/// A header button with a custom text colour (the accent for destructive actions).
+fn icon_button(
+    id: &'static str,
+    label: &'static str,
+    icon: IconName,
+    colors: UiColors,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> AnyElement {
+    let button = Button::new(id)
+        .accessibility_label(label)
+        .rounded(ButtonRounded::Large)
+        .small()
+        .ghost()
+        .text_color(colors.foreground)
+        .bg(with_alpha(
+            colors.surface,
+            (colors.widget_opacity + 0.10).min(1.0),
+        ))
+        // Render the bundled SVG directly so its theme color is explicit. The
+        // Button icon convenience path inherits a color from Kit's component
+        // theme, which can be transparent against custom/translucent surfaces.
+        .child(Icon::new(icon).size_4().text_color(colors.foreground))
+        .on_click(on_click);
+    #[cfg(test)]
+    {
+        div()
+            .debug_selector(|| id.into())
+            .child(button)
+            .into_any_element()
+    }
+    #[cfg(not(test))]
+    {
+        button.into_any_element()
+    }
+}
+
+/// A header button with a theme-aware destructive variant when requested.
 fn button_colored(
     id: &'static str,
     label: &'static str,
-    _color: gpui_kit::Hsla,
-    _colors: UiColors,
+    colors: UiColors,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
-    let button = Button::new(id).label(label).small().on_click(on_click);
+    let button = Button::new(id)
+        .label(label)
+        .rounded(ButtonRounded::Large)
+        .small()
+        .on_click(on_click);
     let button = if label == "Remove" {
         button.danger()
     } else {
         button.secondary()
     };
+    let alpha = (colors.widget_opacity + 0.10).min(1.0);
+    let button = button.bg(with_alpha(
+        if label == "Remove" {
+            colors.danger
+        } else {
+            colors.surface
+        },
+        alpha,
+    ));
     #[cfg(test)]
     {
         div().debug_selector(|| id.into()).child(button)
@@ -4274,52 +5023,56 @@ fn button_colored(
 }
 
 fn main() {
-    application().run(|cx: &mut App| {
-        gpui_kit::init(cx);
-        // The reader handles its own keys (vim-style, see `vim.rs`); only these are bindings.
-        cx.bind_keys([
-            KeyBinding::new("ctrl-o", ImportFiles, Some("Library")),
-            KeyBinding::new("ctrl-shift-o", ImportFolder, Some("Library")),
-            KeyBinding::new("f11", ToggleFullscreen, None),
-            KeyBinding::new("ctrl-,", OpenSettings, None),
-            KeyBinding::new("ctrl-q", Quit, None),
-        ]);
+    application()
+        // GPUI Kit icons are SVG asset paths. Without registering this source,
+        // custom-rendered toolbar and context-menu icons resolve to empty images.
+        .with_assets(gpui_kit::assets::AllAssets)
+        .run(|cx: &mut App| {
+            gpui_kit::init(cx);
+            // The reader handles its own keys (vim-style, see `vim.rs`); only these are bindings.
+            cx.bind_keys([
+                KeyBinding::new("ctrl-o", ImportFiles, Some("Library")),
+                KeyBinding::new("ctrl-shift-o", ImportFolder, Some("Library")),
+                KeyBinding::new("f11", ToggleFullscreen, None),
+                KeyBinding::new("ctrl-,", OpenSettings, None),
+                KeyBinding::new("ctrl-q", Quit, None),
+            ]);
 
-        cx.on_action(|_: &Quit, cx: &mut App| cx.quit());
-        cx.on_window_closed(|cx, _window_id| {
-            if cx.windows().is_empty() {
-                cx.quit();
-            }
-        })
-        .detach();
+            cx.on_action(|_: &Quit, cx: &mut App| cx.quit());
+            cx.on_window_closed(|cx, _window_id| {
+                if cx.windows().is_empty() {
+                    cx.quit();
+                }
+            })
+            .detach();
 
-        let bounds = Bounds::centered(None, size(px(1180.), px(780.)), cx);
-        cx.open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                // Created transparent so the surface has an alpha channel; the app switches to
-                // an opaque appearance whenever the background opacity setting is 100%.
-                window_background: WindowBackgroundAppearance::Transparent,
-                titlebar: Some(TitlebarOptions {
-                    title: Some("yomu".into()),
+            let bounds = Bounds::centered(None, size(px(1180.), px(780.)), cx);
+            cx.open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    // Created transparent so the surface has an alpha channel; the app switches to
+                    // an opaque appearance whenever the background opacity setting is 100%.
+                    window_background: WindowBackgroundAppearance::Transparent,
+                    titlebar: Some(TitlebarOptions {
+                        title: Some("yomu".into()),
+                        ..Default::default()
+                    }),
+                    // Compositors match window rules (Niri, Hyprland, Sway…) on the app id.
+                    app_id: Some("yomu".into()),
+                    window_min_size: Some(size(px(480.), px(360.))),
                     ..Default::default()
-                }),
-                // Compositors match window rules (Niri, Hyprland, Sway…) on the app id.
-                app_id: Some("yomu".into()),
-                window_min_size: Some(size(px(480.), px(360.))),
-                ..Default::default()
-            },
-            |window, cx| {
-                let view = cx.new(Yomu::new);
-                let focus = view.read(cx).focus_handle.clone();
-                window.focus(&focus, cx);
-                view
-            },
-        )
-        .expect("failed to open the window");
+                },
+                |window, cx| {
+                    let view = cx.new(Yomu::new);
+                    let focus = view.read(cx).focus_handle.clone();
+                    window.focus(&focus, cx);
+                    view
+                },
+            )
+            .expect("failed to open the window");
 
-        cx.activate(true);
-    });
+            cx.activate(true);
+        });
 }
 
 #[cfg(test)]
@@ -4383,7 +5136,10 @@ mod tests {
         cx: &'a mut TestAppContext,
     ) -> (Entity<Yomu>, &'a mut VisualTestContext) {
         let dirs = fx.dirs.clone();
-        cx.update(|cx| cx.bind_keys([KeyBinding::new("ctrl-,", OpenSettings, None)]));
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            cx.bind_keys([KeyBinding::new("ctrl-,", OpenSettings, None)]);
+        });
         cx.add_window_view(move |window, cx| {
             let yomu = Yomu::with_dirs(dirs, cx);
             window.focus(&yomu.focus_handle, cx);

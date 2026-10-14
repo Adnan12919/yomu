@@ -1,0 +1,38 @@
+# Noctalia user template for yomu. Configure this file as a user template and
+# write its output to $XDG_CONFIG_HOME/yomu/themes.toml.
+name = "yomu custom themes"
+
+[[themes]]
+name = "Noctalia Dynamic"
+mode = "{{ mode }}"
+radius = 10
+radius_lg = 14
+shadow = true
+
+[themes.colors]
+background = "{{ colors.surface.default.hex }}"
+foreground = "{{ colors.on_surface.default.hex }}"
+"popover.background" = "{{ colors.surface_container.default.hex }}"
+"popover.foreground" = "{{ colors.on_surface.default.hex }}"
+"primary.background" = "{{ colors.primary.default.hex }}"
+"primary.foreground" = "{{ colors.on_primary.default.hex }}"
+"primary.hover.background" = "{{ colors.primary_container.default.hex }}"
+"secondary.background" = "{{ colors.secondary_container.default.hex }}"
+"secondary.foreground" = "{{ colors.on_secondary_container.default.hex }}"
+"secondary.hover.background" = "{{ colors.surface_container_high.default.hex }}"
+"muted.background" = "{{ colors.surface_container_low.default.hex }}"
+"muted.foreground" = "{{ colors.on_surface_variant.default.hex }}"
+"accent.background" = "{{ colors.primary_container.default.hex }}"
+"accent.foreground" = "{{ colors.on_primary_container.default.hex }}"
+border = "{{ colors.outline_variant.default.hex }}"
+"input.border" = "{{ colors.outline.default.hex }}"
+ring = "{{ colors.primary.default.hex }}"
+"button.background" = "{{ colors.surface_container_high.default.hex }}"
+"button.foreground" = "{{ colors.on_surface.default.hex }}"
+"button.hover.background" = "{{ colors.surface_container_highest.default.hex }}"
+"button.primary.background" = "{{ colors.primary.default.hex }}"
+"button.primary.foreground" = "{{ colors.on_primary.default.hex }}"
+"button.primary.hover.background" = "{{ colors.primary_container.default.hex }}"
+"danger.background" = "{{ colors.error.default.hex }}"
+"danger.foreground" = "{{ colors.on_error.default.hex }}"
+"scrollbar.background" = "{{ colors.surface_variant.default.hex }}"

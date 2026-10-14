@@ -424,20 +424,20 @@ mod tests {
     #[test]
     fn keyboard_navigation_skips_separators_and_disabled_items_and_wraps() {
         let entries = book_menu(&book(ReadStatus::Unread), false);
-        // Start Reading (0, disabled), Mark as Read (1), sep, Open File Location (3,
-        // disabled), Properties (4), Set Series (5), sep, Remove (7)
-        assert_eq!(step(&entries, None, true), Some(1));
-        assert_eq!(step(&entries, Some(1), true), Some(4));
-        assert_eq!(step(&entries, Some(4), true), Some(5));
-        assert_eq!(step(&entries, Some(5), true), Some(7));
+        // Start Reading (0, disabled), sep (1), Mark as Read (2), sep (3), Open File Location (4,
+        // disabled), Properties (5), Set Series (6), sep (7), Remove (8)
+        assert_eq!(step(&entries, None, true), Some(2));
+        assert_eq!(step(&entries, Some(2), true), Some(5));
+        assert_eq!(step(&entries, Some(5), true), Some(6));
+        assert_eq!(step(&entries, Some(6), true), Some(8));
         assert_eq!(
-            step(&entries, Some(7), true),
-            Some(1),
+            step(&entries, Some(8), true),
+            Some(2),
             "wraps to the first enabled item"
         );
-        assert_eq!(step(&entries, None, false), Some(7));
-        assert_eq!(step(&entries, Some(1), false), Some(7));
-        assert_eq!(step(&entries, Some(4), false), Some(1));
+        assert_eq!(step(&entries, None, false), Some(8));
+        assert_eq!(step(&entries, Some(2), false), Some(8));
+        assert_eq!(step(&entries, Some(5), false), Some(2));
         assert_eq!(step(&[], None, true), None);
     }
 
@@ -486,13 +486,14 @@ mod tests {
             }
             Entry::Separator => unreachable!(),
         }
-        match &selection_menu(1)[2] {
+        match &selection_menu(1)[3] {
             Entry::Item(item) => assert_eq!(item.label, "Remove 1 Book from Library"),
             Entry::Separator => unreachable!(),
         }
         // keyboard navigation works on it too
         assert_eq!(step(&entries, None, true), Some(0));
-        assert_eq!(step(&entries, Some(0), true), Some(2));
+        assert_eq!(step(&entries, Some(0), true), Some(1));
+        assert_eq!(step(&entries, Some(1), true), Some(3));
     }
 
     #[test]

@@ -21,7 +21,7 @@ GPUI Kit window / Yomu (src/main.rs)
 | `main.rs` | GPUI Kit app/window, library and reader views, key/mouse dispatch, overlays/dialogs, rendering, background-task coordination | UI integration layer; it is large, so prefer extracting pure logic into the core modules when adding reusable behavior. The library toolbar is transparent with centered search and a top-right action menu; command suggestions are also presented here, while command parsing remains in `vim.rs`. |
 | `archive.rs` | Enumerate and read CBZ/ZIP pages or images in folders | Filters supported image names, ignores hidden/resource-fork files, natural-sorts names, limits archive page inflation. Source types are `Archive` and `Folder`. |
 | `imaging.rs` | Decode supported images, scale for display, create JPEG covers | No gpui dependency. Decoded pixel buffers are BGRA for gpui; original dimensions are retained for layout. Has dimension guardrails. |
-| `library.rs` | Book model/status/progress, settings, JSON load/save, imports, generated covers | `DataDirs` resolves storage. `Library` owns persisted data; comic files remain at their original paths. Format version currently 2. Continuous mode, webcomics mode, and series grouping are lenient settings, defaulting off for older libraries. Each book's optional series name defaults to unassigned when loading older data. |
+| `library.rs` | Book model/status/progress, settings, JSON load/save, imports, generated covers | `DataDirs` resolves storage. `Library` owns persisted data; comic files remain at their original paths. Format version 3. Continuous mode and webcomics are lenient settings defaulting off; folder grouping defaults on while honoring explicit saved values. Each book's optional series name defaults to unassigned when loading older data. |
 | `layout.rs` | Fit modes, zoom bounds/steps, viewport geometry, pan offsets, decode tiers | Pure math. Page indices and geometry do not depend on reading direction except arrival placement. |
 | `vim.rs` | Turn key tokens and command-line input into reader actions | Knows no UI. The UI consumes `Action` values and performs side effects. |
 | `motion.rs` | Frame-time based scroll easing, page-turn transitions, reduced-motion detection | Pure calculations/state machines; avoid tying animation duration to frame count. |
@@ -35,7 +35,7 @@ GPUI Kit window / Yomu (src/main.rs)
 
 ### Import
 
-`library::import_paths` expands selected files/folders into candidates, scans image folders with a depth limit, determines source kind, enumerates pages, creates a stable path-derived ID and generates a cover. The resulting books are added to the `Library`, sorted, and saved. An imported book references the original path; it is not copied. Archive and folder page names are naturally sorted.
+`library::import_paths_with_progress` expands selected files/folders into candidates, scans image folders with a depth limit, determines source kind, enumerates pages, creates a stable path-derived ID and generates a cover. It invokes a callback after each cover is ready. `main.rs` forwards each book through a channel to the UI task, adds it, and saves immediately. Library order is persisted insertion order; imports append in natural directory scan order. An imported book references the original path; it is not copied. Archive and folder page names are naturally sorted.
 
 ### Opening and reading
 
@@ -58,8 +58,8 @@ Continuous mode is owned by `Reader` and persisted in `Settings`. It stacks page
 ## Invariants worth preserving
 
 - Library-owned mutations are saved to disk; removal forgets metadata and covers but never deletes source comics.
-- `Book.series` is optional persisted metadata; grouping is an opt-in persisted library setting. Assignment trims and normalizes whitespace, and reuses existing spelling case-insensitively to avoid duplicate groups.
-- Grouped library rendering applies the current search filter before forming collapsible sections; series groups use natural ordering and unassigned books appear last.
+- `Book.series` is optional persisted manual grouping metadata; assignment trims and normalizes whitespace, and reuses existing spelling case-insensitively to avoid duplicate groups. Clearing a manual assignment restores automatic grouping by the book path's parent directory.
+- Directory grouping is on by default. Groups with at least two books render as folder cards; the first member's cover is the folder thumbnail. Opening a card navigates to a second view of its volumes. Both group cards and members retain library/import order. The search filter is applied to group contents and individual items.
 - A zero-based page index is clamped against the enumerated page count, and finished status means the final page is current.
 - Archive/folder sorting is natural (e.g. `2` before `10`) and hidden junk is excluded.
 - Archive entry size and decoded image pixel count have defensive limits.

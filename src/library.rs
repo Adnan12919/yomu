@@ -145,7 +145,8 @@ pub fn clamp_opacity(value: f32) -> f32 {
 ///
 /// * 1 (and files without a version): reading direction defaulted to right-to-left.
 /// * 2: reading direction defaults to left-to-right (Western comics); right-to-left is a preference.
-pub const LIBRARY_VERSION: u32 = 2;
+/// * 3: library grouping defaults to on, with directory-based folder groups.
+pub const LIBRARY_VERSION: u32 = 3;
 
 /// Preferences that carry over from book to book and between launches.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -162,10 +163,10 @@ pub struct Settings {
     pub continuous: bool,
     /// Force a connected, gapless vertical strip of pages, regardless of the normal reading mode.
     pub webcomics: bool,
-    /// Show books under their assigned series headings in the library.
+    /// Group books into directory folders, with manual series assignments taking precedence.
     pub group_series: bool,
-    /// Opacity of the window background, `OPACITY_MIN..=OPACITY_MAX`. Page images, covers and
-    /// text always stay fully opaque; only the background behind them becomes see-through.
+    /// Opacity of the window background, `OPACITY_MIN..=OPACITY_MAX`. Raised widget surfaces use
+    /// a small opacity lift to stay distinct; page images, covers, and text remain opaque.
     pub opacity: f32,
 }
 
@@ -178,7 +179,7 @@ impl Default for Settings {
             animate: true,
             continuous: false,
             webcomics: false,
-            group_series: false,
+            group_series: true,
             opacity: OPACITY_MAX,
         }
     }
@@ -268,6 +269,9 @@ impl Library {
             // back once with `r` and it sticks from then on.
             self.settings.rtl = false;
         }
+        // Directory folders are the default library presentation from version 3 onward. Keep
+        // an explicit value from an existing library so users who disabled grouping retain that
+        // choice; missing values inherit the new default through `Settings::default`.
         self.version = LIBRARY_VERSION;
     }
 
@@ -281,7 +285,6 @@ impl Library {
         match serde_json::from_str::<Library>(&text) {
             Ok(mut lib) => {
                 lib.migrate();
-                lib.sort();
                 Ok(lib)
             }
             Err(err) => {
@@ -336,7 +339,6 @@ impl Library {
             return false;
         }
         self.books.push(book);
-        self.sort();
         true
     }
 
@@ -365,10 +367,6 @@ impl Library {
                 book.series = series.clone();
             }
         }
-    }
-
-    fn sort(&mut self) {
-        self.books.sort_by(|a, b| natural_cmp(&a.title, &b.title));
     }
 }
 
@@ -423,6 +421,21 @@ pub fn import_paths(
     dirs: &DataDirs,
     existing: &HashSet<String>,
 ) -> ImportReport {
+    import_paths_with_progress(paths, dirs, existing, |_| {})
+}
+
+/// Import volumes in scan order and report each completed book immediately. The callback runs
+/// on the caller's thread, so UI callers should send the book to their UI task rather than
+/// touching UI state directly.
+pub fn import_paths_with_progress<F>(
+    paths: &[PathBuf],
+    dirs: &DataDirs,
+    existing: &HashSet<String>,
+    mut on_book: F,
+) -> ImportReport
+where
+    F: FnMut(&Book),
+{
     let mut report = ImportReport::default();
     let mut candidates = Vec::new();
 
@@ -442,7 +455,10 @@ pub fn import_paths(
             continue;
         }
         match build_book(path, kind, dirs) {
-            Ok(book) => report.added.push(book),
+            Ok(book) => {
+                on_book(&book);
+                report.added.push(book);
+            }
             Err(err) => report
                 .errors
                 .push(format!("{}: {err:#}", display_name(path))),

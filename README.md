@@ -92,7 +92,7 @@ Ctrl+wheel) work too. Press `?` in the reader for a cheat sheet.
 | `Ctrl+A`, `Delete`, `Esc` | Select all, remove the selection, clear the selection |
 | `Ctrl+O` / `Ctrl+Shift+O` | Add files / Add folder |
 | `/`, click the search field, or `Ctrl+F` | Search titles, source paths, and series |
-| `Ctrl+,` or the **Settings** button | Settings (works in the reader too) |
+| `Ctrl+,`, `:settings`, or library hamburger → **Settings** | Settings |
 
 **Moving**
 
@@ -163,8 +163,8 @@ Manga readers press `r` once and it sticks.
 - **Ctrl+click** toggles a book. **Shift+click** selects the range from the last book you clicked.
 - Once anything is selected, plain clicks toggle books instead of opening them, so you can just keep clicking.
   Deselect the last one (or press `Esc` / **Cancel**) and clicking opens books again.
-- While books are selected the header shows `N of M selected` with **Select all**, **Remove** and **Cancel**
-  in place of the import and settings buttons. `Ctrl+A` selects everything and `Delete` removes the selection.
+- While books are selected the toolbar shows **Select all**, **Remove** and **Cancel** at the left.
+  `Ctrl+A` selects everything and `Delete` removes the selection.
 - Right-click a selected book for a bulk menu (**Clear Selection**, **Set Series for Selected Books…**, **Remove N Books from Library**).
   Right-clicking a book that is not selected drops the selection and shows that book's normal menu.
 - Removal only forgets the books; the comic files are never deleted. It asks first only if some of the selected
@@ -172,17 +172,23 @@ Manga readers press `r` once and it sticks.
 
 ## Searching and grouping the library
 
-Click the search field in the library header, press `/`, or press `Ctrl+F`, then type. Search matches a case-insensitive
+The library toolbar search is centered and has no placeholder text; its caret blinks while active. Click the field,
+press `/`, or press `Ctrl+F`, then type. Search matches a case-insensitive
 substring in the book title, source path, or assigned series. The filter is temporary and does not change library data;
 selection and bulk actions continue to refer to the full library. Press `Enter` to stop typing while keeping the
 filter, or `Esc` to clear the query (press `Esc` again to leave search).
 
-Click **Group by series** in the library header to switch to collapsible series sections; click **Grouped** to
-return to the regular library grid. The choice is saved in `library.json` and defaults to off. Unassigned books
-appear in their own section. Right-click a book and choose **Set Series…** / **Change Series…** to assign one,
-or select several books and choose **Set Series for Selected Books…** from a selected book's context menu.
-The editor suggests the common source parent folder when possible. Clear the name to unassign books. Series
-names are trimmed, repeated whitespace is collapsed, and names that differ only by capitalization share one group.
+Directory grouping is on by default. Volumes from the same source directory appear as a folder card using the
+first volume's cover; click it to open a second view of its books. The hamburger menu or **Settings → Library**
+can switch to individual volumes. Folder grouping is saved in `library.json`. Right-click a book and choose
+**Set Series…** / **Change Series…** to assign it to a named group, or select several books and choose
+**Set Series for Selected Books…**. A manual series assignment takes precedence over the source directory;
+clearing it returns the book to its directory group. Series names are trimmed, repeated whitespace is collapsed,
+and names that differ only by capitalization share one folder.
+
+Imports finish one volume at a time in the background. Each completed volume is added to the library and saved
+immediately, so its title and cover appear while the remaining folder is still being scanned or decoded. New
+books and folder cards retain scan/import order.
 
 ## Context menu
 
@@ -206,7 +212,7 @@ Right-click a book. Only the actions that make sense for its state are shown:
 
 ## Settings
 
-`Ctrl+,` (or `:settings` in the reader, or the Settings button in the library header) opens a tabbed panel:
+`Ctrl+,` (or `:settings` in the reader, or **Settings** in the library hamburger menu) opens a tabbed panel:
 
 - **Window background opacity**, 30% to 100%, default 100%. Drag the slider or use `Left`/`Right` (5% steps),
   `Home`/`End`. It applies immediately and is saved when you let go. **Reset to Defaults** asks first and also
@@ -215,14 +221,19 @@ Right-click a book. Only the actions that make sense for its state are shown:
   uses its semantic colors throughout the library, reader and dialogs, and remembers it between launches.
 - **Custom themes**, edit `$XDG_CONFIG_HOME/yomu/themes.toml` (usually `~/.config/yomu/themes.toml`) and choose
   **Reload custom themes**. On first launch yomu creates this file from [themes.example.toml](themes.example.toml).
-  A parse or validation error is shown in Settings and leaves the currently applied theme in place.
+  Changes to the file are detected automatically; the reload button remains available. A parse or validation error
+  is shown in Settings and leaves the currently applied theme in place.
+- **Noctalia colors**, install [noctalia/yomu-theme.toml.template](noctalia/yomu-theme.toml.template) as a Noctalia user template,
+  with its output set to `$XDG_CONFIG_HOME/yomu/themes.toml`. The generated **Noctalia Dynamic** theme maps Noctalia's
+  primary, surface, text, outline, and error roles to yomu's controls, icons, progress indicators, and surfaces. Select
+  it in yomu Settings; yomu applies Noctalia's regenerated file automatically.
 - **Reading mode**, single page or continuous vertical scrolling. The choice is remembered between launches;
   use `v`, the Settings panel, or `:continuous [on|off]` in the reader. In continuous mode, `j`/`k`, wheel and touchpad
   scroll through stacked pages, while `J`/`K` and page-number commands jump between pages.
 - **Webcomics mode** shows pages as one connected vertical strip with no gap between adjacent pages. Toggle it
   with `w`, the Settings panel, or `:webcomics [on|off]`. It forces continuous scrolling while active, then restores
   the saved single-page or continuous reading mode when turned off.
-- **Library** controls series grouping.
+- **Library** switches between automatic folder grouping and individual volumes.
 - **Reader** controls reading direction, page fit, animations, single-page or continuous scrolling, and webcomics mode.
 - **Keyboard & Commands** lists the reader shortcuts and `:` commands.
 
@@ -234,15 +245,45 @@ table. Color keys use GPUI Kit theme names and accept `#RRGGBB` or `#RRGGBBAA` v
 `font_size`, `font_family`, `mono_font_size`, `mono_font_family`, `radius`, `radius_lg`, and `shadow`. The starter
 file lists the supported color tokens and shows their TOML quoting for dotted keys.
 
+For Noctalia v5+, add this to `~/.config/noctalia/templates.toml` (adjust the input path if you store the template elsewhere):
+
+```toml
+[theme.templates.user.yomu]
+input_path = "$XDG_CONFIG_HOME/yomu/noctalia-theme.toml.template"
+output_path = "$XDG_CONFIG_HOME/yomu/themes.toml"
+```
+
+Copy the repository template to that input path. Noctalia renders the template on palette changes using its active
+`mode` and color roles; yomu reads the generated TOML when you reload custom themes. See [Noctalia's app theming guide](https://docs.noctalia.dev/noctalia/theming/app-theming/)
+and [template reference](https://docs.noctalia.dev/noctalia/theming/templates/) for user-template setup and available palette tokens.
+
 ### How opacity works, and its limits
 
-yomu asks the compositor for a window with an alpha channel and lowers the alpha of its **background** only.
-Pages, covers, text and menus stay fully opaque, so letterbox margins around a page and the empty library
-background become see-through. At exactly 100% the window switches back to a fully opaque surface, which lets
-the compositor skip blending.
+yomu asks the compositor for a window with an alpha channel. The window background follows the opacity slider,
+and raised widget surfaces (cards, fields, dialogs, buttons, and the reader command/suggestion panel) use 10 percentage
+points more opacity so they remain distinct panes over the background, capped at 100%. Text and comic images stay
+fully opaque. At exactly 100% the window switches back to a fully opaque surface, which lets the compositor skip
+blending.
 
 - Needs a compositing window system. Every Wayland compositor qualifies; on X11 you need a compositor running.
-- There is no blur: gpui's blur support depends on compositor extensions, and a plain opacity slider does not need it.
+- Blur is supplied by the compositor, not yomu. The reader command and suggestion panel is drawn inside yomu's main
+  window and follows the same 10-point raised-surface opacity rule as Settings. The book context menu is a native
+  `xdg_popup`. Niri needs a window effect for the command panel and a popup effect for the context menu; the popup
+  setting alone does not blur in-window panels. Add both rules:
+
+  ```kdl
+  window-rule {
+      match app-id="^yomu$"
+      background-effect {
+          blur true
+      }
+      popups {
+          background-effect {
+              blur true
+          }
+      }
+  }
+  ```
 - I could not look at a real compositor while building this, so the actual translucent look (including the colour
   of semi-transparent areas) is the one thing not verified by the tests.
 
@@ -316,4 +357,6 @@ The code is split so that everything except the window lives in the library crat
 - CBR/CB7 (needs a pure-Rust RAR/7z reader; CBR files are rejected with a clear message)
 - Double-page spreads, pinch zoom
 - Sorting options
+- A clear Noctalia Launcher-style hover and active-selection color across menus and settings, including pointer hover
+  and keyboard navigation. Use the theme's primary/accent color so the current item is easy to identify.
 - Inertial scrolling (very low priority roadmap item)
