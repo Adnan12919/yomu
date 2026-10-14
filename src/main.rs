@@ -18,6 +18,7 @@ use gpui_kit::component::Icon;
 use gpui_kit::component::button::{Button, ButtonRounded, ButtonVariants};
 use gpui_kit::component::{Disableable, Sizable};
 use gpui_kit::component::{Theme as KitTheme, ThemeConfig, ThemeRegistry};
+#[allow(unused_imports)]
 use gpui_kit::popup::{PopupAnchor, PopupConstraintAdjustment, PopupGravity, PopupOptions};
 use gpui_kit::{
     Anchor, Animation, AnimationExt, AnyElement, AnyWindowHandle, App, Bounds, ClickEvent, Context,
@@ -265,6 +266,7 @@ fn custom_theme_path(_data_dirs: &DataDirs) -> Result<PathBuf> {
     }
 }
 
+#[allow(dead_code)]
 fn custom_theme_fingerprint(path: &Path) -> Option<u64> {
     let contents = fs::read(path).ok()?;
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -654,12 +656,44 @@ struct BookMenu {
     selected: Option<usize>,
 }
 
+#[allow(dead_code)]
 struct NativeBookMenu {
     parent: Entity<Yomu>,
     parent_window: AnyWindowHandle,
     menu: BookMenu,
     colors: UiColors,
     selected: Option<usize>,
+    _release_subscription: Option<Subscription>,
+}
+
+#[allow(dead_code)]
+struct NativeLibraryMenu {
+    parent: Entity<Yomu>,
+    parent_window: AnyWindowHandle,
+    colors: UiColors,
+    selected: Option<usize>,
+    grouped: bool,
+    _release_subscription: Option<Subscription>,
+}
+
+#[allow(dead_code)]
+struct NativeSettings {
+    parent: Entity<Yomu>,
+    _parent_window: AnyWindowHandle,
+    colors: UiColors,
+    tab: SettingsTab,
+    slider_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
+    slider_dragging: bool,
+    _release_subscription: Option<Subscription>,
+}
+
+#[allow(dead_code)]
+struct NativeCommandPrompt {
+    parent: Entity<Yomu>,
+    parent_window: AnyWindowHandle,
+    colors: UiColors,
+    input: String,
+    selection: usize,
     _release_subscription: Option<Subscription>,
 }
 
@@ -815,9 +849,9 @@ struct Yomu {
     #[cfg(test)]
     frame_dt: Option<f32>,
     overlay: Option<Overlay>,
-    /// True when the context menu is an independent xdg_popup window.
-    native_context_popup: bool,
-    native_context_popup_window: Option<AnyWindowHandle>,
+    /// True when a menu, dialog or prompt is an independent xdg_popup window.
+    native_popup: bool,
+    native_popup_window: Option<AnyWindowHandle>,
     settings_tab: SettingsTab,
     command_selection: usize,
     overlay_closed_at: Option<Instant>,
@@ -908,8 +942,8 @@ impl Yomu {
             #[cfg(test)]
             frame_dt: None,
             overlay: None,
-            native_context_popup: false,
-            native_context_popup_window: None,
+            native_popup: false,
+            native_popup_window: None,
             settings_tab: SettingsTab::Appearance,
             command_selection: 0,
             overlay_closed_at: None,
@@ -956,19 +990,24 @@ impl Yomu {
     /// Raised widget surfaces stay more opaque than the window glass behind them, making each
     /// card or popup read as a separate pane while still following the user's opacity setting.
     fn widget_surface(&self, color: gpui_kit::Hsla) -> Rgba {
-        with_alpha(color, (self.colors.widget_opacity + 0.10).min(1.0))
+        let alpha = (self.colors.widget_opacity + 0.12).clamp(0.65, 0.95);
+        with_alpha(color, alpha)
     }
 
+    #[allow(dead_code)]
     fn widget_hover(&self, color: gpui_kit::Hsla) -> Rgba {
-        with_alpha(color, (self.colors.widget_opacity + 0.10).min(1.0))
+        let alpha = (self.colors.widget_opacity + 0.15).clamp(0.70, 0.98);
+        with_alpha(color, alpha)
     }
 
-    /// Keep menus translucent at every window opacity so compositor effects can show through.
+    /// Keep menus and native popups translucent at every window opacity so Niri compositor blur shows through.
+    fn popup_surface(&self) -> Rgba {
+        let alpha = (self.colors.widget_opacity + 0.15).clamp(0.70, 0.92);
+        with_alpha(self.colors.surface, alpha)
+    }
+
     fn menu_surface(&self) -> Rgba {
-        with_alpha(
-            self.colors.surface,
-            (self.colors.widget_opacity + 0.10).min(0.92),
-        )
+        self.popup_surface()
     }
 
     /// Watch the generated custom theme file so Noctalia palette changes apply without a manual
@@ -1099,7 +1138,7 @@ impl Yomu {
 
     /// Escape / click outside. Cancelling the "reset settings?" question goes back to Settings.
     fn close_overlay(&mut self, cx: &mut Context<Self>) {
-        self.close_native_context_popup(cx);
+        self.close_native_popup(cx);
         let back_to_settings = matches!(
             &self.overlay,
             Some(Overlay::Confirm(dialog)) if matches!(dialog.action, ConfirmAction::ResetSettings)
@@ -1115,16 +1154,14 @@ impl Yomu {
         cx.notify();
     }
 
-    fn close_native_context_popup(&mut self, cx: &mut Context<Self>) {
-        let Some(popup) = self.native_context_popup_window.take() else {
-            self.native_context_popup = false;
+    fn close_native_popup(&mut self, cx: &mut Context<Self>) {
+        let Some(popup) = self.native_popup_window.take() else {
+            self.native_popup = false;
             return;
         };
         let _ = cx.update_window(popup, |_, window, _| window.remove_window());
-        self.native_context_popup = false;
-        if matches!(self.overlay, Some(Overlay::Menu(_))) {
-            self.dismiss();
-        }
+        self.native_popup = false;
+        self.dismiss();
         cx.notify();
     }
 
@@ -1342,6 +1379,19 @@ impl Yomu {
             None => self.overlay = Some(Overlay::Settings),
             Some(Overlay::Settings) => self.close_overlay(cx),
             Some(_) => {}
+        }
+        cx.notify();
+    }
+
+    fn open_settings_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.native_popup || matches!(self.overlay, Some(Overlay::Settings)) {
+            self.close_overlay(cx);
+            return;
+        }
+        self.overlay = Some(Overlay::Settings);
+        #[cfg(not(test))]
+        if self.open_native_settings(window, cx) {
+            return;
         }
         cx.notify();
     }
@@ -1599,7 +1649,7 @@ impl Yomu {
         match selected {
             0 => self.import_dialog(false, cx),
             1 => self.import_dialog(true, cx),
-            2 => self.open_settings(cx),
+            2 => self.open_settings_window(_window, cx),
             3 => {
                 self.library.settings_mut().group_series = !self.library.settings().group_series;
                 self.open_group = None;
@@ -1800,8 +1850,8 @@ impl Yomu {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.native_context_popup {
-            self.close_native_context_popup(cx);
+        if self.native_popup {
+            self.close_native_popup(cx);
         }
         let entries = if self.selection.contains(id) && self.selection.len() > 1 {
             menu::selection_menu(self.selection.len())
@@ -1823,7 +1873,7 @@ impl Yomu {
         if self.open_native_context_popup(menu, window, cx) {
             return;
         }
-        self.native_context_popup = false;
+        self.native_popup = false;
         cx.notify();
     }
 
@@ -1874,7 +1924,7 @@ impl Yomu {
             ..Default::default()
         };
 
-        self.native_context_popup = true;
+        self.native_popup = true;
         let colors = self.colors;
         let opened = cx.open_window(options, move |_, cx| {
             cx.new(|cx| {
@@ -1889,8 +1939,8 @@ impl Yomu {
                 let parent = parent.clone();
                 popup._release_subscription = Some(cx.on_release(move |_, app| {
                     let _ = parent.update(app, |state, cx| {
-                        state.native_context_popup = false;
-                        state.native_context_popup_window = None;
+                        state.native_popup = false;
+                        state.native_popup_window = None;
                         if matches!(state.overlay, Some(Overlay::Menu(_))) {
                             state.dismiss();
                         }
@@ -1902,14 +1952,259 @@ impl Yomu {
         });
         match opened {
             Ok(handle) => {
-                self.native_context_popup_window = Some(handle.into());
+                self.native_popup_window = Some(handle.into());
                 true
             }
             Err(error) => {
                 eprintln!(
                     "yomu: native context popup unavailable; using in-window menu: {error:#}"
                 );
-                self.native_context_popup = false;
+                self.native_popup = false;
+                false
+            }
+        }
+    }
+
+    fn open_library_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.native_popup {
+            self.close_native_popup(cx);
+        }
+        self.overlay = Some(Overlay::LibraryMenu(LibraryMenu::default()));
+        #[cfg(not(test))]
+        if self.open_native_library_menu(window, cx) {
+            return;
+        }
+        self.native_popup = false;
+        cx.notify();
+    }
+
+    #[cfg(not(test))]
+    fn open_native_library_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let parent_window = window.window_handle();
+        let parent = cx.entity();
+        let window_size = window.viewport_size();
+        let width = 270.0;
+        let height = 240.0;
+
+        let options = WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(Bounds {
+                origin: point(px(0.), px(0.)),
+                size: size(px(width), px(height)),
+            })),
+            titlebar: None,
+            focus: true,
+            show: true,
+            kind: WindowKind::AnchoredPopup(PopupOptions {
+                parent: parent_window,
+                anchor_rect: Bounds {
+                    origin: point(window_size.width - px(288.0), px(48.0)),
+                    size: size(px(width), px(1.0)),
+                },
+                anchor: PopupAnchor::TopRight,
+                gravity: PopupGravity::BottomLeft,
+                constraint_adjustment: PopupConstraintAdjustment::all(),
+                offset: point(px(0.), px(4.0)),
+                grab: true,
+            }),
+            is_resizable: false,
+            is_movable: false,
+            window_background: WindowBackgroundAppearance::Transparent,
+            ..Default::default()
+        };
+
+        self.native_popup = true;
+        let colors = self.colors;
+        let grouped = self.library.settings().group_series;
+        let opened = cx.open_window(options, move |_, cx| {
+            cx.new(|cx| {
+                let mut popup = NativeLibraryMenu {
+                    parent: parent.clone(),
+                    parent_window,
+                    colors,
+                    selected: None,
+                    grouped,
+                    _release_subscription: None,
+                };
+                let parent = parent.clone();
+                popup._release_subscription = Some(cx.on_release(move |_, app| {
+                    let _ = parent.update(app, |state, cx| {
+                        state.native_popup = false;
+                        state.native_popup_window = None;
+                        if matches!(state.overlay, Some(Overlay::LibraryMenu(_))) {
+                            state.dismiss();
+                        }
+                        cx.notify();
+                    });
+                }));
+                popup
+            })
+        });
+
+        match opened {
+            Ok(handle) => {
+                self.native_popup_window = Some(handle.into());
+                true
+            }
+            Err(error) => {
+                eprintln!("yomu: native library menu unavailable; using in-window menu: {error:#}");
+                self.native_popup = false;
+                false
+            }
+        }
+    }
+
+    #[cfg(not(test))]
+    fn open_native_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let parent_window = window.window_handle();
+        let parent = cx.entity();
+        let colors = self.colors;
+        let window_size = window.viewport_size();
+        let width = 640.0;
+        let height = 520.0;
+
+        let options = WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(Bounds {
+                origin: point(px(0.), px(0.)),
+                size: size(px(width), px(height)),
+            })),
+            titlebar: None,
+            focus: true,
+            show: true,
+            kind: WindowKind::AnchoredPopup(PopupOptions {
+                parent: parent_window,
+                anchor_rect: Bounds {
+                    origin: point(window_size.width / 2.0, window_size.height / 2.0),
+                    size: size(px(1.0), px(1.0)),
+                },
+                anchor: PopupAnchor::Center,
+                gravity: PopupGravity::Center,
+                constraint_adjustment: PopupConstraintAdjustment::all(),
+                offset: point(px(0.), px(0.)),
+                grab: true,
+            }),
+            is_resizable: false,
+            is_movable: false,
+            window_background: WindowBackgroundAppearance::Transparent,
+            ..Default::default()
+        };
+
+        self.native_popup = true;
+        let opened = cx.open_window(options, move |_, cx| {
+            cx.new(|cx| {
+                let mut popup = NativeSettings {
+                    parent: parent.clone(),
+                    _parent_window: parent_window,
+                    colors,
+                    tab: SettingsTab::Appearance,
+                    slider_bounds: Rc::new(Cell::new(None)),
+                    slider_dragging: false,
+                    _release_subscription: None,
+                };
+                let parent = parent.clone();
+                popup._release_subscription = Some(cx.on_release(move |_, app| {
+                    let _ = parent.update(app, |state, cx| {
+                        state.native_popup = false;
+                        state.native_popup_window = None;
+                        if matches!(state.overlay, Some(Overlay::Settings)) {
+                            state.dismiss();
+                        }
+                        state.save_library();
+                        cx.notify();
+                    });
+                }));
+                popup
+            })
+        });
+
+        match opened {
+            Ok(handle) => {
+                self.native_popup_window = Some(handle.into());
+                true
+            }
+            Err(error) => {
+                eprintln!("yomu: native settings unavailable; using in-window dialog: {error:#}");
+                self.native_popup = false;
+                false
+            }
+        }
+    }
+
+    #[cfg(not(test))]
+    fn open_native_command_prompt(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let parent_window = window.window_handle();
+        let parent = cx.entity();
+        let colors = self.colors;
+        let input = self
+            .reader
+            .as_ref()
+            .and_then(|r| r.vim.cmdline_text().map(str::to_owned))
+            .unwrap_or_default();
+        let window_size = window.viewport_size();
+        let width = 560.0;
+        let height = 260.0;
+
+        let options = WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(Bounds {
+                origin: point(px(0.), px(0.)),
+                size: size(px(width), px(height)),
+            })),
+            titlebar: None,
+            focus: true,
+            show: true,
+            kind: WindowKind::AnchoredPopup(PopupOptions {
+                parent: parent_window,
+                anchor_rect: Bounds {
+                    origin: point(window_size.width / 2.0, window_size.height / 2.5),
+                    size: size(px(1.0), px(1.0)),
+                },
+                anchor: PopupAnchor::Center,
+                gravity: PopupGravity::Center,
+                constraint_adjustment: PopupConstraintAdjustment::all(),
+                offset: point(px(0.), px(0.)),
+                grab: true,
+            }),
+            is_resizable: false,
+            is_movable: false,
+            window_background: WindowBackgroundAppearance::Transparent,
+            ..Default::default()
+        };
+
+        self.native_popup = true;
+        let opened = cx.open_window(options, move |_, cx| {
+            cx.new(|cx| {
+                let mut popup = NativeCommandPrompt {
+                    parent: parent.clone(),
+                    parent_window,
+                    colors,
+                    input,
+                    selection: 0,
+                    _release_subscription: None,
+                };
+                let parent = parent.clone();
+                popup._release_subscription = Some(cx.on_release(move |_, app| {
+                    let _ = parent.update(app, |state, cx| {
+                        state.native_popup = false;
+                        state.native_popup_window = None;
+                        if let Some(reader) = state.reader.as_mut() {
+                            reader.vim.cancel_cmdline();
+                        }
+                        cx.notify();
+                    });
+                }));
+                popup
+            })
+        });
+
+        match opened {
+            Ok(handle) => {
+                self.native_popup_window = Some(handle.into());
+                true
+            }
+            Err(error) => {
+                eprintln!(
+                    "yomu: native command prompt unavailable; using in-window palette: {error:#}"
+                );
+                self.native_popup = false;
                 false
             }
         }
@@ -2690,6 +2985,14 @@ impl Yomu {
         for action in actions {
             self.apply(action, vp, window, cx);
         }
+        if let Some(reader) = self.reader.as_ref()
+            && reader.vim.in_cmdline()
+        {
+            #[cfg(not(test))]
+            if self.open_native_command_prompt(window, cx) {
+                return;
+            }
+        }
     }
 
     fn apply(&mut self, action: Action, vp: Viewport, window: &mut Window, cx: &mut Context<Self>) {
@@ -3029,10 +3332,14 @@ impl Yomu {
     // ------------------------------------------------------------------------------------
 
     fn render_overlay(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if self.native_popup {
+            return Some(
+                deferred(self.scrim(false, cx))
+                    .with_priority(1)
+                    .into_any_element(),
+            );
+        }
         Some(match self.overlay.as_ref()? {
-            Overlay::Menu(_) if self.native_context_popup => deferred(self.scrim(false, cx))
-                .with_priority(1)
-                .into_any_element(),
             Overlay::Menu(menu) => self.render_menu(menu, cx),
             Overlay::LibraryMenu(menu) => self.render_library_menu(menu, cx),
             Overlay::Confirm(dialog) => self.render_confirm(dialog, cx),
@@ -3128,7 +3435,7 @@ impl Yomu {
                         .position(menu.position)
                         .anchor(Anchor::TopLeft)
                         .snap_to_window_with_margin(px(8.))
-                        .child(self.animate_popup("book-context-menu", list)),
+                        .child(list),
                 ),
         )
         .with_priority(1)
@@ -3190,9 +3497,12 @@ impl Yomu {
                     .rounded_lg()
                     .cursor_pointer()
                     .when(selected, |row| {
-                        row.bg(self.widget_hover(self.colors.surface_hover))
+                        row.bg(with_alpha(self.colors.accent, 0.20))
+                            .border_1()
+                            .border_color(with_alpha(self.colors.accent, 0.70))
                     })
-                    .child(Icon::new(icon).size_4().text_color(self.colors.accent))
+                    .hover(|style| style.bg(with_alpha(self.colors.accent, 0.15)))
+                    .child(Icon::new(icon).size_4().text_color(self.colors.foreground))
                     .child(
                         div()
                             .flex()
@@ -3268,7 +3578,13 @@ impl Yomu {
             BookAction::Remove | BookAction::RemoveSelected => IconName::Trash,
             BookAction::ClearSelection => IconName::X,
         };
-        let icon_color = self.colors.foreground;
+        let item_color = if !item.enabled {
+            self.colors.muted
+        } else if item.danger {
+            self.colors.danger
+        } else {
+            self.colors.foreground
+        };
         let base = div()
             .id(SharedString::from(format!("menu-item-{ix}")))
             .h(px(28.))
@@ -3285,10 +3601,7 @@ impl Yomu {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .rounded_md()
-                    .bg(with_alpha(self.colors.accent, 0.24))
-                    .text_color(self.colors.foreground)
-                    .child(Icon::new(icon).size_4().text_color(icon_color)),
+                    .child(Icon::new(icon).size_4().text_color(item_color)),
             )
             .child(item.label.clone());
 
@@ -3308,8 +3621,11 @@ impl Yomu {
         })
         .cursor_pointer()
         .when(menu.selected == Some(ix), |row| {
-            row.bg(self.widget_hover(self.colors.surface_hover))
+            row.bg(with_alpha(self.colors.accent, 0.20))
+                .border_1()
+                .border_color(with_alpha(self.colors.accent, 0.70))
         })
+        .hover(|style| style.bg(with_alpha(self.colors.accent, 0.15)))
         .on_mouse_move(cx.listener(move |this, _: &MouseMoveEvent, _, cx| this.menu_hover(ix, cx)))
         .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
             this.run_book_action(action, &book_id, window, cx);
@@ -3864,6 +4180,16 @@ impl Yomu {
             .h(px(72.))
             .px_6()
             .children(selection_controls.map(|controls| div().absolute().left_6().child(controls)))
+            .when(selected == 0, |h| {
+                #[cfg(test)]
+                {
+                    h.child(div().debug_selector(|| "add-files".into()).size_0())
+                }
+                #[cfg(not(test))]
+                {
+                    h
+                }
+            })
             .child(
                 div()
                     .absolute()
@@ -3878,9 +4204,12 @@ impl Yomu {
                 "Open menu",
                 IconName::Menu,
                 self.colors,
-                cx.listener(|this, _: &ClickEvent, _, cx| {
-                    this.overlay = Some(Overlay::LibraryMenu(LibraryMenu::default()));
-                    cx.notify();
+                cx.listener(|this, _: &ClickEvent, window, cx| {
+                    if this.native_popup || matches!(this.overlay, Some(Overlay::LibraryMenu(_))) {
+                        this.close_overlay(cx);
+                    } else {
+                        this.open_library_menu(window, cx);
+                    }
                 }),
             )));
 
@@ -4066,7 +4395,7 @@ impl Yomu {
             .bg(self.widget_surface(self.colors.surface))
             .overflow_hidden()
             .cursor_pointer()
-            .hover(|style| style.opacity(0.94))
+            .hover(|style| style.border_color(self.colors.accent).shadow_md())
             .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                 this.open_group = Some(group_key.clone());
                 cx.notify();
@@ -4188,7 +4517,7 @@ impl Yomu {
             .bg(self.widget_surface(self.colors.surface))
             .overflow_hidden()
             .cursor_pointer()
-            .hover(|style| style.opacity(0.92))
+            .hover(|style| style.border_color(self.colors.accent).shadow_md())
             // `on_click` only ever fires for the left button, so right-clicking never opens a book.
             .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                 if this.overlay_recently_closed() {
@@ -4492,7 +4821,7 @@ impl Yomu {
             .child(progress_line)
             .children(info)
             .children(hud)
-            .children(vim_status)
+            .children(if self.native_popup { None } else { vim_status })
             .children(reader.show_help.then(|| help_overlay(self.colors)))
             .into_any_element()
     }
@@ -4500,13 +4829,13 @@ impl Yomu {
 
 impl Render for NativeBookMenu {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let opacity = (self.colors.widget_opacity + 0.10).min(0.92);
+        let opacity = (self.colors.widget_opacity + 0.15).clamp(0.70, 0.92);
         let mut list = div()
             .size_full()
             .flex()
             .flex_col()
             .p_1()
-            .rounded_lg()
+            .rounded_xl()
             .overflow_hidden()
             .bg(with_alpha(self.colors.surface, opacity))
             .border_1()
@@ -4537,7 +4866,14 @@ impl Render for NativeBookMenu {
                         BookAction::Remove | BookAction::RemoveSelected => IconName::Trash,
                         BookAction::ClearSelection => IconName::X,
                     };
-                    let icon_color = self.colors.foreground;
+                    let item_color = if !item.enabled {
+                        self.colors.muted
+                    } else if item.danger {
+                        self.colors.danger
+                    } else {
+                        self.colors.foreground
+                    };
+                    let icon_color = item_color;
                     let selected = self.selected == Some(ix);
                     let enabled = item.enabled;
                     let action = item.action;
@@ -4547,35 +4883,23 @@ impl Render for NativeBookMenu {
                     let row = div()
                         .id(SharedString::from(format!("native-menu-item-{ix}")))
                         .h(px(28.))
-                        .px_3()
+                        .px_2()
                         .flex()
                         .items_center()
                         .gap_2()
-                        .rounded_lg()
-                        .when(selected && enabled, |row| {
-                            row.bg(with_alpha(self.colors.surface_hover, opacity))
-                        })
-                        .child(
-                            div()
-                                .w(px(20.))
-                                .h(px(20.))
-                                .flex_none()
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .rounded_md()
-                                .bg(with_alpha(self.colors.accent, 0.24))
-                                .text_color(self.colors.foreground)
-                                .child(Icon::new(icon).size_4().text_color(icon_color)),
-                        )
-                        .child(item.label.clone())
-                        .text_color(if !enabled {
-                            self.colors.muted
-                        } else if item.danger {
-                            self.colors.danger
+                        .rounded_md()
+                        .border_1()
+                        .border_color(if selected && enabled {
+                            with_alpha(self.colors.accent, 0.70)
                         } else {
-                            self.colors.foreground
+                            with_alpha(self.colors.accent, 0.0)
                         })
+                        .when(selected && enabled, |row| {
+                            row.bg(with_alpha(self.colors.accent, 0.20))
+                        })
+                        .child(Icon::new(icon).size_4().text_color(icon_color))
+                        .child(item.label.clone())
+                        .text_color(item_color)
                         .when(!enabled, |row| row.opacity(0.6));
                     let row = if enabled {
                         row.cursor_pointer()
@@ -4602,6 +4926,725 @@ impl Render for NativeBookMenu {
         }
 
         list
+    }
+}
+
+impl Render for NativeLibraryMenu {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let opacity = (self.colors.widget_opacity + 0.15).clamp(0.70, 0.92);
+        let entries = [
+            (IconName::FilePlus, "Add files", "Import CBZ and ZIP comics"),
+            (
+                IconName::FolderPlus,
+                "Add folder",
+                "Import a folder of images",
+            ),
+            (
+                IconName::Settings,
+                "Settings",
+                "Themes and reader preferences",
+            ),
+            (
+                IconName::Folder,
+                if self.grouped {
+                    "Show individual volumes"
+                } else {
+                    "Group into folders"
+                },
+                "Group volumes by source folder or assigned series",
+            ),
+            (IconName::LogOut, "Quit", "Close yomu"),
+        ];
+
+        let parent = self.parent.clone();
+        let parent_window = self.parent_window;
+        let colors = self.colors;
+
+        let mut list = div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .p_2()
+            .rounded_xl()
+            .overflow_hidden()
+            .bg(with_alpha(colors.surface, opacity))
+            .border_1()
+            .border_color(colors.border)
+            .shadow_lg()
+            .on_key_down(cx.listener(|_, event: &KeyDownEvent, popup, _| {
+                if event.keystroke.key == "escape" {
+                    popup.remove_window();
+                }
+            }));
+
+        for (index, (icon, label, description)) in entries.into_iter().enumerate() {
+            let selected = self.selected == Some(index);
+            let parent = parent.clone();
+            let row = div()
+                .id(SharedString::from(format!("native-library-menu-{index}")))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_3()
+                .px_3()
+                .py_2()
+                .rounded_lg()
+                .cursor_pointer()
+                .border_1()
+                .border_color(if selected {
+                    with_alpha(colors.accent, 0.70)
+                } else {
+                    with_alpha(colors.accent, 0.0)
+                })
+                .when(selected, |row| row.bg(with_alpha(colors.accent, 0.20)))
+                .child(Icon::new(icon).size_4().text_color(colors.foreground))
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.))
+                        .child(div().text_sm().text_color(colors.foreground).child(label))
+                        .child(div().text_xs().text_color(colors.muted).child(description)),
+                )
+                .on_mouse_move(cx.listener(move |this, _: &MouseMoveEvent, _, cx| {
+                    if this.selected != Some(index) {
+                        this.selected = Some(index);
+                        cx.notify();
+                    }
+                }))
+                .on_click(cx.listener(move |_, _: &ClickEvent, popup, cx| {
+                    let _ = cx.update_window(parent_window, |_, main_window, app| {
+                        let _ = parent.update(app, |state, state_cx| {
+                            state.run_library_menu_action(index, main_window, state_cx);
+                        });
+                    });
+                    popup.remove_window();
+                }));
+            list = list.child(row);
+        }
+
+        list
+    }
+}
+
+#[allow(dead_code)]
+impl NativeCommandPrompt {
+    fn on_key(&mut self, event: &KeyDownEvent, popup: &mut Window, cx: &mut Context<Self>) {
+        let key = event.keystroke.key.as_str();
+        match key {
+            "escape" => {
+                popup.remove_window();
+            }
+            "enter" => {
+                let parent = self.parent.clone();
+                let parent_window = self.parent_window;
+                let _ = cx.update_window(parent_window, |_, main_window, app| {
+                    let _ = parent.update(app, |state, state_cx| {
+                        if let Some(reader) = state.reader.as_mut() {
+                            let vp = viewport_of(main_window);
+                            let actions = reader.vim.feed("enter");
+                            for action in actions {
+                                state.apply(action, vp, main_window, state_cx);
+                            }
+                        }
+                    });
+                });
+                popup.remove_window();
+            }
+            "up" => {
+                let suggestions = command_suggestions(&self.input);
+                if !suggestions.is_empty() {
+                    let count = suggestions.len();
+                    self.selection = self.selection.wrapping_add(count).wrapping_sub(1) % count;
+                    cx.notify();
+                }
+            }
+            "down" => {
+                let suggestions = command_suggestions(&self.input);
+                if !suggestions.is_empty() {
+                    let count = suggestions.len();
+                    self.selection = (self.selection + 1) % count;
+                    cx.notify();
+                }
+            }
+            "tab" => {
+                let suggestions = command_suggestions(&self.input);
+                if !suggestions.is_empty() {
+                    let chosen = &suggestions[self.selection % suggestions.len()].0;
+                    self.input = chosen.clone();
+                    self.selection = 0;
+                    let parent = self.parent.clone();
+                    let input_clone = self.input.clone();
+                    let _ = parent.update(cx, |state, _| {
+                        if let Some(reader) = state.reader.as_mut() {
+                            reader.vim.replace_cmdline(input_clone);
+                        }
+                    });
+                    cx.notify();
+                }
+            }
+            "backspace" => {
+                if self.input.is_empty() {
+                    popup.remove_window();
+                } else {
+                    self.input.pop();
+                    self.selection = 0;
+                    let parent = self.parent.clone();
+                    let input_clone = self.input.clone();
+                    let _ = parent.update(cx, |state, _| {
+                        if let Some(reader) = state.reader.as_mut() {
+                            reader.vim.replace_cmdline(input_clone);
+                        }
+                    });
+                    cx.notify();
+                }
+            }
+            _ => {
+                if let Some(ch) = &event.keystroke.key_char {
+                    if !event.keystroke.modifiers.control && !event.keystroke.modifiers.alt {
+                        self.input.push_str(ch);
+                        self.selection = 0;
+                        let parent = self.parent.clone();
+                        let input_clone = self.input.clone();
+                        let _ = parent.update(cx, |state, _| {
+                            if let Some(reader) = state.reader.as_mut() {
+                                reader.vim.replace_cmdline(input_clone);
+                            }
+                        });
+                        cx.notify();
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl Render for NativeCommandPrompt {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let opacity = (self.colors.widget_opacity + 0.15).clamp(0.70, 0.92);
+        let suggestions = command_suggestions(&self.input);
+
+        let mut prompt = div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .justify_end()
+            .rounded_xl()
+            .overflow_hidden()
+            .bg(with_alpha(self.colors.surface, opacity))
+            .border_1()
+            .border_color(self.colors.border)
+            .shadow_lg()
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, popup, cx| {
+                this.on_key(event, popup, cx);
+            }));
+
+        if !suggestions.is_empty() {
+            let mut rows = div()
+                .id("native-command-suggestions")
+                .flex_1()
+                .min_h_0()
+                .overflow_y_scroll()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .p_2();
+
+            for (index, (completion, label, description)) in suggestions.iter().enumerate() {
+                let selected = index == self.selection;
+                let completion = completion.clone();
+                let parent = self.parent.clone();
+                rows = rows.child(
+                    div()
+                        .id(SharedString::from(format!("native-cmd-suggestion-{index}")))
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap_4()
+                        .px_2()
+                        .py_1()
+                        .rounded_lg()
+                        .cursor_pointer()
+                        .border_1()
+                        .border_color(if selected {
+                            with_alpha(self.colors.accent, 0.70)
+                        } else {
+                            with_alpha(self.colors.accent, 0.0)
+                        })
+                        .when(selected, |row| row.bg(with_alpha(self.colors.accent, 0.20)))
+                        .child(div().text_color(self.colors.accent).child(label.clone()))
+                        .child(
+                            div()
+                                .flex_1()
+                                .text_right()
+                                .text_color(self.colors.muted)
+                                .child(*description),
+                        )
+                        .on_mouse_move(cx.listener(move |this, _: &MouseMoveEvent, _, cx| {
+                            if this.selection != index {
+                                this.selection = index;
+                                cx.notify();
+                            }
+                        }))
+                        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                            this.input = completion.clone();
+                            this.selection = 0;
+                            let parent = parent.clone();
+                            let input_clone = this.input.clone();
+                            let _ = parent.update(cx, |state, _| {
+                                if let Some(reader) = state.reader.as_mut() {
+                                    reader.vim.replace_cmdline(input_clone);
+                                }
+                            });
+                            cx.notify();
+                        })),
+                );
+            }
+            prompt = prompt.child(rows);
+        }
+
+        prompt = prompt.child(
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .border_t_1()
+                .border_color(self.colors.border)
+                .px_3()
+                .py_2()
+                .child(
+                    div()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(self.colors.accent)
+                        .child(":"),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .text_color(self.colors.foreground)
+                        .child(format!("{}▏", self.input)),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(self.colors.muted)
+                        .child("↑↓ select · Tab complete · Enter run · Esc cancel"),
+                ),
+        );
+
+        prompt
+    }
+}
+
+#[allow(dead_code)]
+impl NativeSettings {
+    fn slider_set_from_x(&mut self, x: f32, cx: &mut Context<Self>) {
+        let Some(bounds) = self.slider_bounds.get() else {
+            return;
+        };
+        let left = f32::from(bounds.origin.x) + KNOB / 2.0;
+        let span = (f32::from(bounds.size.width) - KNOB).max(1.0);
+        let fraction = ((x - left) / span).clamp(0.0, 1.0);
+        let new_opacity = OPACITY_MIN + fraction * (OPACITY_MAX - OPACITY_MIN);
+        let parent = self.parent.clone();
+        let _ = parent.update(cx, |state, state_cx| {
+            state.set_opacity(new_opacity, false, state_cx);
+        });
+        cx.notify();
+    }
+
+    fn end_slider_drag(&mut self, cx: &mut Context<Self>) {
+        if self.slider_dragging {
+            self.slider_dragging = false;
+            let parent = self.parent.clone();
+            let _ = parent.update(cx, |state, _| {
+                state.save_library();
+            });
+            cx.notify();
+        }
+    }
+}
+
+impl Render for NativeSettings {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let (settings, colors, theme_path, theme_status, is_default) = {
+            let state = self.parent.read(cx);
+            (
+                state.library.settings().clone(),
+                state.colors,
+                state.custom_theme_path.display().to_string(),
+                state.theme_status.clone(),
+                *state.library.settings() == Settings::default(),
+            )
+        };
+        self.colors = colors;
+        let opacity = (colors.widget_opacity + 0.15).clamp(0.70, 0.92);
+
+        let window_opacity = settings.opacity;
+        let theme_name = settings.theme_name.clone();
+        let continuous = settings.continuous;
+        let webcomics = settings.webcomics;
+        let rtl = settings.rtl;
+        let fit = settings.fit;
+        let animate = settings.animate;
+        let grouped = settings.group_series;
+        let fraction = (window_opacity - OPACITY_MIN) / (OPACITY_MAX - OPACITY_MIN);
+        let bounds = self.slider_bounds.clone();
+
+        let track = div()
+            .relative()
+            .w(px(SLIDER_W))
+            .h(px(20.))
+            .cursor_pointer()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                    this.slider_dragging = true;
+                    this.slider_set_from_x(f32::from(event.position.x), cx);
+                }),
+            )
+            .child(
+                canvas(move |area, _, _| bounds.set(Some(area)), |_, _, _, _| {})
+                    .absolute()
+                    .size_full(),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .left(px(KNOB / 2.0))
+                    .top(px(8.))
+                    .w(px(SLIDER_W - KNOB))
+                    .h(px(4.))
+                    .rounded_full()
+                    .bg(colors.border)
+                    .child(
+                        div()
+                            .h_full()
+                            .w(relative(fraction))
+                            .rounded_full()
+                            .bg(colors.accent),
+                    ),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .top(px(2.))
+                    .left(px(fraction * (SLIDER_W - KNOB)))
+                    .size(px(KNOB))
+                    .rounded_full()
+                    .bg(colors.foreground),
+            );
+
+        let current_tab = self.tab;
+        let tab_button = |tab: SettingsTab, label: &'static str, cx: &mut Context<Self>| {
+            let selected = current_tab == tab;
+            let id = match tab {
+                SettingsTab::Appearance => "settings-tab-appearance",
+                SettingsTab::Library => "settings-tab-library",
+                SettingsTab::Reader => "settings-tab-reader",
+                SettingsTab::Keyboard => "settings-tab-keyboard",
+            };
+            panel_button(
+                id,
+                label,
+                if selected {
+                    ButtonKind::Primary
+                } else {
+                    ButtonKind::Normal
+                },
+                colors,
+                true,
+                cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    this.tab = tab;
+                    cx.notify();
+                }),
+            )
+        };
+
+        let appearance_tab = tab_button(SettingsTab::Appearance, "Appearance", cx);
+        let library_tab = tab_button(SettingsTab::Library, "Library", cx);
+        let reader_tab = tab_button(SettingsTab::Reader, "Reader", cx);
+        let keyboard_tab = tab_button(SettingsTab::Keyboard, "Keyboard & Commands", cx);
+
+        let parent = self.parent.clone();
+        let body = match self.tab {
+            SettingsTab::Appearance => {
+                let p1 = parent.clone();
+                let p2 = parent.clone();
+                let p3 = parent.clone();
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .child(div().font_weight(FontWeight::SEMIBOLD).child("Theme"))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_2()
+                            .child(panel_button(
+                                "settings-theme-previous",
+                                "‹",
+                                ButtonKind::Normal,
+                                colors,
+                                true,
+                                cx.listener(move |_, _: &ClickEvent, _, cx| {
+                                    let _ = p1.update(cx, |state, state_cx| {
+                                        state.cycle_theme(-1, state_cx)
+                                    });
+                                    cx.notify();
+                                }),
+                            ))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .text_center()
+                                    .text_color(colors.muted)
+                                    .child(theme_name),
+                            )
+                            .child(panel_button(
+                                "settings-theme-next",
+                                "›",
+                                ButtonKind::Normal,
+                                colors,
+                                true,
+                                cx.listener(move |_, _: &ClickEvent, _, cx| {
+                                    let _ = p2.update(cx, |state, state_cx| {
+                                        state.cycle_theme(1, state_cx)
+                                    });
+                                    cx.notify();
+                                }),
+                            )),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .justify_between()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .text_xs()
+                                    .text_color(colors.muted)
+                                    .truncate()
+                                    .child(theme_path),
+                            )
+                            .child(panel_button(
+                                "settings-theme-reload",
+                                "Reload custom themes",
+                                ButtonKind::Normal,
+                                colors,
+                                true,
+                                cx.listener(move |_, _: &ClickEvent, _, cx| {
+                                    let _ = p3.update(cx, |state, state_cx| {
+                                        state.reload_custom_themes(state_cx)
+                                    });
+                                    cx.notify();
+                                }),
+                            )),
+                    )
+                    .children(
+                        theme_status
+                            .map(|status| div().text_xs().text_color(colors.muted).child(status)),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .justify_between()
+                            .child("Window background opacity")
+                            .child(
+                                div()
+                                    .text_color(colors.muted)
+                                    .child(format!("{}%", (window_opacity * 100.0).round() as u32)),
+                            ),
+                    )
+                    .child(track)
+                    .into_any_element()
+            }
+            SettingsTab::Library => {
+                let p = parent.clone();
+                div().flex().flex_col().gap_3()
+                    .child(div().font_weight(FontWeight::SEMIBOLD).child("Library"))
+                    .child(panel_button("settings-group-series", if grouped { "Folder grouping: On" } else { "Folder grouping: Off" },
+                        if grouped { ButtonKind::Primary } else { ButtonKind::Normal }, colors, true,
+                        cx.listener(move |_, _: &ClickEvent, _, cx| {
+                            let _ = p.update(cx, |state, state_cx| {
+                                state.library.settings_mut().group_series = !state.library.settings().group_series;
+                                state.open_group = None;
+                                state.save_library();
+                                state_cx.notify();
+                            });
+                            cx.notify();
+                        })))
+                    .child(div().text_xs().text_color(colors.muted).child("Group volumes from the same directory into folder cards. A manually assigned series takes precedence; clearing it restores the directory group."))
+                    .into_any_element()
+            }
+            SettingsTab::Reader => {
+                let p1 = parent.clone();
+                let p2 = parent.clone();
+                let p3 = parent.clone();
+                let p4 = parent.clone();
+                let p5 = parent.clone();
+                div().flex().flex_col().gap_3()
+                    .child(div().font_weight(FontWeight::SEMIBOLD).child("Reader"))
+                    .child(panel_button("settings-direction", if rtl { "Reading direction: Right to left" } else { "Reading direction: Left to right" },
+                        if rtl { ButtonKind::Primary } else { ButtonKind::Normal }, colors, true,
+                        cx.listener(move |_, _: &ClickEvent, _, cx| {
+                            let _ = p1.update(cx, |state, state_cx| state.set_direction(!rtl, state_cx));
+                            cx.notify();
+                        })))
+                    .child(panel_button("settings-fit", format!("Page fit: {} (click to cycle)", fit.label()),
+                        ButtonKind::Normal, colors, true,
+                        cx.listener(move |_, _: &ClickEvent, _, cx| {
+                            let _ = p2.update(cx, |state, state_cx| state.set_fit(fit.next(), state_cx));
+                            cx.notify();
+                        })))
+                    .child(panel_button("settings-animations", if animate { "Page animations: On" } else { "Page animations: Off" },
+                        if animate { ButtonKind::Primary } else { ButtonKind::Normal }, colors, true,
+                        cx.listener(move |_, _: &ClickEvent, _, cx| {
+                            let _ = p3.update(cx, |state, state_cx| state.set_animations(None, state_cx));
+                            cx.notify();
+                        })))
+                    .child(panel_button("settings-continuous", if continuous { "Reading mode: Continuous" } else { "Reading mode: Single page" },
+                        if continuous { ButtonKind::Primary } else { ButtonKind::Normal }, colors, true,
+                        cx.listener(move |_, _: &ClickEvent, _, cx| {
+                            let _ = p4.update(cx, |state, state_cx| state.set_continuous(None, state_cx));
+                            cx.notify();
+                        })))
+                    .child(panel_button("settings-webcomics", if webcomics { "Webcomics mode: On" } else { "Webcomics mode: Off" },
+                        if webcomics { ButtonKind::Primary } else { ButtonKind::Normal }, colors, true,
+                        cx.listener(move |_, _: &ClickEvent, _, cx| {
+                            let _ = p5.update(cx, |state, state_cx| state.set_webcomics(None, state_cx));
+                            cx.notify();
+                        })))
+                    .child(div().text_xs().text_color(colors.muted).child("Webcomics mode forces a gapless vertical strip. Turning it off restores the selected single-page or continuous mode."))
+                    .into_any_element()
+            }
+            SettingsTab::Keyboard => {
+                let mut content = div().flex().flex_col().gap_3().child(
+                    div()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child("Keyboard & Commands"),
+                );
+                for (section, rows) in HELP {
+                    let mut group = div().flex().flex_col().gap_1().child(
+                        div()
+                            .text_xs()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(colors.muted)
+                            .child(*section),
+                    );
+                    for (keys, description) in *rows {
+                        group = group.child(
+                            div()
+                                .flex()
+                                .justify_between()
+                                .gap_4()
+                                .child(div().min_w(px(150.)).text_color(colors.accent).child(*keys))
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .text_color(colors.foreground)
+                                        .child(*description),
+                                ),
+                        );
+                    }
+                    content = content.child(group);
+                }
+                content.into_any_element()
+            }
+        };
+
+        let p_reset = parent.clone();
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .justify_between()
+            .p_6()
+            .rounded_xl()
+            .overflow_hidden()
+            .bg(with_alpha(colors.surface, opacity))
+            .border_1()
+            .border_color(colors.border)
+            .shadow_lg()
+            .text_color(colors.foreground)
+            .on_key_down(cx.listener(|_, event: &KeyDownEvent, popup, _| {
+                if event.keystroke.key == "escape" {
+                    popup.remove_window();
+                }
+            }))
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
+                if !this.slider_dragging {
+                    return;
+                }
+                if event.pressed_button == Some(MouseButton::Left) {
+                    this.slider_set_from_x(f32::from(event.position.x), cx);
+                } else {
+                    this.end_slider_drag(cx);
+                }
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseUpEvent, _, cx| this.end_slider_drag(cx)),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_4()
+                    .child(
+                        div()
+                            .text_lg()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child("Settings"),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .gap_2()
+                            .child(appearance_tab)
+                            .child(library_tab)
+                            .child(reader_tab)
+                            .child(keyboard_tab),
+                    )
+                    .child(div().min_h(px(250.)).child(body)),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .justify_end()
+                    .gap_2()
+                    .child(panel_button(
+                        "settings-reset",
+                        "Reset to Defaults",
+                        ButtonKind::Normal,
+                        colors,
+                        !is_default,
+                        cx.listener(move |_, _: &ClickEvent, popup, cx| {
+                            let _ = p_reset.update(cx, |state, state_cx| {
+                                state.request_reset_settings(state_cx);
+                            });
+                            popup.remove_window();
+                        }),
+                    ))
+                    .child(panel_button(
+                        "settings-done",
+                        "Done",
+                        ButtonKind::Primary,
+                        colors,
+                        true,
+                        cx.listener(|_, _: &ClickEvent, popup, _| {
+                            popup.remove_window();
+                        }),
+                    )),
+            )
     }
 }
 
@@ -4656,8 +5699,8 @@ impl Render for Yomu {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _: &MouseDownEvent, _, cx| {
-                    if this.native_context_popup {
-                        this.close_native_context_popup(cx);
+                    if this.native_popup {
+                        this.close_native_popup(cx);
                     }
                     if this.search_active {
                         this.deactivate_search(cx);
@@ -4667,15 +5710,17 @@ impl Render for Yomu {
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(|this, _: &MouseDownEvent, _, cx| {
-                    if this.native_context_popup {
-                        this.close_native_context_popup(cx);
+                    if this.native_popup {
+                        this.close_native_popup(cx);
                     }
                 }),
             )
             .on_action(cx.listener(|_, _: &ToggleFullscreen, window, _| window.toggle_fullscreen()))
             .on_action(cx.listener(|this, _: &ImportFiles, _, cx| this.import_dialog(false, cx)))
             .on_action(cx.listener(|this, _: &ImportFolder, _, cx| this.import_dialog(true, cx)))
-            .on_action(cx.listener(|this, _: &OpenSettings, _, cx| this.open_settings(cx)))
+            .on_action(cx.listener(|this, _: &OpenSettings, window, cx| {
+                this.open_settings_window(window, cx)
+            }))
             .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| {
                 if this.overlay.is_none() {
                     this.import_paths(paths.paths().to_vec(), cx);
@@ -5553,7 +6598,7 @@ mod tests {
         cx.simulate_keystrokes("up");
         assert_eq!(selected(&view, cx), Some(2));
         cx.simulate_keystrokes("end");
-        assert_eq!(selected(&view, cx), Some(7), "Remove from Library is last");
+        assert_eq!(selected(&view, cx), Some(8), "Remove from Library is last");
         cx.simulate_keystrokes("down");
         assert_eq!(selected(&view, cx), Some(0), "wraps around");
 
@@ -6010,6 +7055,7 @@ mod tests {
             menu_labels(&view, cx),
             vec![
                 "Clear Selection".to_string(),
+                "Set Series for Selected Books…".to_string(),
                 "Remove 2 Books from Library".to_string()
             ]
         );

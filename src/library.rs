@@ -179,7 +179,7 @@ impl Default for Settings {
             animate: true,
             continuous: false,
             webcomics: false,
-            group_series: true,
+            group_series: false,
             opacity: OPACITY_MAX,
         }
     }

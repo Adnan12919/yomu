@@ -123,6 +123,10 @@ impl Vim {
         }
     }
 
+    pub fn cancel_cmdline(&mut self) {
+        self.cmd = None;
+    }
+
     /// Text for the small status line shown while something is half-typed (`12`, `g`, `:fit w`).
     pub fn status(&self) -> Option<String> {
         if let Some(cmd) = &self.cmd {

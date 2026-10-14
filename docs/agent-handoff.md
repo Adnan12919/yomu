@@ -85,6 +85,33 @@ Settings uses active Kit themes rather than a Yomu palette. Tabs are open to fut
 - **Default folder grouping in tests:** Library schema version 3 defaults `group_series` to true. When test fixtures place multiple archives in the same temporary directory without distinct parent paths or series tags, they are grouped into a single folder card. Legacy UI tests expecting flat book cards must account for folder grouping or explicitly set `group_series: false`.
 - **Raised surface opacity rule:** All elevated surfaces (dialogs, menus, settings, floating command prompt) use `widget_surface(window_opacity, colors)` to add +10 percentage points of opacity (capped at 1.0) above the main window background.
 
+### 4. Niri Compositor Blur Architecture & Native Popups
+- **Research on Niri & Wayland Blur:**
+  - Niri's `window-rule` configuration (`~/.config/niri/niri/window-rules.kdl`) specifies:
+    ```kdl
+    window-rule {
+        match app-id="yomu"
+        open-maximized true
+        background-effect { blur true }
+        popups {
+            background-effect { blur true }
+        }
+    }
+    ```
+  - Wayland compositors (like Niri via `ext-background-effect`) apply compositor blur strictly per Wayland surface (`wl_surface` / `xdg_popup` / `xdg_toplevel`). In-window elements drawn on the parent window's single framebuffer cannot be blurred by the compositor because the compositor receives only the final composite client texture.
+  - Furthermore, top-level native windows (`xdg_toplevel`) with `app-id="yomu"` are automatically maximized by Niri's `open-maximized true` rule.
+  - Therefore, all floating elements—Context Menu, Hamburger Library Menu, Modal Settings Dialog, and Reader Command Prompt—are implemented as `WindowKind::AnchoredPopup` (`xdg_popup`). Niri positions them as popups without tiling/maximizing and applies authentic background blur behind each surface via its `popups { background-effect { blur true } }` rule.
+- **Consistent Transparency (`popup_surface`):**
+  - All popups use `(widget_opacity + 0.15).clamp(0.70, 0.92)`. This provides a consistent frosted-glass look where the desktop/app underneath is visibly blurred while ensuring high contrast and legibility for text and controls.
+- **Icon Color Consistency:**
+  - All menu icons now match their row text color (`self.colors.foreground` for normal items, `self.colors.danger` for destructive items, `self.colors.muted` for disabled items). The legacy awkward teal pill background (`.bg(with_alpha(self.colors.accent, 0.24))`) has been removed.
+- **Noctalia-Style Hover Border Glow:**
+  - Cards, list rows, suggestions, and menu items feature Noctalia launcher-style hover effects: an accent border ring glow (`with_alpha(colors.accent, 0.70)`) accompanied by subtle accent surface tinting (`with_alpha(colors.accent, 0.20)`).
+- **Click-Outside Dismissal:**
+  - Wayland `grab: true` popups automatically dismiss when clicking outside the application. Inside the application, GPUI renders a transparent occluding scrim in the parent window (`deferred(self.scrim(false, cx))`) while `self.native_popup` is active, intercepting clicks anywhere in the parent window to cleanly close the popup.
+- **Fallbacks:**
+  - Fully functional in-window fallbacks are preserved for non-Wayland platforms and simulated test environments (`#[cfg(test)]`).
+
 ## Build and verification
 
 On the configured NixOS system, use `devenv shell` (or `nix develop`) before launching. Useful commands:
@@ -92,7 +119,7 @@ On the configured NixOS system, use `devenv shell` (or `nix develop`) before lau
 ```sh
 cargo fmt --all -- --check
 cargo check
-cargo test --lib
+cargo test
 ```
 
 The current toolchain minimum is Rust 1.92. UI tests use GPUI's simulated platform; they do not validate actual compositor appearance, window transparency, portals, or Wayland behavior. Report precisely which commands ran and whether a real compositor was used. `cargo test perf_ -- --ignored --nocapture` runs opt-in measurements only.
