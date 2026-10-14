@@ -108,9 +108,20 @@ Settings uses active Kit themes rather than a Yomu palette. Tabs are open to fut
 - **Noctalia-Style Hover Border Glow:**
   - Cards, list rows, suggestions, and menu items feature Noctalia launcher-style hover effects: an accent border ring glow (`with_alpha(colors.accent, 0.70)`) accompanied by subtle accent surface tinting (`with_alpha(colors.accent, 0.20)`).
 - **Click-Outside Dismissal:**
-  - Wayland `grab: true` popups automatically dismiss when clicking outside the application. Inside the application, GPUI renders a transparent occluding scrim in the parent window (`deferred(self.scrim(false, cx))`) while `self.native_popup` is active, intercepting clicks anywhere in the parent window to cleanly close the popup.
+  - Wayland `grab: true` popups automatically dismiss when clicking outside the application. Inside the application, GPUI renders a transparent click-intercepting scrim in the parent window (`deferred(self.scrim(false, cx))`) while `self.native_popup` is active, intercepting clicks anywhere in the parent window to cleanly close the popup.
 - **Fallbacks:**
   - Fully functional in-window fallbacks are preserved for non-Wayland platforms and simulated test environments (`#[cfg(test)]`).
+
+### 5. Settings modal & transparent scrim occlusion fix
+- **Issue:** Clicking "Settings" caused the entire Yomu window to disappear/become completely invisible while `cargo run` continued executing in the background.
+- **Root causes:**
+  1. **`.occlude()` on translucent/transparent full-screen elements:** Calling `.occlude()` on `scrim`, `render_menu`, or `render_library_menu` told GPUI's quad renderer to treat the element's bounding rect as opaque and cull (discard) all scene rendering primitives behind it. Because `scrim` is full-window (`size_full()`) with alpha 0.0 or semi-transparent dimming, `.occlude()` wiped out the entire parent window.
+  2. **Invalid Wayland `xdg_popup` for centered modal dialogs:** An experimental attempt to make Settings an `AnchoredPopup` with `PopupAnchor::Center, PopupGravity::Center, grab: true` broke Wayland positioner constraints in tiling compositors like Niri, caused surfaces to fail to map, and caused re-entrant GPUI `Context` borrow panics (`cannot read yomu::Yomu while it is already being updated`).
+- **Fix:**
+  - Removed `.occlude()` from `scrim`, `render_menu`, and `render_library_menu`. Event intercepting (`on_mouse_down`) is handled via event propagation without quad occlusion.
+  - Removed the broken `NativeSettings` struct and `open_native_settings` popup logic (~520 lines of duplicate code).
+  - Restored `open_settings` and `open_settings_window` to activate the native `Overlay::Settings` in-window modal dialog, closing any active popups and notifying `Context`.
+  - Preserved the full in-window Settings dialog with its 4 tabs, live opacity slider, theme cycler, keyboard shortcuts, and animations.
 
 ## Build and verification
 

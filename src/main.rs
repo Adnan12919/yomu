@@ -20,6 +20,7 @@ use gpui_kit::component::{Disableable, Sizable};
 use gpui_kit::component::{Theme as KitTheme, ThemeConfig, ThemeRegistry};
 #[allow(unused_imports)]
 use gpui_kit::popup::{PopupAnchor, PopupConstraintAdjustment, PopupGravity, PopupOptions};
+#[allow(unused_imports)]
 use gpui_kit::{
     Anchor, Animation, AnimationExt, AnyElement, AnyWindowHandle, App, Bounds, ClickEvent, Context,
     Entity, ExternalPaths, FocusHandle, FontWeight, KeyBinding, KeyDownEvent, MouseButton,
@@ -673,17 +674,6 @@ struct NativeLibraryMenu {
     colors: UiColors,
     selected: Option<usize>,
     grouped: bool,
-    _release_subscription: Option<Subscription>,
-}
-
-#[allow(dead_code)]
-struct NativeSettings {
-    parent: Entity<Yomu>,
-    _parent_window: AnyWindowHandle,
-    colors: UiColors,
-    tab: SettingsTab,
-    slider_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
-    slider_dragging: bool,
     _release_subscription: Option<Subscription>,
 }
 
@@ -1375,6 +1365,9 @@ impl Yomu {
     // ------------------------------------------------------------------------------------
 
     fn open_settings(&mut self, cx: &mut Context<Self>) {
+        if self.native_popup {
+            self.close_native_popup(cx);
+        }
         match self.overlay {
             None => self.overlay = Some(Overlay::Settings),
             Some(Overlay::Settings) => self.close_overlay(cx),
@@ -1383,17 +1376,8 @@ impl Yomu {
         cx.notify();
     }
 
-    fn open_settings_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.native_popup || matches!(self.overlay, Some(Overlay::Settings)) {
-            self.close_overlay(cx);
-            return;
-        }
-        self.overlay = Some(Overlay::Settings);
-        #[cfg(not(test))]
-        if self.open_native_settings(window, cx) {
-            return;
-        }
-        cx.notify();
+    fn open_settings_window(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        self.open_settings(cx);
     }
 
     fn request_reset_settings(&mut self, cx: &mut Context<Self>) {
@@ -1847,7 +1831,7 @@ impl Yomu {
         &mut self,
         id: &str,
         position: Point<Pixels>,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if self.native_popup {
@@ -1870,7 +1854,7 @@ impl Yomu {
         };
         self.overlay = Some(Overlay::Menu(menu.clone()));
         #[cfg(not(test))]
-        if self.open_native_context_popup(menu, window, cx) {
+        if self.open_native_context_popup(menu, _window, cx) {
             return;
         }
         self.native_popup = false;
@@ -1926,7 +1910,8 @@ impl Yomu {
 
         self.native_popup = true;
         let colors = self.colors;
-        let opened = cx.open_window(options, move |_, cx| {
+        let opened = cx.open_window(options, move |popup_window, cx| {
+            let this_window = popup_window.window_handle();
             cx.new(|cx| {
                 let mut popup = NativeBookMenu {
                     parent: parent.clone(),
@@ -1939,8 +1924,10 @@ impl Yomu {
                 let parent = parent.clone();
                 popup._release_subscription = Some(cx.on_release(move |_, app| {
                     let _ = parent.update(app, |state, cx| {
-                        state.native_popup = false;
-                        state.native_popup_window = None;
+                        if state.native_popup_window == Some(this_window) {
+                            state.native_popup = false;
+                            state.native_popup_window = None;
+                        }
                         if matches!(state.overlay, Some(Overlay::Menu(_))) {
                             state.dismiss();
                         }
@@ -1965,13 +1952,13 @@ impl Yomu {
         }
     }
 
-    fn open_library_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn open_library_menu(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         if self.native_popup {
             self.close_native_popup(cx);
         }
         self.overlay = Some(Overlay::LibraryMenu(LibraryMenu::default()));
         #[cfg(not(test))]
-        if self.open_native_library_menu(window, cx) {
+        if self.open_native_library_menu(_window, cx) {
             return;
         }
         self.native_popup = false;
@@ -1983,8 +1970,8 @@ impl Yomu {
         let parent_window = window.window_handle();
         let parent = cx.entity();
         let window_size = window.viewport_size();
-        let width = 270.0;
-        let height = 240.0;
+        let width = 300.0;
+        let height = 340.0;
 
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(Bounds {
@@ -1997,8 +1984,8 @@ impl Yomu {
             kind: WindowKind::AnchoredPopup(PopupOptions {
                 parent: parent_window,
                 anchor_rect: Bounds {
-                    origin: point(window_size.width - px(288.0), px(48.0)),
-                    size: size(px(width), px(1.0)),
+                    origin: point(window_size.width - px(24.0), px(56.0)),
+                    size: size(px(1.0), px(1.0)),
                 },
                 anchor: PopupAnchor::TopRight,
                 gravity: PopupGravity::BottomLeft,
@@ -2015,7 +2002,8 @@ impl Yomu {
         self.native_popup = true;
         let colors = self.colors;
         let grouped = self.library.settings().group_series;
-        let opened = cx.open_window(options, move |_, cx| {
+        let opened = cx.open_window(options, move |popup_window, cx| {
+            let this_window = popup_window.window_handle();
             cx.new(|cx| {
                 let mut popup = NativeLibraryMenu {
                     parent: parent.clone(),
@@ -2028,8 +2016,10 @@ impl Yomu {
                 let parent = parent.clone();
                 popup._release_subscription = Some(cx.on_release(move |_, app| {
                     let _ = parent.update(app, |state, cx| {
-                        state.native_popup = false;
-                        state.native_popup_window = None;
+                        if state.native_popup_window == Some(this_window) {
+                            state.native_popup = false;
+                            state.native_popup_window = None;
+                        }
                         if matches!(state.overlay, Some(Overlay::LibraryMenu(_))) {
                             state.dismiss();
                         }
@@ -2047,82 +2037,6 @@ impl Yomu {
             }
             Err(error) => {
                 eprintln!("yomu: native library menu unavailable; using in-window menu: {error:#}");
-                self.native_popup = false;
-                false
-            }
-        }
-    }
-
-    #[cfg(not(test))]
-    fn open_native_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        let parent_window = window.window_handle();
-        let parent = cx.entity();
-        let colors = self.colors;
-        let window_size = window.viewport_size();
-        let width = 640.0;
-        let height = 520.0;
-
-        let options = WindowOptions {
-            window_bounds: Some(WindowBounds::Windowed(Bounds {
-                origin: point(px(0.), px(0.)),
-                size: size(px(width), px(height)),
-            })),
-            titlebar: None,
-            focus: true,
-            show: true,
-            kind: WindowKind::AnchoredPopup(PopupOptions {
-                parent: parent_window,
-                anchor_rect: Bounds {
-                    origin: point(window_size.width / 2.0, window_size.height / 2.0),
-                    size: size(px(1.0), px(1.0)),
-                },
-                anchor: PopupAnchor::Center,
-                gravity: PopupGravity::Center,
-                constraint_adjustment: PopupConstraintAdjustment::all(),
-                offset: point(px(0.), px(0.)),
-                grab: true,
-            }),
-            is_resizable: false,
-            is_movable: false,
-            window_background: WindowBackgroundAppearance::Transparent,
-            ..Default::default()
-        };
-
-        self.native_popup = true;
-        let opened = cx.open_window(options, move |_, cx| {
-            cx.new(|cx| {
-                let mut popup = NativeSettings {
-                    parent: parent.clone(),
-                    _parent_window: parent_window,
-                    colors,
-                    tab: SettingsTab::Appearance,
-                    slider_bounds: Rc::new(Cell::new(None)),
-                    slider_dragging: false,
-                    _release_subscription: None,
-                };
-                let parent = parent.clone();
-                popup._release_subscription = Some(cx.on_release(move |_, app| {
-                    let _ = parent.update(app, |state, cx| {
-                        state.native_popup = false;
-                        state.native_popup_window = None;
-                        if matches!(state.overlay, Some(Overlay::Settings)) {
-                            state.dismiss();
-                        }
-                        state.save_library();
-                        cx.notify();
-                    });
-                }));
-                popup
-            })
-        });
-
-        match opened {
-            Ok(handle) => {
-                self.native_popup_window = Some(handle.into());
-                true
-            }
-            Err(error) => {
-                eprintln!("yomu: native settings unavailable; using in-window dialog: {error:#}");
                 self.native_popup = false;
                 false
             }
@@ -2303,9 +2217,12 @@ impl Yomu {
                 self.selection.select_all(&order);
                 cx.notify();
             }
-            "escape" => {
+            "escape" | "backspace" => {
                 if !self.selection.is_empty() {
                     self.selection.clear();
+                    cx.notify();
+                } else if self.open_group.is_some() {
+                    self.open_group = None;
                     cx.notify();
                 }
             }
@@ -3079,7 +2996,7 @@ impl Yomu {
                 }
             }
             Action::ToggleFullscreen => window.toggle_fullscreen(),
-            Action::OpenSettings => self.open_settings(cx),
+            Action::OpenSettings => self.open_settings_window(window, cx),
             Action::CloseBook => self.close_book(window, cx),
             Action::QuitApp => cx.quit(),
             Action::Message(text) => self.show_hud(text, cx),
@@ -3370,7 +3287,6 @@ impl Yomu {
                     0.0
                 },
             ))
-            .occlude()
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _: &MouseDownEvent, _, cx| this.close_overlay(cx)),
@@ -3421,7 +3337,6 @@ impl Yomu {
                 .top_0()
                 .left_0()
                 .size_full()
-                .occlude()
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|this, _: &MouseDownEvent, _, cx| this.close_overlay(cx)),
@@ -3539,7 +3454,6 @@ impl Yomu {
                 .top_0()
                 .left_0()
                 .size_full()
-                .occlude()
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|this, _: &MouseDownEvent, _, cx| this.close_overlay(cx)),
@@ -5014,12 +4928,12 @@ impl Render for NativeLibraryMenu {
                     }
                 }))
                 .on_click(cx.listener(move |_, _: &ClickEvent, popup, cx| {
+                    popup.remove_window();
                     let _ = cx.update_window(parent_window, |_, main_window, app| {
                         let _ = parent.update(app, |state, state_cx| {
                             state.run_library_menu_action(index, main_window, state_cx);
                         });
                     });
-                    popup.remove_window();
                 }));
             list = list.child(row);
         }
@@ -5234,417 +5148,6 @@ impl Render for NativeCommandPrompt {
         );
 
         prompt
-    }
-}
-
-#[allow(dead_code)]
-impl NativeSettings {
-    fn slider_set_from_x(&mut self, x: f32, cx: &mut Context<Self>) {
-        let Some(bounds) = self.slider_bounds.get() else {
-            return;
-        };
-        let left = f32::from(bounds.origin.x) + KNOB / 2.0;
-        let span = (f32::from(bounds.size.width) - KNOB).max(1.0);
-        let fraction = ((x - left) / span).clamp(0.0, 1.0);
-        let new_opacity = OPACITY_MIN + fraction * (OPACITY_MAX - OPACITY_MIN);
-        let parent = self.parent.clone();
-        let _ = parent.update(cx, |state, state_cx| {
-            state.set_opacity(new_opacity, false, state_cx);
-        });
-        cx.notify();
-    }
-
-    fn end_slider_drag(&mut self, cx: &mut Context<Self>) {
-        if self.slider_dragging {
-            self.slider_dragging = false;
-            let parent = self.parent.clone();
-            let _ = parent.update(cx, |state, _| {
-                state.save_library();
-            });
-            cx.notify();
-        }
-    }
-}
-
-impl Render for NativeSettings {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let (settings, colors, theme_path, theme_status, is_default) = {
-            let state = self.parent.read(cx);
-            (
-                state.library.settings().clone(),
-                state.colors,
-                state.custom_theme_path.display().to_string(),
-                state.theme_status.clone(),
-                *state.library.settings() == Settings::default(),
-            )
-        };
-        self.colors = colors;
-        let opacity = (colors.widget_opacity + 0.15).clamp(0.70, 0.92);
-
-        let window_opacity = settings.opacity;
-        let theme_name = settings.theme_name.clone();
-        let continuous = settings.continuous;
-        let webcomics = settings.webcomics;
-        let rtl = settings.rtl;
-        let fit = settings.fit;
-        let animate = settings.animate;
-        let grouped = settings.group_series;
-        let fraction = (window_opacity - OPACITY_MIN) / (OPACITY_MAX - OPACITY_MIN);
-        let bounds = self.slider_bounds.clone();
-
-        let track = div()
-            .relative()
-            .w(px(SLIDER_W))
-            .h(px(20.))
-            .cursor_pointer()
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, event: &MouseDownEvent, _, cx| {
-                    this.slider_dragging = true;
-                    this.slider_set_from_x(f32::from(event.position.x), cx);
-                }),
-            )
-            .child(
-                canvas(move |area, _, _| bounds.set(Some(area)), |_, _, _, _| {})
-                    .absolute()
-                    .size_full(),
-            )
-            .child(
-                div()
-                    .absolute()
-                    .left(px(KNOB / 2.0))
-                    .top(px(8.))
-                    .w(px(SLIDER_W - KNOB))
-                    .h(px(4.))
-                    .rounded_full()
-                    .bg(colors.border)
-                    .child(
-                        div()
-                            .h_full()
-                            .w(relative(fraction))
-                            .rounded_full()
-                            .bg(colors.accent),
-                    ),
-            )
-            .child(
-                div()
-                    .absolute()
-                    .top(px(2.))
-                    .left(px(fraction * (SLIDER_W - KNOB)))
-                    .size(px(KNOB))
-                    .rounded_full()
-                    .bg(colors.foreground),
-            );
-
-        let current_tab = self.tab;
-        let tab_button = |tab: SettingsTab, label: &'static str, cx: &mut Context<Self>| {
-            let selected = current_tab == tab;
-            let id = match tab {
-                SettingsTab::Appearance => "settings-tab-appearance",
-                SettingsTab::Library => "settings-tab-library",
-                SettingsTab::Reader => "settings-tab-reader",
-                SettingsTab::Keyboard => "settings-tab-keyboard",
-            };
-            panel_button(
-                id,
-                label,
-                if selected {
-                    ButtonKind::Primary
-                } else {
-                    ButtonKind::Normal
-                },
-                colors,
-                true,
-                cx.listener(move |this, _: &ClickEvent, _, cx| {
-                    this.tab = tab;
-                    cx.notify();
-                }),
-            )
-        };
-
-        let appearance_tab = tab_button(SettingsTab::Appearance, "Appearance", cx);
-        let library_tab = tab_button(SettingsTab::Library, "Library", cx);
-        let reader_tab = tab_button(SettingsTab::Reader, "Reader", cx);
-        let keyboard_tab = tab_button(SettingsTab::Keyboard, "Keyboard & Commands", cx);
-
-        let parent = self.parent.clone();
-        let body = match self.tab {
-            SettingsTab::Appearance => {
-                let p1 = parent.clone();
-                let p2 = parent.clone();
-                let p3 = parent.clone();
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_3()
-                    .child(div().font_weight(FontWeight::SEMIBOLD).child("Theme"))
-                    .child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap_2()
-                            .child(panel_button(
-                                "settings-theme-previous",
-                                "‹",
-                                ButtonKind::Normal,
-                                colors,
-                                true,
-                                cx.listener(move |_, _: &ClickEvent, _, cx| {
-                                    let _ = p1.update(cx, |state, state_cx| {
-                                        state.cycle_theme(-1, state_cx)
-                                    });
-                                    cx.notify();
-                                }),
-                            ))
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .text_center()
-                                    .text_color(colors.muted)
-                                    .child(theme_name),
-                            )
-                            .child(panel_button(
-                                "settings-theme-next",
-                                "›",
-                                ButtonKind::Normal,
-                                colors,
-                                true,
-                                cx.listener(move |_, _: &ClickEvent, _, cx| {
-                                    let _ = p2.update(cx, |state, state_cx| {
-                                        state.cycle_theme(1, state_cx)
-                                    });
-                                    cx.notify();
-                                }),
-                            )),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .justify_between()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .min_w_0()
-                                    .text_xs()
-                                    .text_color(colors.muted)
-                                    .truncate()
-                                    .child(theme_path),
-                            )
-                            .child(panel_button(
-                                "settings-theme-reload",
-                                "Reload custom themes",
-                                ButtonKind::Normal,
-                                colors,
-                                true,
-                                cx.listener(move |_, _: &ClickEvent, _, cx| {
-                                    let _ = p3.update(cx, |state, state_cx| {
-                                        state.reload_custom_themes(state_cx)
-                                    });
-                                    cx.notify();
-                                }),
-                            )),
-                    )
-                    .children(
-                        theme_status
-                            .map(|status| div().text_xs().text_color(colors.muted).child(status)),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .justify_between()
-                            .child("Window background opacity")
-                            .child(
-                                div()
-                                    .text_color(colors.muted)
-                                    .child(format!("{}%", (window_opacity * 100.0).round() as u32)),
-                            ),
-                    )
-                    .child(track)
-                    .into_any_element()
-            }
-            SettingsTab::Library => {
-                let p = parent.clone();
-                div().flex().flex_col().gap_3()
-                    .child(div().font_weight(FontWeight::SEMIBOLD).child("Library"))
-                    .child(panel_button("settings-group-series", if grouped { "Folder grouping: On" } else { "Folder grouping: Off" },
-                        if grouped { ButtonKind::Primary } else { ButtonKind::Normal }, colors, true,
-                        cx.listener(move |_, _: &ClickEvent, _, cx| {
-                            let _ = p.update(cx, |state, state_cx| {
-                                state.library.settings_mut().group_series = !state.library.settings().group_series;
-                                state.open_group = None;
-                                state.save_library();
-                                state_cx.notify();
-                            });
-                            cx.notify();
-                        })))
-                    .child(div().text_xs().text_color(colors.muted).child("Group volumes from the same directory into folder cards. A manually assigned series takes precedence; clearing it restores the directory group."))
-                    .into_any_element()
-            }
-            SettingsTab::Reader => {
-                let p1 = parent.clone();
-                let p2 = parent.clone();
-                let p3 = parent.clone();
-                let p4 = parent.clone();
-                let p5 = parent.clone();
-                div().flex().flex_col().gap_3()
-                    .child(div().font_weight(FontWeight::SEMIBOLD).child("Reader"))
-                    .child(panel_button("settings-direction", if rtl { "Reading direction: Right to left" } else { "Reading direction: Left to right" },
-                        if rtl { ButtonKind::Primary } else { ButtonKind::Normal }, colors, true,
-                        cx.listener(move |_, _: &ClickEvent, _, cx| {
-                            let _ = p1.update(cx, |state, state_cx| state.set_direction(!rtl, state_cx));
-                            cx.notify();
-                        })))
-                    .child(panel_button("settings-fit", format!("Page fit: {} (click to cycle)", fit.label()),
-                        ButtonKind::Normal, colors, true,
-                        cx.listener(move |_, _: &ClickEvent, _, cx| {
-                            let _ = p2.update(cx, |state, state_cx| state.set_fit(fit.next(), state_cx));
-                            cx.notify();
-                        })))
-                    .child(panel_button("settings-animations", if animate { "Page animations: On" } else { "Page animations: Off" },
-                        if animate { ButtonKind::Primary } else { ButtonKind::Normal }, colors, true,
-                        cx.listener(move |_, _: &ClickEvent, _, cx| {
-                            let _ = p3.update(cx, |state, state_cx| state.set_animations(None, state_cx));
-                            cx.notify();
-                        })))
-                    .child(panel_button("settings-continuous", if continuous { "Reading mode: Continuous" } else { "Reading mode: Single page" },
-                        if continuous { ButtonKind::Primary } else { ButtonKind::Normal }, colors, true,
-                        cx.listener(move |_, _: &ClickEvent, _, cx| {
-                            let _ = p4.update(cx, |state, state_cx| state.set_continuous(None, state_cx));
-                            cx.notify();
-                        })))
-                    .child(panel_button("settings-webcomics", if webcomics { "Webcomics mode: On" } else { "Webcomics mode: Off" },
-                        if webcomics { ButtonKind::Primary } else { ButtonKind::Normal }, colors, true,
-                        cx.listener(move |_, _: &ClickEvent, _, cx| {
-                            let _ = p5.update(cx, |state, state_cx| state.set_webcomics(None, state_cx));
-                            cx.notify();
-                        })))
-                    .child(div().text_xs().text_color(colors.muted).child("Webcomics mode forces a gapless vertical strip. Turning it off restores the selected single-page or continuous mode."))
-                    .into_any_element()
-            }
-            SettingsTab::Keyboard => {
-                let mut content = div().flex().flex_col().gap_3().child(
-                    div()
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .child("Keyboard & Commands"),
-                );
-                for (section, rows) in HELP {
-                    let mut group = div().flex().flex_col().gap_1().child(
-                        div()
-                            .text_xs()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(colors.muted)
-                            .child(*section),
-                    );
-                    for (keys, description) in *rows {
-                        group = group.child(
-                            div()
-                                .flex()
-                                .justify_between()
-                                .gap_4()
-                                .child(div().min_w(px(150.)).text_color(colors.accent).child(*keys))
-                                .child(
-                                    div()
-                                        .flex_1()
-                                        .text_color(colors.foreground)
-                                        .child(*description),
-                                ),
-                        );
-                    }
-                    content = content.child(group);
-                }
-                content.into_any_element()
-            }
-        };
-
-        let p_reset = parent.clone();
-        div()
-            .size_full()
-            .flex()
-            .flex_col()
-            .justify_between()
-            .p_6()
-            .rounded_xl()
-            .overflow_hidden()
-            .bg(with_alpha(colors.surface, opacity))
-            .border_1()
-            .border_color(colors.border)
-            .shadow_lg()
-            .text_color(colors.foreground)
-            .on_key_down(cx.listener(|_, event: &KeyDownEvent, popup, _| {
-                if event.keystroke.key == "escape" {
-                    popup.remove_window();
-                }
-            }))
-            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
-                if !this.slider_dragging {
-                    return;
-                }
-                if event.pressed_button == Some(MouseButton::Left) {
-                    this.slider_set_from_x(f32::from(event.position.x), cx);
-                } else {
-                    this.end_slider_drag(cx);
-                }
-            }))
-            .on_mouse_up(
-                MouseButton::Left,
-                cx.listener(|this, _: &MouseUpEvent, _, cx| this.end_slider_drag(cx)),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_4()
-                    .child(
-                        div()
-                            .text_lg()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child("Settings"),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .gap_2()
-                            .child(appearance_tab)
-                            .child(library_tab)
-                            .child(reader_tab)
-                            .child(keyboard_tab),
-                    )
-                    .child(div().min_h(px(250.)).child(body)),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .justify_end()
-                    .gap_2()
-                    .child(panel_button(
-                        "settings-reset",
-                        "Reset to Defaults",
-                        ButtonKind::Normal,
-                        colors,
-                        !is_default,
-                        cx.listener(move |_, _: &ClickEvent, popup, cx| {
-                            let _ = p_reset.update(cx, |state, state_cx| {
-                                state.request_reset_settings(state_cx);
-                            });
-                            popup.remove_window();
-                        }),
-                    ))
-                    .child(panel_button(
-                        "settings-done",
-                        "Done",
-                        ButtonKind::Primary,
-                        colors,
-                        true,
-                        cx.listener(|_, _: &ClickEvent, popup, _| {
-                            popup.remove_window();
-                        }),
-                    )),
-            )
     }
 }
 
@@ -6943,6 +6446,37 @@ mod tests {
             reading(&view, cx),
             None,
             "escape in the library does nothing else"
+        );
+    }
+
+    #[gpui_kit::test]
+    fn escape_and_backspace_exit_open_group(cx: &mut TestAppContext) {
+        let fx = fixture("opengroup");
+        let (view, cx) = launch(&fx, cx);
+
+        view.update(cx, |this, _| {
+            this.open_group = Some("series:test".into());
+        });
+        assert_eq!(
+            view.read_with(cx, |this, _| this.open_group.clone()),
+            Some("series:test".into())
+        );
+
+        cx.simulate_keystrokes("escape");
+        assert_eq!(
+            view.read_with(cx, |this, _| this.open_group.clone()),
+            None,
+            "escape exits open group"
+        );
+
+        view.update(cx, |this, _| {
+            this.open_group = Some("series:test".into());
+        });
+        cx.simulate_keystrokes("backspace");
+        assert_eq!(
+            view.read_with(cx, |this, _| this.open_group.clone()),
+            None,
+            "backspace exits open group"
         );
     }
 
