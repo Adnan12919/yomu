@@ -123,6 +123,15 @@ Settings uses active Kit themes rather than a Yomu palette. Tabs are open to fut
   - Restored `open_settings` and `open_settings_window` to activate the native `Overlay::Settings` in-window modal dialog, closing any active popups and notifying `Context`.
   - Preserved the full in-window Settings dialog with its 4 tabs, live opacity slider, theme cycler, keyboard shortcuts, and animations.
 
+### 6. Cross-platform uniformity & removal of native popup hacks and background opacity
+- **Context & Motivation:** Attempting to force menus, dialogs, and the command prompt into separate native Wayland `xdg_popup` child windows created severe platform coupling, compositor positioner rejections, focus stealing issues, and broke cross-platform parity on macOS and Windows (where `AnchoredPopup` is either unsupported or behaves inconsistently). Furthermore, compositor-level blur cannot be uniformly controlled across Linux, macOS, and Windows until upstream GPUI Kit natively supports standard blur protocols (such as `ext-background-effects-v1`).
+- **Changes made:**
+  1. **Removed all native child window popup hacks:** Excised `NativeBookMenu`, `NativeLibraryMenu`, `NativeCommandPrompt`, and their corresponding multi-window open/close orchestration (~1000 lines of complex duplicate code removed).
+  2. **Unified in-window overlays:** All context menus (`Overlay::Menu`), library hamburger menus (`Overlay::LibraryMenu`), dialogs (Properties, Series, Confirmation, Settings), and the floating reader command prompt (`vim_status`) are rendered as clean, high-performance in-window GPUI elements. They behave identically across Linux (Wayland & X11), macOS, and Windows.
+  3. **Locked window to fully opaque:** Window is created with `WindowBackgroundAppearance::Opaque`, removing background translucency hacks and compositor alpha blending quirks. The background opacity slider and related drag math were completely removed from the Appearance settings tab.
+  4. **Removed context menu separator line:** Separators inside `render_menu` were removed for a sleek, cohesive look matching the Noctalia design language.
+  5. **Updated test suite:** Replaced obsolete opacity slider tests with `window_appearance_is_always_opaque`, verifying all 138 unit and UI tests pass cleanly.
+
 ## Build and verification
 
 On the configured NixOS system, use `devenv shell` (or `nix develop`) before launching. Useful commands:

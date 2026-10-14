@@ -1,7 +1,6 @@
 //! yomu: a minimal, GPU-accelerated, Wayland-native manga reader.
 
 use std::{
-    cell::Cell,
     collections::{HashMap, HashSet},
     fs,
     hash::{Hash, Hasher},
@@ -36,7 +35,7 @@ use yomu::{
     archive::{self, SourceKind},
     imaging,
     layout::{self, Arrive, FitMode, Viewport},
-    library::{self, Book, DataDirs, Library, OPACITY_MAX, OPACITY_MIN, Settings},
+    library::{self, Book, DataDirs, Library, Settings},
     menu::{self, BookAction, Entry, Item},
     motion::{self, PageTransition},
     pagecache, search,
@@ -322,10 +321,6 @@ const DRAG_THRESHOLD: f32 = 4.0;
 const HUD_SECS: u64 = 2;
 
 const MENU_W: f32 = 224.0;
-const SLIDER_W: f32 = 280.0;
-const KNOB: f32 = 16.0;
-/// One arrow-key press moves the opacity slider this much.
-const OPACITY_STEP: f32 = 0.05;
 /// Clicks this soon after a menu or dialog closes are ignored, so double-clicking a menu item
 /// cannot also click the book underneath it.
 const CLICK_GUARD: Duration = Duration::from_millis(300);
@@ -657,36 +652,6 @@ struct BookMenu {
     selected: Option<usize>,
 }
 
-#[allow(dead_code)]
-struct NativeBookMenu {
-    parent: Entity<Yomu>,
-    parent_window: AnyWindowHandle,
-    menu: BookMenu,
-    colors: UiColors,
-    selected: Option<usize>,
-    _release_subscription: Option<Subscription>,
-}
-
-#[allow(dead_code)]
-struct NativeLibraryMenu {
-    parent: Entity<Yomu>,
-    parent_window: AnyWindowHandle,
-    colors: UiColors,
-    selected: Option<usize>,
-    grouped: bool,
-    _release_subscription: Option<Subscription>,
-}
-
-#[allow(dead_code)]
-struct NativeCommandPrompt {
-    parent: Entity<Yomu>,
-    parent_window: AnyWindowHandle,
-    colors: UiColors,
-    input: String,
-    selection: usize,
-    _release_subscription: Option<Subscription>,
-}
-
 enum ConfirmAction {
     Book(BookAction, String),
     RemoveSelected,
@@ -732,12 +697,6 @@ enum SettingsTab {
     Library,
     Reader,
     Keyboard,
-}
-
-struct Slider {
-    /// Where the track was last painted, so mouse positions can be turned into a value.
-    bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
-    dragging: bool,
 }
 
 struct LibraryGroup<'a> {
@@ -839,9 +798,6 @@ struct Yomu {
     #[cfg(test)]
     frame_dt: Option<f32>,
     overlay: Option<Overlay>,
-    /// True when a menu, dialog or prompt is an independent xdg_popup window.
-    native_popup: bool,
-    native_popup_window: Option<AnyWindowHandle>,
     settings_tab: SettingsTab,
     command_selection: usize,
     overlay_closed_at: Option<Instant>,
@@ -853,7 +809,6 @@ struct Yomu {
     search_caret_visible: bool,
     search_blink_seq: u64,
     open_group: Option<String>,
-    slider: Slider,
     /// Which background appearance the window currently has (`None` before the first frame).
     applied_opaque: Option<bool>,
 }
@@ -932,8 +887,6 @@ impl Yomu {
             #[cfg(test)]
             frame_dt: None,
             overlay: None,
-            native_popup: false,
-            native_popup_window: None,
             settings_tab: SettingsTab::Appearance,
             command_selection: 0,
             overlay_closed_at: None,
@@ -943,10 +896,6 @@ impl Yomu {
             search_caret_visible: false,
             search_blink_seq: 0,
             open_group: None,
-            slider: Slider {
-                bounds: Rc::new(Cell::new(None)),
-                dragging: false,
-            },
             applied_opaque: None,
         };
 
@@ -1123,35 +1072,18 @@ impl Yomu {
         if self.overlay.take().is_some() {
             self.overlay_closed_at = Some(Instant::now());
         }
-        self.slider.dragging = false;
     }
 
     /// Escape / click outside. Cancelling the "reset settings?" question goes back to Settings.
     fn close_overlay(&mut self, cx: &mut Context<Self>) {
-        self.close_native_popup(cx);
         let back_to_settings = matches!(
             &self.overlay,
             Some(Overlay::Confirm(dialog)) if matches!(dialog.action, ConfirmAction::ResetSettings)
         );
-        let was_dragging = self.slider.dragging;
         self.dismiss();
-        if was_dragging {
-            self.save_library();
-        }
         if back_to_settings {
             self.overlay = Some(Overlay::Settings);
         }
-        cx.notify();
-    }
-
-    fn close_native_popup(&mut self, cx: &mut Context<Self>) {
-        let Some(popup) = self.native_popup_window.take() else {
-            self.native_popup = false;
-            return;
-        };
-        let _ = cx.update_window(popup, |_, window, _| window.remove_window());
-        self.native_popup = false;
-        self.dismiss();
         cx.notify();
     }
 
@@ -1365,9 +1297,6 @@ impl Yomu {
     // ------------------------------------------------------------------------------------
 
     fn open_settings(&mut self, cx: &mut Context<Self>) {
-        if self.native_popup {
-            self.close_native_popup(cx);
-        }
         match self.overlay {
             None => self.overlay = Some(Overlay::Settings),
             Some(Overlay::Settings) => self.close_overlay(cx),
@@ -1407,7 +1336,6 @@ impl Yomu {
             reader.arrive = Some(Arrive::Start);
         }
         self.save_library();
-        self.slider.dragging = false;
         self.overlay = Some(Overlay::Settings);
         cx.notify();
     }
@@ -1482,55 +1410,15 @@ impl Yomu {
         cx.notify();
     }
 
-    fn set_opacity(&mut self, value: f32, persist: bool, cx: &mut Context<Self>) {
-        self.library.settings_mut().set_opacity(value);
-        self.colors.widget_opacity = self.library.settings().opacity;
-        if persist {
-            self.save_library();
-        }
-        cx.notify();
-    }
-
-    /// Turn a mouse x position into an opacity, accounting for the knob's width.
-    fn slider_set_from_x(&mut self, x: f32, cx: &mut Context<Self>) {
-        let Some(bounds) = self.slider.bounds.get() else {
-            return;
-        };
-        let left = f32::from(bounds.origin.x) + KNOB / 2.0;
-        let span = (f32::from(bounds.size.width) - KNOB).max(1.0);
-        let fraction = ((x - left) / span).clamp(0.0, 1.0);
-        self.set_opacity(
-            OPACITY_MIN + fraction * (OPACITY_MAX - OPACITY_MIN),
-            false,
-            cx,
-        );
-    }
-
-    /// Save once when a drag ends instead of on every mouse move.
-    fn end_slider_drag(&mut self, cx: &mut Context<Self>) {
-        if self.slider.dragging {
-            self.slider.dragging = false;
-            self.save_library();
-            cx.notify();
-        }
-    }
-
     /// Fully opaque windows use the opaque appearance, which lets the compositor skip blending;
     /// anything lower needs real alpha transparency.
     fn sync_appearance(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let opaque = self.library.settings().opacity >= OPACITY_MAX - 0.001;
-        if self.applied_opaque == Some(opaque) {
+        if self.applied_opaque == Some(true) {
             return;
         }
-        self.applied_opaque = Some(opaque);
-        let appearance = if opaque {
-            WindowBackgroundAppearance::Opaque
-        } else {
-            WindowBackgroundAppearance::Transparent
-        };
-        // Reconfiguring the surface mid-draw is not safe, so do it right after this frame.
+        self.applied_opaque = Some(true);
         window.defer(cx, move |window, _| {
-            window.set_background_appearance(appearance)
+            window.set_background_appearance(WindowBackgroundAppearance::Opaque)
         });
     }
 
@@ -1605,18 +1493,8 @@ impl Yomu {
             }
             Some(Overlay::Series(_)) => {}
             Some(Overlay::Settings) => {
-                let current = self.library.settings().opacity;
-                match token {
-                    "escape" | "enter" | "q" => self.close_overlay(cx),
-                    "left" | "h" | "down" | "j" => {
-                        self.set_opacity(current - OPACITY_STEP, true, cx)
-                    }
-                    "right" | "l" | "up" | "k" => {
-                        self.set_opacity(current + OPACITY_STEP, true, cx)
-                    }
-                    "home" => self.set_opacity(OPACITY_MIN, true, cx),
-                    "end" => self.set_opacity(OPACITY_MAX, true, cx),
-                    _ => {}
+                if matches!(token, "escape" | "enter" | "q") {
+                    self.close_overlay(cx);
                 }
             }
             None => {}
@@ -1834,9 +1712,6 @@ impl Yomu {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.native_popup {
-            self.close_native_popup(cx);
-        }
         let entries = if self.selection.contains(id) && self.selection.len() > 1 {
             menu::selection_menu(self.selection.len())
         } else {
@@ -1852,276 +1727,17 @@ impl Yomu {
             position,
             selected: None,
         };
-        self.overlay = Some(Overlay::Menu(menu.clone()));
-        #[cfg(not(test))]
-        if self.open_native_context_popup(menu, _window, cx) {
-            return;
-        }
-        self.native_popup = false;
+        self.overlay = Some(Overlay::Menu(menu));
         cx.notify();
-    }
-
-    #[cfg(not(test))]
-    fn open_native_context_popup(
-        &mut self,
-        menu: BookMenu,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> bool {
-        let parent_window = window.window_handle();
-        let parent = cx.entity();
-        let height = menu
-            .entries
-            .iter()
-            .map(|entry| match entry {
-                Entry::Item(_) => 28.0,
-                Entry::Separator => 5.0,
-            })
-            .sum::<f32>()
-            + 12.0;
-        let options = WindowOptions {
-            window_bounds: Some(WindowBounds::Windowed(Bounds {
-                origin: point(px(0.), px(0.)),
-                size: size(px(MENU_W), px(height)),
-            })),
-            titlebar: None,
-            focus: true,
-            show: true,
-            kind: WindowKind::AnchoredPopup(PopupOptions {
-                parent: parent_window,
-                anchor_rect: Bounds {
-                    origin: menu.position,
-                    size: size(px(1.), px(1.)),
-                },
-                anchor: PopupAnchor::TopLeft,
-                gravity: PopupGravity::BottomRight,
-                constraint_adjustment: PopupConstraintAdjustment::SLIDE_X
-                    | PopupConstraintAdjustment::SLIDE_Y
-                    | PopupConstraintAdjustment::FLIP_X
-                    | PopupConstraintAdjustment::FLIP_Y,
-                offset: point(px(2.), px(2.)),
-                grab: true,
-            }),
-            is_resizable: false,
-            is_movable: false,
-            window_background: WindowBackgroundAppearance::Transparent,
-            ..Default::default()
-        };
-
-        self.native_popup = true;
-        let colors = self.colors;
-        let opened = cx.open_window(options, move |popup_window, cx| {
-            let this_window = popup_window.window_handle();
-            cx.new(|cx| {
-                let mut popup = NativeBookMenu {
-                    parent: parent.clone(),
-                    parent_window,
-                    menu,
-                    colors,
-                    selected: None,
-                    _release_subscription: None,
-                };
-                let parent = parent.clone();
-                popup._release_subscription = Some(cx.on_release(move |_, app| {
-                    let _ = parent.update(app, |state, cx| {
-                        if state.native_popup_window == Some(this_window) {
-                            state.native_popup = false;
-                            state.native_popup_window = None;
-                        }
-                        if matches!(state.overlay, Some(Overlay::Menu(_))) {
-                            state.dismiss();
-                        }
-                        cx.notify();
-                    });
-                }));
-                popup
-            })
-        });
-        match opened {
-            Ok(handle) => {
-                self.native_popup_window = Some(handle.into());
-                true
-            }
-            Err(error) => {
-                eprintln!(
-                    "yomu: native context popup unavailable; using in-window menu: {error:#}"
-                );
-                self.native_popup = false;
-                false
-            }
-        }
     }
 
     fn open_library_menu(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
-        if self.native_popup {
-            self.close_native_popup(cx);
-        }
-        self.overlay = Some(Overlay::LibraryMenu(LibraryMenu::default()));
-        #[cfg(not(test))]
-        if self.open_native_library_menu(_window, cx) {
+        if matches!(self.overlay, Some(Overlay::LibraryMenu(_))) {
+            self.close_overlay(cx);
             return;
         }
-        self.native_popup = false;
+        self.overlay = Some(Overlay::LibraryMenu(LibraryMenu::default()));
         cx.notify();
-    }
-
-    #[cfg(not(test))]
-    fn open_native_library_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        let parent_window = window.window_handle();
-        let parent = cx.entity();
-        let window_size = window.viewport_size();
-        let width = 300.0;
-        let height = 340.0;
-
-        let options = WindowOptions {
-            window_bounds: Some(WindowBounds::Windowed(Bounds {
-                origin: point(px(0.), px(0.)),
-                size: size(px(width), px(height)),
-            })),
-            titlebar: None,
-            focus: true,
-            show: true,
-            kind: WindowKind::AnchoredPopup(PopupOptions {
-                parent: parent_window,
-                anchor_rect: Bounds {
-                    origin: point(window_size.width - px(24.0), px(56.0)),
-                    size: size(px(1.0), px(1.0)),
-                },
-                anchor: PopupAnchor::TopRight,
-                gravity: PopupGravity::BottomLeft,
-                constraint_adjustment: PopupConstraintAdjustment::all(),
-                offset: point(px(0.), px(4.0)),
-                grab: true,
-            }),
-            is_resizable: false,
-            is_movable: false,
-            window_background: WindowBackgroundAppearance::Transparent,
-            ..Default::default()
-        };
-
-        self.native_popup = true;
-        let colors = self.colors;
-        let grouped = self.library.settings().group_series;
-        let opened = cx.open_window(options, move |popup_window, cx| {
-            let this_window = popup_window.window_handle();
-            cx.new(|cx| {
-                let mut popup = NativeLibraryMenu {
-                    parent: parent.clone(),
-                    parent_window,
-                    colors,
-                    selected: None,
-                    grouped,
-                    _release_subscription: None,
-                };
-                let parent = parent.clone();
-                popup._release_subscription = Some(cx.on_release(move |_, app| {
-                    let _ = parent.update(app, |state, cx| {
-                        if state.native_popup_window == Some(this_window) {
-                            state.native_popup = false;
-                            state.native_popup_window = None;
-                        }
-                        if matches!(state.overlay, Some(Overlay::LibraryMenu(_))) {
-                            state.dismiss();
-                        }
-                        cx.notify();
-                    });
-                }));
-                popup
-            })
-        });
-
-        match opened {
-            Ok(handle) => {
-                self.native_popup_window = Some(handle.into());
-                true
-            }
-            Err(error) => {
-                eprintln!("yomu: native library menu unavailable; using in-window menu: {error:#}");
-                self.native_popup = false;
-                false
-            }
-        }
-    }
-
-    #[cfg(not(test))]
-    fn open_native_command_prompt(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        let parent_window = window.window_handle();
-        let parent = cx.entity();
-        let colors = self.colors;
-        let input = self
-            .reader
-            .as_ref()
-            .and_then(|r| r.vim.cmdline_text().map(str::to_owned))
-            .unwrap_or_default();
-        let window_size = window.viewport_size();
-        let width = 560.0;
-        let height = 260.0;
-
-        let options = WindowOptions {
-            window_bounds: Some(WindowBounds::Windowed(Bounds {
-                origin: point(px(0.), px(0.)),
-                size: size(px(width), px(height)),
-            })),
-            titlebar: None,
-            focus: true,
-            show: true,
-            kind: WindowKind::AnchoredPopup(PopupOptions {
-                parent: parent_window,
-                anchor_rect: Bounds {
-                    origin: point(window_size.width / 2.0, window_size.height / 2.5),
-                    size: size(px(1.0), px(1.0)),
-                },
-                anchor: PopupAnchor::Center,
-                gravity: PopupGravity::Center,
-                constraint_adjustment: PopupConstraintAdjustment::all(),
-                offset: point(px(0.), px(0.)),
-                grab: true,
-            }),
-            is_resizable: false,
-            is_movable: false,
-            window_background: WindowBackgroundAppearance::Transparent,
-            ..Default::default()
-        };
-
-        self.native_popup = true;
-        let opened = cx.open_window(options, move |_, cx| {
-            cx.new(|cx| {
-                let mut popup = NativeCommandPrompt {
-                    parent: parent.clone(),
-                    parent_window,
-                    colors,
-                    input,
-                    selection: 0,
-                    _release_subscription: None,
-                };
-                let parent = parent.clone();
-                popup._release_subscription = Some(cx.on_release(move |_, app| {
-                    let _ = parent.update(app, |state, cx| {
-                        state.native_popup = false;
-                        state.native_popup_window = None;
-                        if let Some(reader) = state.reader.as_mut() {
-                            reader.vim.cancel_cmdline();
-                        }
-                        cx.notify();
-                    });
-                }));
-                popup
-            })
-        });
-
-        match opened {
-            Ok(handle) => {
-                self.native_popup_window = Some(handle.into());
-                true
-            }
-            Err(error) => {
-                eprintln!(
-                    "yomu: native command prompt unavailable; using in-window palette: {error:#}"
-                );
-                self.native_popup = false;
-                false
-            }
-        }
     }
 
     /// Remove every selected book from the library, asking first only if progress or marks
@@ -2902,14 +2518,6 @@ impl Yomu {
         for action in actions {
             self.apply(action, vp, window, cx);
         }
-        if let Some(reader) = self.reader.as_ref()
-            && reader.vim.in_cmdline()
-        {
-            #[cfg(not(test))]
-            if self.open_native_command_prompt(window, cx) {
-                return;
-            }
-        }
     }
 
     fn apply(&mut self, action: Action, vp: Viewport, window: &mut Window, cx: &mut Context<Self>) {
@@ -3249,13 +2857,6 @@ impl Yomu {
     // ------------------------------------------------------------------------------------
 
     fn render_overlay(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        if self.native_popup {
-            return Some(
-                deferred(self.scrim(false, cx))
-                    .with_priority(1)
-                    .into_any_element(),
-            );
-        }
         Some(match self.overlay.as_ref()? {
             Overlay::Menu(menu) => self.render_menu(menu, cx),
             Overlay::LibraryMenu(menu) => self.render_library_menu(menu, cx),
@@ -3281,11 +2882,7 @@ impl Yomu {
             .justify_center()
             .bg(with_alpha(
                 overlay_shade(self.colors),
-                if dim {
-                    0.25 + self.colors.widget_opacity * 0.30
-                } else {
-                    0.0
-                },
+                if dim { 0.50 } else { 0.0 },
             ))
             .on_mouse_down(
                 MouseButton::Left,
@@ -3319,9 +2916,7 @@ impl Yomu {
 
         for (ix, entry) in menu.entries.iter().enumerate() {
             list = match entry {
-                Entry::Separator => {
-                    list.child(div().h(px(1.)).mx_2().my_1().bg(self.colors.border))
-                }
+                Entry::Separator => list,
                 Entry::Item(item) => list.child(self.menu_item(menu, ix, item, cx)),
             };
         }
@@ -3751,7 +3346,6 @@ impl Yomu {
 
     fn render_settings(&self, cx: &mut Context<Self>) -> AnyElement {
         let settings = self.library.settings();
-        let opacity = settings.opacity;
         let theme_name = settings.theme_name.clone();
         let theme_path = self.custom_theme_path.display().to_string();
         let theme_status = self.theme_status.clone();
@@ -3761,55 +3355,7 @@ impl Yomu {
         let fit = settings.fit;
         let animate = settings.animate;
         let grouped = settings.group_series;
-        let fraction = (opacity - OPACITY_MIN) / (OPACITY_MAX - OPACITY_MIN);
         let is_default = *settings == Settings::default();
-        let bounds = self.slider.bounds.clone();
-
-        // The rail is inset by half a knob on each side so the knob's centre sits exactly at
-        // the end of the filled part.
-        let track = div()
-            .relative()
-            .w(px(SLIDER_W))
-            .h(px(20.))
-            .cursor_pointer()
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, event: &MouseDownEvent, _, cx| {
-                    this.slider.dragging = true;
-                    this.slider_set_from_x(f32::from(event.position.x), cx);
-                }),
-            )
-            .child(
-                canvas(move |area, _, _| bounds.set(Some(area)), |_, _, _, _| {})
-                    .absolute()
-                    .size_full(),
-            )
-            .child(
-                div()
-                    .absolute()
-                    .left(px(KNOB / 2.0))
-                    .top(px(8.))
-                    .w(px(SLIDER_W - KNOB))
-                    .h(px(4.))
-                    .rounded_full()
-                    .bg(self.colors.border)
-                    .child(
-                        div()
-                            .h_full()
-                            .w(relative(fraction))
-                            .rounded_full()
-                            .bg(self.colors.accent),
-                    ),
-            )
-            .child(
-                div()
-                    .absolute()
-                    .top(px(2.))
-                    .left(px(fraction * (SLIDER_W - KNOB)))
-                    .size(px(KNOB))
-                    .rounded_full()
-                    .bg(self.colors.foreground),
-            );
 
         // No dimming scrim here: you want to see the window behind the panel while dragging.
         let tab_button = |tab, label| {
@@ -3857,9 +3403,6 @@ impl Yomu {
                     .child(panel_button("settings-theme-reload", "Reload custom themes", ButtonKind::Normal,
                         self.colors, true, cx.listener(|this, _: &ClickEvent, _, cx| this.reload_custom_themes(cx)))))
                 .children(theme_status.map(|status| div().text_xs().text_color(self.colors.muted).child(status)))
-                .child(div().flex().justify_between().child("Window background opacity")
-                    .child(div().text_color(self.colors.muted).child(format!("{}%", (opacity * 100.0).round() as u32))))
-                .child(track)
                 .into_any_element(),
             SettingsTab::Library => div().flex().flex_col().gap_3()
                 .child(div().font_weight(FontWeight::SEMIBOLD).child("Library"))
@@ -3902,21 +3445,7 @@ impl Yomu {
             }
         };
 
-        self.scrim(false, cx)
-            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
-                if !this.slider.dragging {
-                    return;
-                }
-                if event.pressed_button == Some(MouseButton::Left) {
-                    this.slider_set_from_x(f32::from(event.position.x), cx);
-                } else {
-                    this.end_slider_drag(cx);
-                }
-            }))
-            .on_mouse_up(
-                MouseButton::Left,
-                cx.listener(|this, _: &MouseUpEvent, _, cx| this.end_slider_drag(cx)),
-            )
+        self.scrim(true, cx)
             .child(
                 self.animate_popup("settings-dialog", self.panel(640.))
                     .child(
@@ -4119,7 +3648,7 @@ impl Yomu {
                 IconName::Menu,
                 self.colors,
                 cx.listener(|this, _: &ClickEvent, window, cx| {
-                    if this.native_popup || matches!(this.overlay, Some(Overlay::LibraryMenu(_))) {
+                    if matches!(this.overlay, Some(Overlay::LibraryMenu(_))) {
                         this.close_overlay(cx);
                     } else {
                         this.open_library_menu(window, cx);
@@ -4698,10 +4227,7 @@ impl Yomu {
             .size_full()
             .relative()
             .overflow_hidden()
-            .bg(with_alpha(
-                self.colors.background,
-                self.library.settings().opacity,
-            ))
+            .bg(self.colors.background)
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, event: &MouseDownEvent, _, _| {
@@ -4735,419 +4261,9 @@ impl Yomu {
             .child(progress_line)
             .children(info)
             .children(hud)
-            .children(if self.native_popup { None } else { vim_status })
+            .children(vim_status)
             .children(reader.show_help.then(|| help_overlay(self.colors)))
             .into_any_element()
-    }
-}
-
-impl Render for NativeBookMenu {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let opacity = (self.colors.widget_opacity + 0.15).clamp(0.70, 0.92);
-        let mut list = div()
-            .size_full()
-            .flex()
-            .flex_col()
-            .p_1()
-            .rounded_xl()
-            .overflow_hidden()
-            .bg(with_alpha(self.colors.surface, opacity))
-            .border_1()
-            .border_color(self.colors.border)
-            .shadow_lg()
-            .text_sm()
-            .text_color(self.colors.foreground)
-            .on_key_down(cx.listener(|_, event: &KeyDownEvent, popup, _| {
-                if event.keystroke.key == "escape" {
-                    popup.remove_window();
-                }
-            }));
-
-        for (ix, entry) in self.menu.entries.iter().enumerate() {
-            match entry {
-                Entry::Separator => {
-                    list = list.child(div().h(px(1.)).mx_2().my_1().bg(self.colors.border));
-                }
-                Entry::Item(item) => {
-                    let icon = match item.action {
-                        BookAction::Open => IconName::BookOpen,
-                        BookAction::StartOver | BookAction::ResetProgress => IconName::RotateCcw,
-                        BookAction::MarkRead => IconName::CircleCheck,
-                        BookAction::MarkUnread => IconName::CircleX,
-                        BookAction::RevealFile => IconName::FolderOpen,
-                        BookAction::Properties => IconName::Info,
-                        BookAction::SetSeries => IconName::Library,
-                        BookAction::Remove | BookAction::RemoveSelected => IconName::Trash,
-                        BookAction::ClearSelection => IconName::X,
-                    };
-                    let item_color = if !item.enabled {
-                        self.colors.muted
-                    } else if item.danger {
-                        self.colors.danger
-                    } else {
-                        self.colors.foreground
-                    };
-                    let icon_color = item_color;
-                    let selected = self.selected == Some(ix);
-                    let enabled = item.enabled;
-                    let action = item.action;
-                    let id = self.menu.book_id.clone();
-                    let parent = self.parent.clone();
-                    let parent_window = self.parent_window;
-                    let row = div()
-                        .id(SharedString::from(format!("native-menu-item-{ix}")))
-                        .h(px(28.))
-                        .px_2()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .rounded_md()
-                        .border_1()
-                        .border_color(if selected && enabled {
-                            with_alpha(self.colors.accent, 0.70)
-                        } else {
-                            with_alpha(self.colors.accent, 0.0)
-                        })
-                        .when(selected && enabled, |row| {
-                            row.bg(with_alpha(self.colors.accent, 0.20))
-                        })
-                        .child(Icon::new(icon).size_4().text_color(icon_color))
-                        .child(item.label.clone())
-                        .text_color(item_color)
-                        .when(!enabled, |row| row.opacity(0.6));
-                    let row = if enabled {
-                        row.cursor_pointer()
-                            .on_mouse_move(cx.listener(move |this, _: &MouseMoveEvent, _, cx| {
-                                if this.selected != Some(ix) {
-                                    this.selected = Some(ix);
-                                    cx.notify();
-                                }
-                            }))
-                            .on_click(cx.listener(move |_, _: &ClickEvent, popup, cx| {
-                                let _ = cx.update_window(parent_window, |_, main_window, app| {
-                                    let _ = parent.update(app, |state, state_cx| {
-                                        state.run_book_action(action, &id, main_window, state_cx);
-                                    });
-                                });
-                                popup.remove_window();
-                            }))
-                    } else {
-                        row
-                    };
-                    list = list.child(row);
-                }
-            }
-        }
-
-        list
-    }
-}
-
-impl Render for NativeLibraryMenu {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let opacity = (self.colors.widget_opacity + 0.15).clamp(0.70, 0.92);
-        let entries = [
-            (IconName::FilePlus, "Add files", "Import CBZ and ZIP comics"),
-            (
-                IconName::FolderPlus,
-                "Add folder",
-                "Import a folder of images",
-            ),
-            (
-                IconName::Settings,
-                "Settings",
-                "Themes and reader preferences",
-            ),
-            (
-                IconName::Folder,
-                if self.grouped {
-                    "Show individual volumes"
-                } else {
-                    "Group into folders"
-                },
-                "Group volumes by source folder or assigned series",
-            ),
-            (IconName::LogOut, "Quit", "Close yomu"),
-        ];
-
-        let parent = self.parent.clone();
-        let parent_window = self.parent_window;
-        let colors = self.colors;
-
-        let mut list = div()
-            .size_full()
-            .flex()
-            .flex_col()
-            .gap_1()
-            .p_2()
-            .rounded_xl()
-            .overflow_hidden()
-            .bg(with_alpha(colors.surface, opacity))
-            .border_1()
-            .border_color(colors.border)
-            .shadow_lg()
-            .on_key_down(cx.listener(|_, event: &KeyDownEvent, popup, _| {
-                if event.keystroke.key == "escape" {
-                    popup.remove_window();
-                }
-            }));
-
-        for (index, (icon, label, description)) in entries.into_iter().enumerate() {
-            let selected = self.selected == Some(index);
-            let parent = parent.clone();
-            let row = div()
-                .id(SharedString::from(format!("native-library-menu-{index}")))
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap_3()
-                .px_3()
-                .py_2()
-                .rounded_lg()
-                .cursor_pointer()
-                .border_1()
-                .border_color(if selected {
-                    with_alpha(colors.accent, 0.70)
-                } else {
-                    with_alpha(colors.accent, 0.0)
-                })
-                .when(selected, |row| row.bg(with_alpha(colors.accent, 0.20)))
-                .child(Icon::new(icon).size_4().text_color(colors.foreground))
-                .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap(px(2.))
-                        .child(div().text_sm().text_color(colors.foreground).child(label))
-                        .child(div().text_xs().text_color(colors.muted).child(description)),
-                )
-                .on_mouse_move(cx.listener(move |this, _: &MouseMoveEvent, _, cx| {
-                    if this.selected != Some(index) {
-                        this.selected = Some(index);
-                        cx.notify();
-                    }
-                }))
-                .on_click(cx.listener(move |_, _: &ClickEvent, popup, cx| {
-                    popup.remove_window();
-                    let _ = cx.update_window(parent_window, |_, main_window, app| {
-                        let _ = parent.update(app, |state, state_cx| {
-                            state.run_library_menu_action(index, main_window, state_cx);
-                        });
-                    });
-                }));
-            list = list.child(row);
-        }
-
-        list
-    }
-}
-
-#[allow(dead_code)]
-impl NativeCommandPrompt {
-    fn on_key(&mut self, event: &KeyDownEvent, popup: &mut Window, cx: &mut Context<Self>) {
-        let key = event.keystroke.key.as_str();
-        match key {
-            "escape" => {
-                popup.remove_window();
-            }
-            "enter" => {
-                let parent = self.parent.clone();
-                let parent_window = self.parent_window;
-                let _ = cx.update_window(parent_window, |_, main_window, app| {
-                    let _ = parent.update(app, |state, state_cx| {
-                        if let Some(reader) = state.reader.as_mut() {
-                            let vp = viewport_of(main_window);
-                            let actions = reader.vim.feed("enter");
-                            for action in actions {
-                                state.apply(action, vp, main_window, state_cx);
-                            }
-                        }
-                    });
-                });
-                popup.remove_window();
-            }
-            "up" => {
-                let suggestions = command_suggestions(&self.input);
-                if !suggestions.is_empty() {
-                    let count = suggestions.len();
-                    self.selection = self.selection.wrapping_add(count).wrapping_sub(1) % count;
-                    cx.notify();
-                }
-            }
-            "down" => {
-                let suggestions = command_suggestions(&self.input);
-                if !suggestions.is_empty() {
-                    let count = suggestions.len();
-                    self.selection = (self.selection + 1) % count;
-                    cx.notify();
-                }
-            }
-            "tab" => {
-                let suggestions = command_suggestions(&self.input);
-                if !suggestions.is_empty() {
-                    let chosen = &suggestions[self.selection % suggestions.len()].0;
-                    self.input = chosen.clone();
-                    self.selection = 0;
-                    let parent = self.parent.clone();
-                    let input_clone = self.input.clone();
-                    let _ = parent.update(cx, |state, _| {
-                        if let Some(reader) = state.reader.as_mut() {
-                            reader.vim.replace_cmdline(input_clone);
-                        }
-                    });
-                    cx.notify();
-                }
-            }
-            "backspace" => {
-                if self.input.is_empty() {
-                    popup.remove_window();
-                } else {
-                    self.input.pop();
-                    self.selection = 0;
-                    let parent = self.parent.clone();
-                    let input_clone = self.input.clone();
-                    let _ = parent.update(cx, |state, _| {
-                        if let Some(reader) = state.reader.as_mut() {
-                            reader.vim.replace_cmdline(input_clone);
-                        }
-                    });
-                    cx.notify();
-                }
-            }
-            _ => {
-                if let Some(ch) = &event.keystroke.key_char {
-                    if !event.keystroke.modifiers.control && !event.keystroke.modifiers.alt {
-                        self.input.push_str(ch);
-                        self.selection = 0;
-                        let parent = self.parent.clone();
-                        let input_clone = self.input.clone();
-                        let _ = parent.update(cx, |state, _| {
-                            if let Some(reader) = state.reader.as_mut() {
-                                reader.vim.replace_cmdline(input_clone);
-                            }
-                        });
-                        cx.notify();
-                    }
-                }
-            }
-        }
-    }
-}
-
-impl Render for NativeCommandPrompt {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let opacity = (self.colors.widget_opacity + 0.15).clamp(0.70, 0.92);
-        let suggestions = command_suggestions(&self.input);
-
-        let mut prompt = div()
-            .size_full()
-            .flex()
-            .flex_col()
-            .justify_end()
-            .rounded_xl()
-            .overflow_hidden()
-            .bg(with_alpha(self.colors.surface, opacity))
-            .border_1()
-            .border_color(self.colors.border)
-            .shadow_lg()
-            .on_key_down(cx.listener(|this, event: &KeyDownEvent, popup, cx| {
-                this.on_key(event, popup, cx);
-            }));
-
-        if !suggestions.is_empty() {
-            let mut rows = div()
-                .id("native-command-suggestions")
-                .flex_1()
-                .min_h_0()
-                .overflow_y_scroll()
-                .flex()
-                .flex_col()
-                .gap_1()
-                .p_2();
-
-            for (index, (completion, label, description)) in suggestions.iter().enumerate() {
-                let selected = index == self.selection;
-                let completion = completion.clone();
-                let parent = self.parent.clone();
-                rows = rows.child(
-                    div()
-                        .id(SharedString::from(format!("native-cmd-suggestion-{index}")))
-                        .flex()
-                        .items_center()
-                        .justify_between()
-                        .gap_4()
-                        .px_2()
-                        .py_1()
-                        .rounded_lg()
-                        .cursor_pointer()
-                        .border_1()
-                        .border_color(if selected {
-                            with_alpha(self.colors.accent, 0.70)
-                        } else {
-                            with_alpha(self.colors.accent, 0.0)
-                        })
-                        .when(selected, |row| row.bg(with_alpha(self.colors.accent, 0.20)))
-                        .child(div().text_color(self.colors.accent).child(label.clone()))
-                        .child(
-                            div()
-                                .flex_1()
-                                .text_right()
-                                .text_color(self.colors.muted)
-                                .child(*description),
-                        )
-                        .on_mouse_move(cx.listener(move |this, _: &MouseMoveEvent, _, cx| {
-                            if this.selection != index {
-                                this.selection = index;
-                                cx.notify();
-                            }
-                        }))
-                        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                            this.input = completion.clone();
-                            this.selection = 0;
-                            let parent = parent.clone();
-                            let input_clone = this.input.clone();
-                            let _ = parent.update(cx, |state, _| {
-                                if let Some(reader) = state.reader.as_mut() {
-                                    reader.vim.replace_cmdline(input_clone);
-                                }
-                            });
-                            cx.notify();
-                        })),
-                );
-            }
-            prompt = prompt.child(rows);
-        }
-
-        prompt = prompt.child(
-            div()
-                .flex()
-                .items_center()
-                .gap_2()
-                .border_t_1()
-                .border_color(self.colors.border)
-                .px_3()
-                .py_2()
-                .child(
-                    div()
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(self.colors.accent)
-                        .child(":"),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .text_color(self.colors.foreground)
-                        .child(format!("{}▏", self.input)),
-                )
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(self.colors.muted)
-                        .child("↑↓ select · Tab complete · Enter run · Esc cancel"),
-                ),
-        );
-
-        prompt
     }
 }
 
@@ -5179,13 +4295,7 @@ impl Render for Yomu {
             None => self.render_library(cx),
         };
 
-        // The reader paints its own background, so the root only has one in the library;
-        // two translucent layers would add up to a different opacity than the setting says.
-        let root_bg = if reading {
-            with_alpha(self.colors.background, 0.0)
-        } else {
-            with_alpha(self.colors.background, self.library.settings().opacity)
-        };
+        let root_bg = self.colors.background;
         let overlay = self.render_overlay(cx);
 
         div()
@@ -5202,19 +4312,8 @@ impl Render for Yomu {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _: &MouseDownEvent, _, cx| {
-                    if this.native_popup {
-                        this.close_native_popup(cx);
-                    }
                     if this.search_active {
                         this.deactivate_search(cx);
-                    }
-                }),
-            )
-            .on_mouse_down(
-                MouseButton::Right,
-                cx.listener(|this, _: &MouseDownEvent, _, cx| {
-                    if this.native_popup {
-                        this.close_native_popup(cx);
                     }
                 }),
             )
@@ -5598,9 +4697,7 @@ fn main() {
             cx.open_window(
                 WindowOptions {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
-                    // Created transparent so the surface has an alpha channel; the app switches to
-                    // an opaque appearance whenever the background opacity setting is 100%.
-                    window_background: WindowBackgroundAppearance::Transparent,
+                    window_background: WindowBackgroundAppearance::Opaque,
                     titlebar: Some(TitlebarOptions {
                         title: Some("yomu".into()),
                         ..Default::default()
@@ -6169,92 +5266,7 @@ mod tests {
     }
 
     #[gpui_kit::test]
-    fn opacity_keys_apply_immediately_and_persist(cx: &mut TestAppContext) {
-        let fx = fixture("opacitykeys");
-        let (view, cx) = launch(&fx, cx);
-        assert_eq!(opacity(&view, cx), 1.0, "default is fully opaque");
-
-        view.update(cx, |this, cx| this.open_settings(cx));
-        cx.run_until_parked();
-        cx.simulate_keystrokes("left left");
-        assert!((opacity(&view, cx) - 0.90).abs() < 1e-4);
-        assert!(
-            (saved_settings(&fx).opacity - 0.90).abs() < 1e-4,
-            "saved on every change"
-        );
-        cx.simulate_keystrokes("right");
-        assert!((opacity(&view, cx) - 0.95).abs() < 1e-4);
-        cx.simulate_keystrokes("home");
-        assert!((opacity(&view, cx) - OPACITY_MIN).abs() < 1e-4);
-        cx.simulate_keystrokes("left");
-        assert!(
-            (opacity(&view, cx) - OPACITY_MIN).abs() < 1e-4,
-            "cannot go below the minimum"
-        );
-        cx.simulate_keystrokes("end right");
-        assert_eq!(opacity(&view, cx), OPACITY_MAX, "cannot go above 100%");
-    }
-
-    #[gpui_kit::test]
-    fn slider_follows_the_mouse_and_saves_when_released(cx: &mut TestAppContext) {
-        let fx = fixture("slider");
-        let (view, cx) = launch(&fx, cx);
-        view.update(cx, |this, cx| this.open_settings(cx));
-        cx.run_until_parked();
-
-        let track = view
-            .read_with(cx, |this, _| this.slider.bounds.get())
-            .expect("the slider track has been painted");
-        let y = track.center().y;
-        let left = track.origin.x;
-        let right = track.origin.x + track.size.width;
-
-        cx.simulate_mouse_down(
-            point(left + px(1.), y),
-            MouseButton::Left,
-            Modifiers::default(),
-        );
-        assert!(
-            (opacity(&view, cx) - OPACITY_MIN).abs() < 1e-4,
-            "pressing at the left end"
-        );
-        assert!(
-            (saved_settings(&fx).opacity - 1.0).abs() < 1e-4,
-            "not saved while dragging"
-        );
-
-        let middle = point((left + right) / 2.0, y);
-        cx.simulate_mouse_move(middle, MouseButton::Left, Modifiers::default());
-        let expected = (OPACITY_MIN + OPACITY_MAX) / 2.0;
-        assert!(
-            (opacity(&view, cx) - expected).abs() < 0.02,
-            "dragging to the middle"
-        );
-
-        // dragging past the end (even off the track) clamps
-        cx.simulate_mouse_move(
-            point(right + px(200.), y),
-            MouseButton::Left,
-            Modifiers::default(),
-        );
-        assert_eq!(opacity(&view, cx), OPACITY_MAX);
-
-        cx.simulate_mouse_move(middle, MouseButton::Left, Modifiers::default());
-        cx.simulate_mouse_up(middle, MouseButton::Left, Modifiers::default());
-        let value = opacity(&view, cx);
-        assert!(
-            (saved_settings(&fx).opacity - value).abs() < 1e-4,
-            "saved on release"
-        );
-        assert_eq!(
-            overlay_kind(&view, cx),
-            "settings",
-            "dragging does not dismiss the panel"
-        );
-    }
-
-    #[gpui_kit::test]
-    fn window_appearance_switches_between_opaque_and_transparent(cx: &mut TestAppContext) {
+    fn window_appearance_is_always_opaque(cx: &mut TestAppContext) {
         let fx = fixture("appearance");
         let (view, cx) = launch(&fx, cx);
         let applied = |view: &Entity<Yomu>, cx: &mut VisualTestContext| {
@@ -6263,20 +5275,8 @@ mod tests {
         assert_eq!(
             applied(&view, cx),
             Some(true),
-            "100% uses the opaque appearance"
+            "window is locked to opaque appearance"
         );
-
-        view.update(cx, |this, cx| this.set_opacity(0.6, true, cx));
-        cx.run_until_parked();
-        assert_eq!(
-            applied(&view, cx),
-            Some(false),
-            "below 100% needs real transparency"
-        );
-
-        view.update(cx, |this, cx| this.set_opacity(1.0, true, cx));
-        cx.run_until_parked();
-        assert_eq!(applied(&view, cx), Some(true));
     }
 
     #[gpui_kit::test]
@@ -6292,11 +5292,11 @@ mod tests {
         cx.run_until_parked();
         assert_eq!(overlay_kind(&view, cx), "settings");
 
-        view.update(cx, |this, cx| {
-            this.set_opacity(0.55, true, cx);
+        view.update(cx, |this, _| {
             let settings = this.library.settings_mut();
             settings.rtl = true;
             settings.fit = FitMode::Width;
+            this.save_library();
         });
         view.update(cx, |this, cx| this.request_reset_settings(cx));
         cx.run_until_parked();
@@ -6305,7 +5305,10 @@ mod tests {
         // cancelling goes back to the panel and changes nothing
         cx.simulate_keystrokes("escape");
         assert_eq!(overlay_kind(&view, cx), "settings");
-        assert!((opacity(&view, cx) - 0.55).abs() < 1e-4);
+        assert_eq!(
+            view.read_with(cx, |this, _| this.library.settings().rtl),
+            true
+        );
 
         view.update(cx, |this, cx| this.request_reset_settings(cx));
         cx.simulate_keystrokes("enter");
@@ -6314,7 +5317,6 @@ mod tests {
             "settings",
             "back on the panel to see the result"
         );
-        assert_eq!(opacity(&view, cx), OPACITY_MAX);
         assert_eq!(saved_settings(&fx), Settings::default());
     }
 
@@ -6347,13 +5349,19 @@ mod tests {
         {
             let (view, cx) = launch(&fx, cx);
             let id = fx.ids[2].clone();
-            view.update(cx, |this, cx| this.set_opacity(0.72, true, cx));
+            view.update(cx, |this, _| {
+                this.library.settings_mut().rtl = true;
+                this.save_library();
+            });
             set_progress(&view, cx, &id, 2);
             act(&view, cx, &id, BookAction::MarkRead);
         }
         // a brand new app instance reads the same files
         let (view, cx) = launch(&fx, cx);
-        assert!((opacity(&view, cx) - 0.72).abs() < 1e-4);
+        assert_eq!(
+            view.read_with(cx, |this, _| this.library.settings().rtl),
+            true
+        );
         assert!(book(&view, cx, &fx.ids[2]).is_finished());
     }
 
@@ -6367,7 +5375,7 @@ mod tests {
 
         let (view, cx) = launch(&fx, cx);
         assert_eq!(view.read_with(cx, |this, _| this.library.books().len()), 3);
-        assert_eq!(opacity(&view, cx), OPACITY_MAX);
+        assert_eq!(opacity(&view, cx), 1.0);
         assert_eq!(
             view.read_with(cx, |this, _| this.library.settings().clone()),
             Settings::default()
