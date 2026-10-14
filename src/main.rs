@@ -926,27 +926,12 @@ impl Yomu {
         self.library.settings().animate && !self.reduce_motion
     }
 
-    /// Raised widget surfaces stay more opaque than the window glass behind them, making each
-    /// card or popup read as a separate pane while still following the user's opacity setting.
-    fn widget_surface(&self, color: gpui_kit::Hsla) -> Rgba {
-        let alpha = (self.colors.widget_opacity + 0.12).clamp(0.65, 0.95);
-        with_alpha(color, alpha)
+    fn widget_surface(&self, color: gpui_kit::Hsla) -> gpui_kit::Hsla {
+        color
     }
 
-    #[allow(dead_code)]
-    fn widget_hover(&self, color: gpui_kit::Hsla) -> Rgba {
-        let alpha = (self.colors.widget_opacity + 0.15).clamp(0.70, 0.98);
-        with_alpha(color, alpha)
-    }
-
-    /// Keep menus and native popups translucent at every window opacity so Niri compositor blur shows through.
-    fn popup_surface(&self) -> Rgba {
-        let alpha = (self.colors.widget_opacity + 0.15).clamp(0.70, 0.92);
-        with_alpha(self.colors.surface, alpha)
-    }
-
-    fn menu_surface(&self) -> Rgba {
-        self.popup_surface()
+    fn menu_surface(&self) -> gpui_kit::Hsla {
+        self.colors.surface
     }
 
     /// Watch the generated custom theme file so Noctalia palette changes apply without a manual
@@ -4132,10 +4117,11 @@ impl Yomu {
                 .rounded_lg()
                 .border_1()
                 .border_color(self.colors.border)
-                .bg(self.widget_surface(self.colors.surface))
+                .bg(self.colors.surface)
+                .shadow_lg()
                 .text_sm();
             if !suggestions.is_empty() {
-                let mut rows = div().flex().flex_col().p_1();
+                let mut rows = div().flex().flex_col().p_1().bg(self.colors.surface);
                 for (index, (completion, label, description)) in suggestions.iter().enumerate() {
                     let selected = index == self.command_selection;
                     let completion = completion.clone();
@@ -4150,12 +4136,14 @@ impl Yomu {
                             .py_1()
                             .rounded_lg()
                             .cursor_pointer()
-                            .when(selected, |row| {
-                                row.bg(with_alpha(
-                                    self.colors.accent,
-                                    (self.library.settings().opacity + 0.10).min(1.0),
-                                ))
+                            .border_1()
+                            .border_color(if selected {
+                                with_alpha(self.colors.accent, 0.70)
+                            } else {
+                                with_alpha(self.colors.accent, 0.0)
                             })
+                            .when(selected, |row| row.bg(with_alpha(self.colors.accent, 0.20)))
+                            .hover(|row| row.bg(with_alpha(self.colors.accent, 0.15)))
                             .child(div().text_color(self.colors.accent).child(label.clone()))
                             .child(
                                 div()
@@ -4182,6 +4170,7 @@ impl Yomu {
                     .gap_2()
                     .border_t_1()
                     .border_color(self.colors.border)
+                    .bg(self.colors.surface)
                     .px_3()
                     .py_2()
                     .child(
@@ -4360,17 +4349,16 @@ fn centered(text: impl Into<SharedString>, colors: UiColors) -> AnyElement {
         .into_any_element()
 }
 
-/// A small rounded label centred horizontally inside `row` (an absolutely positioned div).
 fn pill(row: gpui_kit::Div, text: impl Into<SharedString>, colors: UiColors) -> gpui_kit::Div {
     row.flex().justify_center().child(
         div()
             .px_3()
             .py_1()
             .rounded_full()
-            .bg(with_alpha(
-                colors.background,
-                (colors.widget_opacity + 0.10).min(1.0),
-            ))
+            .bg(colors.surface)
+            .border_1()
+            .border_color(colors.border)
+            .shadow_md()
             .text_sm()
             .text_color(colors.foreground)
             .child(text.into()),
@@ -4496,10 +4484,10 @@ fn help_overlay(colors: UiColors) -> AnyElement {
         .gap_3()
         .p_6()
         .rounded_lg()
-        .bg(with_alpha(
-            colors.surface,
-            (colors.widget_opacity + 0.10).min(1.0),
-        ))
+        .border_1()
+        .border_color(colors.border)
+        .bg(colors.surface)
+        .shadow_lg()
         .text_sm();
 
     for (title, rows) in HELP {
@@ -4569,7 +4557,6 @@ fn panel_button(
     enabled: bool,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> AnyElement {
-    let alpha = (colors.widget_opacity + 0.10).min(1.0);
     let button = Button::new(id)
         .label(label)
         .rounded(ButtonRounded::Large)
@@ -4580,12 +4567,9 @@ fn panel_button(
         ButtonKind::Normal => button
             .secondary()
             .outline()
-            .bg(with_alpha(colors.surface, alpha))
+            .bg(colors.surface)
             .into_any_element(),
-        ButtonKind::Primary => button
-            .primary()
-            .bg(with_alpha(colors.accent, alpha))
-            .into_any_element(),
+        ButtonKind::Primary => button.primary().bg(colors.accent).into_any_element(),
     }
 }
 
@@ -4611,10 +4595,7 @@ fn icon_button(
         .small()
         .ghost()
         .text_color(colors.foreground)
-        .bg(with_alpha(
-            colors.surface,
-            (colors.widget_opacity + 0.10).min(1.0),
-        ))
+        .bg(colors.surface)
         // Render the bundled SVG directly so its theme color is explicit. The
         // Button icon convenience path inherits a color from Kit's component
         // theme, which can be transparent against custom/translucent surfaces.
@@ -4650,15 +4631,11 @@ fn button_colored(
     } else {
         button.secondary()
     };
-    let alpha = (colors.widget_opacity + 0.10).min(1.0);
-    let button = button.bg(with_alpha(
-        if label == "Remove" {
-            colors.danger
-        } else {
-            colors.surface
-        },
-        alpha,
-    ));
+    let button = button.bg(if label == "Remove" {
+        colors.danger
+    } else {
+        colors.surface
+    });
     #[cfg(test)]
     {
         div().debug_selector(|| id.into()).child(button)
