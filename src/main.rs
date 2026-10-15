@@ -3857,13 +3857,14 @@ impl Yomu {
                     ),
             )
             .child(
-                div()
-                    .p_3()
-                    .text_sm()
-                    .font_weight(FontWeight::MEDIUM)
-                    .text_color(self.colors.foreground)
-                    .truncate()
-                    .child(group.name.clone()),
+                div().flex_1().flex().flex_col().p_3().child(
+                    div()
+                        .min_h(px(46.))
+                        .text_sm()
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(self.colors.foreground)
+                        .child(group.name.clone()),
+                ),
             )
             .into_any_element()
     }
@@ -3972,20 +3973,28 @@ impl Yomu {
             .child(cover)
             .child(
                 div()
+                    .flex_1()
                     .flex()
                     .flex_col()
+                    .justify_between()
                     .gap_2()
                     .p_3()
                     .child(
                         div()
+                            .min_h(px(46.))
                             .text_sm()
                             .font_weight(FontWeight::MEDIUM)
                             .text_color(self.colors.foreground)
-                            .truncate()
                             .child(SharedString::from(book.title.clone())),
                     )
-                    .child(progress_bar)
-                    .child(div().text_xs().text_color(self.colors.muted).child(status)),
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .child(progress_bar)
+                            .child(div().text_xs().text_color(self.colors.muted).child(status)),
+                    ),
             )
             .into_any_element()
     }
