@@ -4009,7 +4009,12 @@ impl Yomu {
             let visible_top = reader.off.1;
             let visible_bottom = visible_top + vp.height;
             for (ix, (top, height)) in tops.iter().zip(&heights).enumerate() {
-                if *top + *height < visible_top || *top > visible_bottom {
+                let overlap = if reader.webcomics && ix + 1 < reader.total {
+                    1.0
+                } else {
+                    0.0
+                };
+                if *top + *height + overlap < visible_top || *top > visible_bottom {
                     continue;
                 }
                 if let Some(page) = reader.images.get(&ix) {
@@ -4017,7 +4022,7 @@ impl Yomu {
                         &page.image,
                         left,
                         *top - reader.off.1,
-                        (width, *height),
+                        (width, *height + overlap),
                     ));
                 } else if let Some(error) = reader.failed.get(&ix) {
                     content.push(centered(
