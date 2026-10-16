@@ -271,6 +271,87 @@ impl ThumbnailSize {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum BorderSize {
+    None,
+    #[default]
+    Thin,
+    Medium,
+}
+
+impl BorderSize {
+    pub const ALL: [BorderSize; 3] = [BorderSize::None, BorderSize::Thin, BorderSize::Medium];
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            BorderSize::None => "None (0px)",
+            BorderSize::Thin => "Thin (1px)",
+            BorderSize::Medium => "Medium (2px)",
+        }
+    }
+
+    pub fn pixels(&self) -> f32 {
+        match self {
+            BorderSize::None => 0.0,
+            BorderSize::Thin => 1.0,
+            BorderSize::Medium => 2.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum CornerRounding {
+    Sharp,
+    #[default]
+    Medium,
+    Soft,
+}
+
+impl CornerRounding {
+    pub const ALL: [CornerRounding; 3] = [
+        CornerRounding::Sharp,
+        CornerRounding::Medium,
+        CornerRounding::Soft,
+    ];
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            CornerRounding::Sharp => "Sharp (0px)",
+            CornerRounding::Medium => "Medium (8px)",
+            CornerRounding::Soft => "Soft (14px)",
+        }
+    }
+
+    /// Base radius for general elements (GPUI Kit `theme.radius`).
+    pub fn radius_pixels(&self) -> f32 {
+        match self {
+            CornerRounding::Sharp => 0.0,
+            CornerRounding::Medium => 6.0,
+            CornerRounding::Soft => 12.0,
+        }
+    }
+
+    /// Radius for cards and dialogs (GPUI Kit `theme.radius_lg`).
+    pub fn radius_lg_pixels(&self) -> f32 {
+        match self {
+            CornerRounding::Sharp => 0.0,
+            CornerRounding::Medium => 8.0,
+            CornerRounding::Soft => 14.0,
+        }
+    }
+
+    /// Radius for large card containers and modal dialogs.
+    pub fn radius_xl_pixels(&self) -> f32 {
+        match self {
+            CornerRounding::Sharp => 0.0,
+            CornerRounding::Medium => 12.0,
+            CornerRounding::Soft => 20.0,
+        }
+    }
+}
+
 /// Preferences that carry over from book to book and between launches.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Settings {
@@ -289,6 +370,12 @@ pub struct Settings {
     /// Thumbnail card size in library grid view.
     #[serde(default)]
     pub thumbnail_size: ThumbnailSize,
+    /// Border thickness across cards, dialogs, and controls.
+    #[serde(default)]
+    pub border_size: BorderSize,
+    /// Corner rounding across cards, dialogs, and controls.
+    #[serde(default)]
+    pub corner_rounding: CornerRounding,
     /// Opacity of the window background, `OPACITY_MIN..=OPACITY_MAX`. Raised widget surfaces use
     /// a small opacity lift to stay distinct; page images, covers, and text remain opaque.
     pub opacity: f32,
@@ -304,6 +391,8 @@ impl Default for Settings {
             webcomics: false,
             group_series: false,
             thumbnail_size: ThumbnailSize::Medium,
+            border_size: BorderSize::Thin,
+            corner_rounding: CornerRounding::Medium,
             opacity: OPACITY_MAX,
         }
     }
@@ -343,6 +432,18 @@ impl Settings {
             .and_then(|v| serde_json::from_value::<ThumbnailSize>(v.clone()).ok())
         {
             settings.thumbnail_size = size;
+        }
+        if let Some(border_size) = object
+            .get("border_size")
+            .and_then(|v| serde_json::from_value::<BorderSize>(v.clone()).ok())
+        {
+            settings.border_size = border_size;
+        }
+        if let Some(corner_rounding) = object
+            .get("corner_rounding")
+            .and_then(|v| serde_json::from_value::<CornerRounding>(v.clone()).ok())
+        {
+            settings.corner_rounding = corner_rounding;
         }
         if let Some(fit) = object
             .get("fit")
@@ -1015,5 +1116,26 @@ mod tests {
         assert!(report.added.is_empty());
         assert_eq!(report.errors.len(), 1);
         assert!(report.errors[0].contains("unsupported"));
+    }
+
+    #[test]
+    fn border_size_and_corner_rounding_persistence() {
+        let tmp = temp_dir("border-rounding");
+        let dirs = DataDirs::at(tmp.join("data")).unwrap();
+        let mut lib = Library::default();
+        lib.settings_mut().border_size = BorderSize::Medium;
+        lib.settings_mut().corner_rounding = CornerRounding::Soft;
+        lib.save(&dirs).unwrap();
+
+        let loaded = Library::load(&dirs).unwrap();
+        assert_eq!(loaded.settings().border_size, BorderSize::Medium);
+        assert_eq!(loaded.settings().corner_rounding, CornerRounding::Soft);
+
+        // Lenient loading with missing fields defaults to Thin / Medium
+        let json = r#"{"books":[],"settings":{}}"#;
+        fs::write(dirs.library_file(), json).unwrap();
+        let loaded = Library::load(&dirs).unwrap();
+        assert_eq!(loaded.settings().border_size, BorderSize::Thin);
+        assert_eq!(loaded.settings().corner_rounding, CornerRounding::Medium);
     }
 }

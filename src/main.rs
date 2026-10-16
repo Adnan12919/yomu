@@ -40,7 +40,7 @@ use image::Frame;
 use yomu::{
     archive, imaging,
     layout::{self, Arrive, FitMode, Viewport},
-    library::{self, Book, DataDirs, Library, Settings, ThumbnailSize},
+    library::{self, Book, BorderSize, CornerRounding, DataDirs, Library, Settings, ThumbnailSize},
     menu::{self, BookAction, Entry, Item},
     motion::{self, InertialScroll},
     pagecache, search,
@@ -251,6 +251,7 @@ impl Yomu {
                 format!("Theme “{selected_theme}” was unavailable; using Default Dark")
             });
         }
+        Self::apply_corner_rounding(library.settings().corner_rounding, cx);
         let mut colors = UiColors::from_app(cx);
         colors.widget_opacity = library.settings().opacity;
         let state = Self {
@@ -779,6 +780,48 @@ impl Yomu {
             .detach();
     }
 
+    fn border_px(&self) -> f32 {
+        self.library.settings().border_size.pixels()
+    }
+
+    fn radius_px(&self) -> f32 {
+        self.library.settings().corner_rounding.radius_pixels()
+    }
+
+    fn radius_lg_px(&self) -> f32 {
+        self.library.settings().corner_rounding.radius_lg_pixels()
+    }
+
+    fn radius_xl_px(&self) -> f32 {
+        self.library.settings().corner_rounding.radius_xl_pixels()
+    }
+
+    fn set_border_size(&mut self, size: BorderSize, cx: &mut Context<Self>) {
+        if self.library.settings().border_size == size {
+            return;
+        }
+        self.library.settings_mut().border_size = size;
+        self.save_library();
+        cx.notify();
+    }
+
+    fn set_corner_rounding(&mut self, rounding: CornerRounding, cx: &mut Context<Self>) {
+        if self.library.settings().corner_rounding == rounding {
+            return;
+        }
+        self.library.settings_mut().corner_rounding = rounding;
+        Self::apply_corner_rounding(rounding, cx);
+        self.save_library();
+        cx.notify();
+    }
+
+    fn apply_corner_rounding(rounding: CornerRounding, cx: &mut App) {
+        KitTheme::update(cx, |theme| {
+            theme.radius = px(rounding.radius_pixels());
+            theme.radius_lg = px(rounding.radius_lg_pixels());
+        });
+    }
+
     fn request_clear_thumbnail_cache(&mut self, cx: &mut Context<Self>) {
         self.overlay = Some(Overlay::Confirm(ConfirmDialog {
             title: "Clear thumbnail cache?".into(),
@@ -862,6 +905,7 @@ impl Yomu {
             return;
         };
         KitTheme::update(cx, |theme| theme.apply_config(&config));
+        Self::apply_corner_rounding(self.library.settings().corner_rounding, cx);
         self.library.settings_mut().theme_name = name.to_string();
         self.colors = UiColors::from_app(cx);
         self.colors.widget_opacity = self.library.settings().opacity;
@@ -914,6 +958,7 @@ impl Yomu {
 
         if let Some(config) = self.custom_themes.get(&selected).cloned() {
             KitTheme::update(cx, |theme| theme.apply_config(&config));
+            Self::apply_corner_rounding(self.library.settings().corner_rounding, cx);
             self.colors = UiColors::from_app(cx);
             self.colors.widget_opacity = self.library.settings().opacity;
         } else if was_custom {
@@ -2400,6 +2445,8 @@ impl Yomu {
     }
 
     fn render_menu(&self, menu: &BookMenu, cx: &mut Context<Self>) -> AnyElement {
+        let border_px = self.border_px();
+        let rounding_lg = self.radius_lg_px();
         let mut list = div()
             .min_w(px(200.))
             .max_w(px(320.))
@@ -2407,10 +2454,11 @@ impl Yomu {
             .flex()
             .flex_col()
             .p_1()
-            .rounded_lg()
+            .rounded(px(rounding_lg))
             .bg(self.menu_surface())
-            .border_1()
-            .border_color(self.colors.border)
+            .when(border_px > 0.0, |this| {
+                this.border(px(border_px)).border_color(self.colors.border)
+            })
             .shadow_lg()
             .text_sm()
             .text_color(self.colors.foreground)
@@ -2489,6 +2537,9 @@ impl Yomu {
             ),
             (IconName::LogOut, "Quit", "Close yomu"),
         ];
+        let border_px = self.border_px();
+        let rounding_lg = self.radius_lg_px();
+        let rounding_md = self.radius_px();
         let mut list = div()
             .min_w(px(240.))
             .max_w(px(360.))
@@ -2497,10 +2548,11 @@ impl Yomu {
             .flex_col()
             .gap_1()
             .p_2()
-            .rounded_lg()
+            .rounded(px(rounding_lg))
             .bg(self.menu_surface())
-            .border_1()
-            .border_color(self.colors.border)
+            .when(border_px > 0.0, |this| {
+                this.border(px(border_px)).border_color(self.colors.border)
+            })
             .shadow_lg()
             .on_mouse_down(MouseButton::Left, |_: &MouseDownEvent, _, cx| {
                 cx.stop_propagation()
@@ -2519,7 +2571,7 @@ impl Yomu {
                     .gap_3()
                     .px_3()
                     .py_2()
-                    .rounded_lg()
+                    .rounded(px(rounding_md))
                     .cursor_pointer()
                     .when(selected, |row| row.bg(self.colors.accent))
                     .when(!selected, |row| {
@@ -2627,6 +2679,7 @@ impl Yomu {
         } else {
             self.colors.foreground
         };
+        let rounding_md = self.radius_px();
         let base = div()
             .id(SharedString::from(format!("menu-item-{ix}")))
             .h(px(28.))
@@ -2634,7 +2687,7 @@ impl Yomu {
             .flex()
             .items_center()
             .gap_2()
-            .rounded_lg()
+            .rounded(px(rounding_md))
             .child(
                 div()
                     .w(px(20.))
@@ -2676,6 +2729,8 @@ impl Yomu {
     }
 
     fn panel(&self, width: f32) -> gpui_kit::Stateful<gpui_kit::Div> {
+        let border_px = self.border_px();
+        let rounding_xl = self.radius_xl_px();
         div()
             .id(SharedString::from(format!("panel-{}", width as u32)))
             .occlude()
@@ -2685,10 +2740,11 @@ impl Yomu {
             .flex_col()
             .gap_4()
             .p_6()
-            .rounded_lg()
+            .rounded(px(rounding_xl))
             .bg(self.widget_surface(self.colors.surface))
-            .border_1()
-            .border_color(self.colors.border)
+            .when(border_px > 0.0, |this| {
+                this.border(px(border_px)).border_color(self.colors.border)
+            })
             .shadow_lg()
             .text_sm()
             .text_color(self.colors.foreground)
@@ -2876,6 +2932,8 @@ impl Yomu {
         let theme_name = settings.theme_name.clone();
         let theme_path = self.custom_theme_path.display().to_string();
         let theme_status = self.theme_status.clone();
+        let border_size = settings.border_size;
+        let corner_rounding = settings.corner_rounding;
         let continuous = settings.continuous;
         let webcomics = settings.webcomics;
         let fit = settings.fit;
@@ -2925,7 +2983,10 @@ impl Yomu {
                     .prefix(Icon::new(IconName::Keyboard)),
             );
 
-        let adw_group = |title: &'static str, rows: Vec<AnyElement>| {
+        let border_px = self.border_px();
+        let rounding_xl = self.radius_xl_px();
+        let rounding_md = self.radius_px();
+        let adw_group = move |title: &'static str, rows: Vec<AnyElement>| {
             div()
                 .flex()
                 .flex_col()
@@ -2942,19 +3003,20 @@ impl Yomu {
                     div()
                         .flex()
                         .flex_col()
-                        .rounded_xl()
-                        .border_1()
-                        .border_color(self.colors.border)
+                        .rounded(px(rounding_xl))
+                        .when(border_px > 0.0, |this| {
+                            this.border(px(border_px)).border_color(self.colors.border)
+                        })
                         .bg(self.widget_surface(self.colors.surface))
                         .children(rows),
                 )
         };
 
-        let adw_row = |icon: IconName,
-                       title: &'static str,
-                       subtitle: Option<String>,
-                       control: AnyElement,
-                       is_last: bool| {
+        let adw_row = move |icon: IconName,
+                            title: &'static str,
+                            subtitle: Option<String>,
+                            control: AnyElement,
+                            is_last: bool| {
             let mut row = div()
                 .flex()
                 .flex_row()
@@ -2977,7 +3039,7 @@ impl Yomu {
                     .child(
                         div()
                             .p_2()
-                            .rounded_lg()
+                            .rounded(px(rounding_md))
                             .bg(self.colors.surface_hover)
                             .text_color(self.colors.accent)
                             .child(Icon::new(icon).size(px(16.))),
@@ -3044,6 +3106,87 @@ impl Yomu {
                         .into_any_element(),
                     false,
                 );
+
+                const BORDER_OPTIONS: &[(BorderSize, &str)] = &[
+                    (BorderSize::None, "None (0px)"),
+                    (BorderSize::Thin, "Thin (1px)"),
+                    (BorderSize::Medium, "Medium (2px)"),
+                ];
+                let border_dropdown = Button::new("settings-border-size")
+                    .label(border_size.label())
+                    .dropdown_caret(true)
+                    .rounded(ButtonRounded::Medium)
+                    .small()
+                    .secondary()
+                    .outline()
+                    .bg(self.colors.surface)
+                    .dropdown_menu_with_anchor(Anchor::TopRight, {
+                        let yomu = yomu.clone();
+                        move |mut menu, _window, _cx| {
+                            for &(val, opt_label) in BORDER_OPTIONS {
+                                let yomu = yomu.clone();
+                                let is_current = val == border_size;
+                                menu = menu.item(
+                                    PopupMenuItem::new(opt_label).checked(is_current).on_click(
+                                        move |_, _window, cx| {
+                                            yomu.update(cx, |this, cx| {
+                                                this.set_border_size(val, cx);
+                                            });
+                                        },
+                                    ),
+                                );
+                            }
+                            menu
+                        }
+                    });
+                let border_row = adw_row(
+                    IconName::Layers,
+                    "Border Thickness",
+                    Some("Border width for cards, dialogs, and controls".into()),
+                    border_dropdown.into_any_element(),
+                    false,
+                );
+
+                const ROUNDING_OPTIONS: &[(CornerRounding, &str)] = &[
+                    (CornerRounding::Sharp, "Sharp (0px)"),
+                    (CornerRounding::Medium, "Medium (8px)"),
+                    (CornerRounding::Soft, "Soft (14px)"),
+                ];
+                let rounding_dropdown = Button::new("settings-corner-rounding")
+                    .label(corner_rounding.label())
+                    .dropdown_caret(true)
+                    .rounded(ButtonRounded::Medium)
+                    .small()
+                    .secondary()
+                    .outline()
+                    .bg(self.colors.surface)
+                    .dropdown_menu_with_anchor(Anchor::TopRight, {
+                        let yomu = yomu.clone();
+                        move |mut menu, _window, _cx| {
+                            for &(val, opt_label) in ROUNDING_OPTIONS {
+                                let yomu = yomu.clone();
+                                let is_current = val == corner_rounding;
+                                menu = menu.item(
+                                    PopupMenuItem::new(opt_label).checked(is_current).on_click(
+                                        move |_, _window, cx| {
+                                            yomu.update(cx, |this, cx| {
+                                                this.set_corner_rounding(val, cx);
+                                            });
+                                        },
+                                    ),
+                                );
+                            }
+                            menu
+                        }
+                    });
+                let rounding_row = adw_row(
+                    IconName::Maximize2,
+                    "Corner Rounding",
+                    Some("Corner radius style across the user interface".into()),
+                    rounding_dropdown.into_any_element(),
+                    false,
+                );
+
                 let reload_row = adw_row(
                     IconName::FolderOpen,
                     "Custom Themes Directory",
@@ -3058,7 +3201,10 @@ impl Yomu {
                     ),
                     true,
                 );
-                let mut app_group = adw_group("APPEARANCE", vec![theme_row, reload_row]);
+                let mut app_group = adw_group(
+                    "APPEARANCE",
+                    vec![theme_row, border_row, rounding_row, reload_row],
+                );
                 if let Some(status) = theme_status {
                     app_group = app_group.child(
                         div()
@@ -3322,9 +3468,11 @@ impl Yomu {
                             div()
                                 .px_2()
                                 .py_0p5()
-                                .rounded_md()
-                                .border_1()
-                                .border_color(with_alpha(self.colors.border, 0.7))
+                                .rounded(px(rounding_md))
+                                .when(border_px > 0.0, |this| {
+                                    this.border(px(border_px))
+                                        .border_color(with_alpha(self.colors.border, 0.7))
+                                })
                                 .bg(self.colors.surface)
                                 .text_xs()
                                 .font_weight(FontWeight::SEMIBOLD)
@@ -3363,9 +3511,10 @@ impl Yomu {
                         div()
                             .flex()
                             .flex_col()
-                            .rounded_xl()
-                            .border_1()
-                            .border_color(self.colors.border)
+                            .rounded(px(rounding_xl))
+                            .when(border_px > 0.0, |this| {
+                                this.border(px(border_px)).border_color(self.colors.border)
+                            })
                             .bg(self.widget_surface(self.colors.surface))
                             .child(
                                 div()
@@ -3480,12 +3629,15 @@ impl Yomu {
         let selected = self.selection.len();
 
         let search_field: AnyElement = if let Some(input) = &self.search_input {
-            Input::new(input)
+            let mut field = Input::new(input)
                 .id("library-search")
                 .cleanable(true)
                 .prefix(Icon::new(IconName::Search).size(px(16.)))
-                .w(px(360.))
-                .into_any_element()
+                .w(px(360.));
+            if self.library.settings().border_size == BorderSize::None {
+                field = field.bordered(false);
+            }
+            field.into_any_element()
         } else {
             div().id("library-search").w(px(360.)).into_any_element()
         };
@@ -3742,20 +3894,30 @@ impl Yomu {
         let thumb_size = self.library.settings().thumbnail_size;
         let card_w = thumb_size.card_width();
         let card_h = thumb_size.card_height();
+        let border_px = self.border_px();
+        let rounding_lg = self.radius_lg_px();
         div()
             .id(SharedString::from(format!("folder-{}", group.key)))
             .w(px(card_w))
             .flex_none()
             .flex()
             .flex_col()
-            .rounded_lg()
-            .border_1()
-            .border_color(self.colors.border)
+            .rounded(px(rounding_lg))
+            .when(border_px > 0.0, |this| {
+                this.border(px(border_px)).border_color(self.colors.border)
+            })
             .bg(self.widget_surface(self.colors.surface))
             .overflow_hidden()
             .cursor_pointer()
             .when(self.overlay.is_none(), |card| {
-                card.hover(|style| style.border_color(self.colors.accent).shadow_md())
+                card.hover(|style| {
+                    let style = if border_px > 0.0 {
+                        style.border_color(self.colors.accent)
+                    } else {
+                        style
+                    };
+                    style.shadow_md()
+                })
             })
             .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                 this.open_group = Some(group_key.clone());
@@ -3767,7 +3929,7 @@ impl Yomu {
                     .w(px(card_w))
                     .h(px(card_h))
                     .overflow_hidden()
-                    .rounded_lg()
+                    .rounded(px(rounding_lg))
                     .bg(self.widget_surface(self.colors.surface))
                     .child(
                         img(self.dirs.cover_for_size(&first.id, thumb_size))
@@ -3817,19 +3979,27 @@ impl Yomu {
         let card_w = thumb_size.card_width();
         let card_h = thumb_size.card_height();
         let selected = self.selection.contains(&book.id);
+        let border_px = self.border_px();
+        let rounding_lg = self.radius_lg_px();
         let cover = div()
             .relative()
             .w(px(card_w))
             .h(px(card_h))
             .flex_none()
-            .rounded_lg()
+            .rounded(px(rounding_lg))
             .overflow_hidden()
             .bg(self.widget_surface(self.colors.surface))
-            .border_2()
-            .border_color(if selected {
-                self.colors.accent
-            } else {
-                self.colors.surface
+            .when(border_px > 0.0 || selected, |this| {
+                this.border(px(if selected {
+                    border_px.max(2.0)
+                } else {
+                    border_px
+                }))
+                .border_color(if selected {
+                    self.colors.accent
+                } else {
+                    self.colors.surface
+                })
             })
             .child(
                 img(self.dirs.cover_for_size(&book.id, thumb_size))
@@ -3858,18 +4028,26 @@ impl Yomu {
             .flex_none()
             .flex()
             .flex_col()
-            .rounded_lg()
-            .border_1()
-            .border_color(if selected {
-                self.colors.accent
-            } else {
-                self.colors.border
+            .rounded(px(rounding_lg))
+            .when(border_px > 0.0, |this| {
+                this.border(px(border_px)).border_color(if selected {
+                    self.colors.accent
+                } else {
+                    self.colors.border
+                })
             })
             .bg(self.widget_surface(self.colors.surface))
             .overflow_hidden()
             .cursor_pointer()
             .when(self.overlay.is_none(), |card| {
-                card.hover(|style| style.border_color(self.colors.accent).shadow_md())
+                card.hover(|style| {
+                    let style = if border_px > 0.0 {
+                        style.border_color(self.colors.accent)
+                    } else {
+                        style
+                    };
+                    style.shadow_md()
+                })
             })
             // `on_click` only ever fires for the left button, so right-clicking never opens a book.
             .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
@@ -4037,14 +4215,18 @@ impl Yomu {
 
         let vim_status = if let Some(input) = reader.vim.cmdline_text() {
             let suggestions = command_suggestions(input);
+            let border_px = self.border_px();
+            let rounding_lg = self.radius_lg_px();
+            let rounding_md = self.radius_px();
             let mut prompt = div()
                 .w(px(560.))
                 .max_w_full()
                 .flex()
                 .flex_col()
-                .rounded_lg()
-                .border_1()
-                .border_color(self.colors.border)
+                .rounded(px(rounding_lg))
+                .when(border_px > 0.0, |this| {
+                    this.border(px(border_px)).border_color(self.colors.border)
+                })
                 .bg(self.colors.surface)
                 .shadow_lg()
                 .text_sm();
@@ -4062,13 +4244,15 @@ impl Yomu {
                             .gap_4()
                             .px_2()
                             .py_1()
-                            .rounded_lg()
+                            .rounded(px(rounding_md))
                             .cursor_pointer()
-                            .border_1()
-                            .border_color(if selected {
-                                with_alpha(self.colors.accent, 0.70)
-                            } else {
-                                with_alpha(self.colors.accent, 0.0)
+                            .when(border_px > 0.0 || selected, |this| {
+                                this.border(px(border_px.max(1.0)))
+                                    .border_color(if selected {
+                                        with_alpha(self.colors.accent, 0.70)
+                                    } else {
+                                        with_alpha(self.colors.accent, 0.0)
+                                    })
                             })
                             .when(selected, |row| row.bg(with_alpha(self.colors.accent, 0.20)))
                             .hover(|row| row.bg(with_alpha(self.colors.accent, 0.15)))
@@ -4182,7 +4366,11 @@ impl Yomu {
             .children(info)
             .children(hud)
             .children(vim_status)
-            .children(reader.show_help.then(|| help_overlay(self.colors)))
+            .children(
+                reader
+                    .show_help
+                    .then(|| help_overlay(self.colors, self.border_px(), self.radius_xl_px())),
+            )
             .into_any_element()
     }
 }
@@ -4425,7 +4613,7 @@ fn command_suggestions(input: &str) -> Vec<(String, String, &'static str)> {
         .collect()
 }
 
-fn help_overlay(colors: UiColors) -> AnyElement {
+fn help_overlay(colors: UiColors, border_px: f32, rounding_xl: f32) -> AnyElement {
     let mut panel = div()
         .w(px(600.))
         .max_w_full()
@@ -4433,9 +4621,10 @@ fn help_overlay(colors: UiColors) -> AnyElement {
         .flex_col()
         .gap_3()
         .p_6()
-        .rounded_lg()
-        .border_1()
-        .border_color(colors.border)
+        .rounded(px(rounding_xl))
+        .when(border_px > 0.0, |this| {
+            this.border(px(border_px)).border_color(colors.border)
+        })
         .bg(colors.surface)
         .shadow_lg()
         .text_sm();
@@ -5216,6 +5405,58 @@ mod tests {
             FitMode::Width
         );
         assert!(book(&view, cx, &fx.ids[2]).is_finished());
+    }
+
+    #[gpui_kit::test]
+    fn border_and_rounding_settings_survive_a_restart_and_reset(cx: &mut TestAppContext) {
+        let fx = fixture("border-rounding-ui");
+        {
+            let (view, cx) = launch(&fx, cx);
+            view.update(cx, |this, cx| {
+                this.set_border_size(BorderSize::Medium, cx);
+                this.set_corner_rounding(CornerRounding::Soft, cx);
+            });
+            assert_eq!(
+                view.read_with(cx, |this, _| this.library.settings().border_size),
+                BorderSize::Medium
+            );
+            assert_eq!(
+                view.read_with(cx, |this, _| this.library.settings().corner_rounding),
+                CornerRounding::Soft
+            );
+        }
+
+        // Restarting the app preserves the configured border size and corner rounding
+        let (view, cx) = launch(&fx, cx);
+        assert_eq!(
+            view.read_with(cx, |this, _| this.library.settings().border_size),
+            BorderSize::Medium
+        );
+        assert_eq!(
+            view.read_with(cx, |this, _| this.library.settings().corner_rounding),
+            CornerRounding::Soft
+        );
+        assert_eq!(view.read_with(cx, |this, _| this.border_px()), 2.0);
+        assert_eq!(view.read_with(cx, |this, _| this.radius_px()), 12.0);
+        assert_eq!(view.read_with(cx, |this, _| this.radius_lg_px()), 14.0);
+
+        // Reset restores defaults
+        view.update(cx, |this, cx| {
+            this.open_settings(cx);
+            this.request_reset_settings(cx);
+        });
+        cx.simulate_keystrokes("enter");
+        assert_eq!(
+            view.read_with(cx, |this, _| this.library.settings().border_size),
+            BorderSize::Thin
+        );
+        assert_eq!(
+            view.read_with(cx, |this, _| this.library.settings().corner_rounding),
+            CornerRounding::Medium
+        );
+        assert_eq!(view.read_with(cx, |this, _| this.border_px()), 1.0);
+        assert_eq!(view.read_with(cx, |this, _| this.radius_px()), 6.0);
+        assert_eq!(view.read_with(cx, |this, _| this.radius_lg_px()), 8.0);
     }
 
     #[gpui_kit::test]
