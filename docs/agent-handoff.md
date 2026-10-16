@@ -132,6 +132,14 @@ Settings uses active Kit themes rather than a Yomu palette. Tabs are open to fut
   4. **Removed context menu separator line:** Separators inside `render_menu` were removed for a sleek, cohesive look matching the Noctalia design language.
   5. **Updated test suite:** Replaced obsolete opacity slider tests with `window_appearance_is_always_opaque`, verifying all 138 unit and UI tests pass cleanly.
 
+### 7. Pre-migration UI polish & native UI migration plan
+- **RTL Removal:** Right-to-left (manga) toggle mode, keybindings (`r`), commands (`:rtl`, `:ltr`), and tests were completely removed across `src/layout.rs`, `src/motion.rs`, `src/vim.rs`, `src/library.rs`, `src/main.rs`, and `README.md`. Single-page and continuous vertical modes run strictly left-to-right.
+- **Library Grid Alignment:** Tuned `ThumbnailSize::Large` to 240px and `ExtraLarge` to 280px; introduced centered responsive grid calculation (`make_grid`) based on window viewport width, eliminating trailing right-side empty space on 1366px/1080p displays.
+- **Async Cover Art Generation:** Thumbnail resizing on size changes was offloaded to background threads (`cx.background_executor().spawn(...).detach()`), preventing UI freezing.
+- **Button Rounding Consistency:** Changed `ButtonRounded::Large` (which rendered as circular pills) to `ButtonRounded::Medium` across `panel_button`, `button_colored`, and `icon_button` for uniform rectangular shapes with rounded corners.
+- **Hover & Scrim Occlusion:** Added `.id(...).occlude()` to modal dialog scrims, panels, and dropdown menus, and guarded library card hover rings with `.when(self.overlay.is_none(), ...)`, stopping cursor hover states from leaking through overlays to the library cards underneath.
+- **Native Component Migration Plan:** Audited remaining ad-hoc `div()` widgets (dropdowns, toggle switches, destructive buttons, and menu hover border jumps) and documented the comprehensive migration plan to native GPUI Kit components (`DropdownMenu`, `PopupMenu`, `Switch`, and `Dialog`) in `ui-migration-plan.md`.
+
 ## Build and verification
 
 On the configured NixOS system, use `devenv shell` (or `nix develop`) before launching. Useful commands:

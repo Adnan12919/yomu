@@ -46,8 +46,58 @@ impl DataDirs {
     }
 
     pub fn cover(&self, id: &str) -> PathBuf {
-        self.root.join("covers").join(format!("{id}.jpg"))
+        self.cover_for_size(id, ThumbnailSize::Medium)
     }
+
+    pub fn cover_for_size(&self, id: &str, size: ThumbnailSize) -> PathBuf {
+        let size_path = self
+            .root
+            .join("covers")
+            .join(size.dir_name())
+            .join(format!("{id}.jpg"));
+        if size_path.exists() {
+            return size_path;
+        }
+        let legacy_path = self.root.join("covers").join(format!("{id}.jpg"));
+        if legacy_path.exists() {
+            return legacy_path;
+        }
+        size_path
+    }
+
+    pub fn cover_dir_for_size(&self, size: ThumbnailSize) -> PathBuf {
+        self.root.join("covers").join(size.dir_name())
+    }
+
+    pub fn clear_covers(&self) -> Result<()> {
+        let covers_dir = self.root.join("covers");
+        if covers_dir.exists() {
+            fs::remove_dir_all(&covers_dir).context("removing covers directory")?;
+        }
+        fs::create_dir_all(&covers_dir).context("recreating covers directory")?;
+        Ok(())
+    }
+
+    pub fn cache_size_bytes(&self) -> u64 {
+        let covers_dir = self.root.join("covers");
+        dir_size_recursive(&covers_dir)
+    }
+}
+
+fn dir_size_recursive(path: &Path) -> u64 {
+    let mut total = 0;
+    if let Ok(entries) = fs::read_dir(path) {
+        for entry in entries.flatten() {
+            if let Ok(meta) = entry.metadata() {
+                if meta.is_dir() {
+                    total += dir_size_recursive(&entry.path());
+                } else {
+                    total += meta.len();
+                }
+            }
+        }
+    }
+    total
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -148,13 +198,84 @@ pub fn clamp_opacity(value: f32) -> f32 {
 /// * 3: library grouping defaults to on, with directory-based folder groups.
 pub const LIBRARY_VERSION: u32 = 3;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ThumbnailSize {
+    Small,
+    #[default]
+    Medium,
+    Large,
+    ExtraLarge,
+}
+
+impl ThumbnailSize {
+    pub const ALL: [ThumbnailSize; 4] = [
+        ThumbnailSize::Small,
+        ThumbnailSize::Medium,
+        ThumbnailSize::Large,
+        ThumbnailSize::ExtraLarge,
+    ];
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            ThumbnailSize::Small => "Small (180px)",
+            ThumbnailSize::Medium => "Medium (210px)",
+            ThumbnailSize::Large => "Large (240px)",
+            ThumbnailSize::ExtraLarge => "Extra Large (280px)",
+        }
+    }
+
+    pub fn card_width(&self) -> f32 {
+        match self {
+            ThumbnailSize::Small => 180.0,
+            ThumbnailSize::Medium => 210.0,
+            ThumbnailSize::Large => 240.0,
+            ThumbnailSize::ExtraLarge => 280.0,
+        }
+    }
+
+    pub fn card_height(&self) -> f32 {
+        match self {
+            ThumbnailSize::Small => 270.0,
+            ThumbnailSize::Medium => 315.0,
+            ThumbnailSize::Large => 360.0,
+            ThumbnailSize::ExtraLarge => 420.0,
+        }
+    }
+
+    pub fn pixel_dimensions(&self) -> (u32, u32) {
+        match self {
+            ThumbnailSize::Small => (360, 540),
+            ThumbnailSize::Medium => (420, 630),
+            ThumbnailSize::Large => (480, 720),
+            ThumbnailSize::ExtraLarge => (560, 840),
+        }
+    }
+
+    pub fn dir_name(&self) -> &'static str {
+        match self {
+            ThumbnailSize::Small => "small",
+            ThumbnailSize::Medium => "medium",
+            ThumbnailSize::Large => "large",
+            ThumbnailSize::ExtraLarge => "xlarge",
+        }
+    }
+
+    pub fn next(&self) -> Self {
+        match self {
+            ThumbnailSize::Small => ThumbnailSize::Medium,
+            ThumbnailSize::Medium => ThumbnailSize::Large,
+            ThumbnailSize::Large => ThumbnailSize::ExtraLarge,
+            ThumbnailSize::ExtraLarge => ThumbnailSize::Small,
+        }
+    }
+}
+
 /// Preferences that carry over from book to book and between launches.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Settings {
     /// Name of the GPUI Kit theme selected in Appearance settings.
     pub theme_name: String,
-    /// Right-to-left reading order (manga). Off by default: pages run left to right.
-    pub rtl: bool,
     pub fit: FitMode,
     /// Slide between pages and glide when scrolling. Reduced-motion preferences of the desktop
     /// switch this off regardless of the stored value.
@@ -165,6 +286,9 @@ pub struct Settings {
     pub webcomics: bool,
     /// Group books into directory folders, with manual series assignments taking precedence.
     pub group_series: bool,
+    /// Thumbnail card size in library grid view.
+    #[serde(default)]
+    pub thumbnail_size: ThumbnailSize,
     /// Opacity of the window background, `OPACITY_MIN..=OPACITY_MAX`. Raised widget surfaces use
     /// a small opacity lift to stay distinct; page images, covers, and text remain opaque.
     pub opacity: f32,
@@ -174,12 +298,12 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             theme_name: "Default Dark".to_string(),
-            rtl: false,
             fit: FitMode::Page,
             animate: true,
             continuous: false,
             webcomics: false,
             group_series: false,
+            thumbnail_size: ThumbnailSize::Medium,
             opacity: OPACITY_MAX,
         }
     }
@@ -197,9 +321,6 @@ impl Settings {
         let Some(object) = value.as_object() else {
             return settings;
         };
-        if let Some(rtl) = object.get("rtl").and_then(|v| v.as_bool()) {
-            settings.rtl = rtl;
-        }
         if let Some(theme_name) = object.get("theme_name").and_then(|v| v.as_str()) {
             if !theme_name.trim().is_empty() {
                 settings.theme_name = theme_name.to_string();
@@ -216,6 +337,12 @@ impl Settings {
         }
         if let Some(group_series) = object.get("group_series").and_then(|v| v.as_bool()) {
             settings.group_series = group_series;
+        }
+        if let Some(size) = object
+            .get("thumbnail_size")
+            .and_then(|v| serde_json::from_value::<ThumbnailSize>(v.clone()).ok())
+        {
+            settings.thumbnail_size = size;
         }
         if let Some(fit) = object
             .get("fit")
@@ -262,13 +389,6 @@ impl Default for Library {
 impl Library {
     /// Bring a library written by an older version up to date.
     fn migrate(&mut self) {
-        if self.version < 2 {
-            // Reading direction used to default to right-to-left and that default was written
-            // into every library file, so a stored `true` cannot be told apart from a deliberate
-            // choice. Move everyone to the new left-to-right default; manga readers switch it
-            // back once with `r` and it sticks from then on.
-            self.settings.rtl = false;
-        }
         // Directory folders are the default library presentation from version 3 onward. Keep
         // an explicit value from an existing library so users who disabled grouping retain that
         // choice; missing values inherit the new default through `Settings::default`.
@@ -342,10 +462,60 @@ impl Library {
         true
     }
 
-    /// Remove from the library and delete the cached cover. The comic file itself is untouched.
+    /// Remove from the library and delete the cached cover across all size tiers. The comic file itself is untouched.
     pub fn remove(&mut self, id: &str, dirs: &DataDirs) {
         self.books.retain(|b| b.id != id);
-        let _ = fs::remove_file(dirs.cover(id));
+        for size in ThumbnailSize::ALL {
+            let _ = fs::remove_file(
+                dirs.root
+                    .join("covers")
+                    .join(size.dir_name())
+                    .join(format!("{id}.jpg")),
+            );
+        }
+        let _ = fs::remove_file(dirs.root.join("covers").join(format!("{id}.jpg")));
+    }
+
+    /// Clear all cached covers for all sizes.
+    pub fn clear_cover_cache(&self, dirs: &DataDirs) -> Result<()> {
+        dirs.clear_covers()
+    }
+
+    /// Clear all app data: books, reading history, marks, reset settings, and delete covers.
+    pub fn clear_all_data(&mut self, dirs: &DataDirs) -> Result<()> {
+        self.books.clear();
+        self.settings = Settings::default();
+        let _ = dirs.clear_covers();
+        self.save(dirs)?;
+        Ok(())
+    }
+
+    /// Rebuild/ensure cover thumbnails exist for the requested size. Returns count of newly generated covers.
+    pub fn ensure_covers_for_size(&self, dirs: &DataDirs, size: ThumbnailSize) -> usize {
+        let target_dir = dirs.cover_dir_for_size(size);
+        let _ = fs::create_dir_all(&target_dir);
+        let (max_w, max_h) = size.pixel_dimensions();
+        let mut built = 0;
+
+        for book in &self.books {
+            let cover_path = target_dir.join(format!("{}.jpg", book.id));
+            if cover_path.exists() {
+                continue;
+            }
+            if let Ok(pages) = archive::list_pages(&book.path, book.kind) {
+                for name in pages.iter().take(3) {
+                    if let Ok(bytes) = archive::read_page(&book.path, book.kind, name) {
+                        if let Ok(jpeg) = imaging::make_cover_jpeg(&bytes, max_w, max_h) {
+                            if fs::write(&cover_path, jpeg).is_ok() {
+                                built += 1;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        built
     }
 
     /// Assign or clear a series for several books. Names are trimmed and matching existing
@@ -529,7 +699,13 @@ fn build_book(path: &Path, kind: SourceKind, dirs: &DataDirs) -> Result<Book> {
         if let Ok(jpeg) =
             imaging::make_cover_jpeg(&bytes, imaging::COVER_MAX_W, imaging::COVER_MAX_H)
         {
-            fs::write(dirs.cover(&id), jpeg).context("writing cover")?;
+            let _ = fs::write(dirs.root.join("covers").join(format!("{id}.jpg")), &jpeg);
+            let _ = fs::create_dir_all(dirs.cover_dir_for_size(ThumbnailSize::Medium));
+            let _ = fs::write(
+                dirs.cover_dir_for_size(ThumbnailSize::Medium)
+                    .join(format!("{id}.jpg")),
+                &jpeg,
+            );
             cover_written = true;
             break;
         }
@@ -693,7 +869,6 @@ mod tests {
         book.marks.insert("a".into(), 3);
         assert!(lib.add(book.clone()));
         assert!(!lib.add(book));
-        lib.settings_mut().rtl = true;
         lib.settings_mut().animate = false;
         lib.settings_mut().fit = FitMode::Width;
         lib.save(&dirs).unwrap();
@@ -702,10 +877,6 @@ mod tests {
         assert_eq!(loaded.books().len(), 1);
         assert_eq!(loaded.get("abc").unwrap().current_page, 9);
         assert_eq!(loaded.get("abc").unwrap().marks.get("a"), Some(&3));
-        assert!(
-            loaded.settings().rtl,
-            "a deliberate right-to-left choice is kept"
-        );
         assert!(!loaded.settings().animate);
         assert_eq!(loaded.settings().fit, FitMode::Width);
     }
@@ -718,7 +889,6 @@ mod tests {
         fs::write(dirs.library_file(), json).unwrap();
         let loaded = Library::load(&dirs).unwrap();
         assert_eq!(loaded.books().len(), 1);
-        assert!(!loaded.settings().rtl, "left to right is the default");
         assert!(loaded.settings().animate);
         assert_eq!(loaded.settings().fit, FitMode::Page);
         assert!(loaded.get("x").unwrap().marks.is_empty());
@@ -800,10 +970,10 @@ mod tests {
         assert_eq!(*loaded.settings(), Settings::default());
         assert!(!dirs.library_file().with_extension("json.corrupt").exists());
 
-        let json = r#"{"version":2,"books":[],"settings":{"rtl":true,"animate":"yes","fit":"Width","opacity":7.5}}"#;
+        let json =
+            r#"{"version":2,"books":[],"settings":{"animate":"yes","fit":"Width","opacity":7.5}}"#;
         fs::write(dirs.library_file(), json).unwrap();
         let loaded = Library::load(&dirs).unwrap();
-        assert!(loaded.settings().rtl);
         assert!(
             loaded.settings().animate,
             "a mistyped value falls back to the default"
@@ -824,32 +994,6 @@ mod tests {
             *Library::load(&dirs).unwrap().settings(),
             Settings::default()
         );
-    }
-
-    #[test]
-    fn reading_direction_default_moves_to_left_to_right_once() {
-        let tmp = temp_dir("direction");
-        let dirs = DataDirs::at(tmp.join("data")).unwrap();
-
-        // a file written by the old version: right-to-left was stored as the default
-        let old = r#"{"books":[],"settings":{"rtl":true,"fit":"Page","opacity":1.0}}"#;
-        fs::write(dirs.library_file(), old).unwrap();
-        let mut lib = Library::load(&dirs).unwrap();
-        assert!(!lib.settings().rtl, "migrated to the left-to-right default");
-
-        // choosing right-to-left afterwards is saved with the new version and survives reloads
-        lib.settings_mut().rtl = true;
-        lib.save(&dirs).unwrap();
-        let text = fs::read_to_string(dirs.library_file()).unwrap();
-        assert!(text.contains(&format!("\"version\": {LIBRARY_VERSION}")));
-        assert!(Library::load(&dirs).unwrap().settings().rtl);
-        assert!(Library::load(&dirs).unwrap().settings().rtl);
-
-        // a brand new library starts at the current version with left-to-right
-        let fresh = Library::default();
-        assert!(!fresh.settings().rtl);
-        fresh.save(&dirs).unwrap();
-        assert!(!Library::load(&dirs).unwrap().settings().rtl);
     }
 
     #[test]

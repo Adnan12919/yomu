@@ -142,10 +142,10 @@ pub fn zoom_anchor_offset(
     )
 }
 
-pub fn arrival_offset(arrive: Arrive, rtl: bool, max: (f32, f32)) -> (f32, f32) {
+pub fn arrival_offset(arrive: Arrive, max: (f32, f32)) -> (f32, f32) {
     match arrive {
-        Arrive::Start => (if rtl { max.0 } else { 0.0 }, 0.0),
-        Arrive::End => (if rtl { 0.0 } else { max.0 }, max.1),
+        Arrive::Start => (0.0, 0.0),
+        Arrive::End => (max.0, max.1),
     }
 }
 
@@ -261,12 +261,10 @@ mod tests {
     }
 
     #[test]
-    fn arrival_respects_reading_direction() {
+    fn arrival_offsets_match_bounds() {
         let max = (500.0, 900.0);
-        assert_eq!(arrival_offset(Arrive::Start, true, max), (500.0, 0.0));
-        assert_eq!(arrival_offset(Arrive::Start, false, max), (0.0, 0.0));
-        assert_eq!(arrival_offset(Arrive::End, true, max), (0.0, 900.0));
-        assert_eq!(arrival_offset(Arrive::End, false, max), (500.0, 900.0));
+        assert_eq!(arrival_offset(Arrive::Start, max), (0.0, 0.0));
+        assert_eq!(arrival_offset(Arrive::End, max), (500.0, 900.0));
     }
 
     #[test]

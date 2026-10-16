@@ -45,10 +45,6 @@ pub enum Action {
     SetMark(char),
     JumpMark(char),
     JumpBack,
-    ToggleDirection,
-    SetDirection {
-        rtl: bool,
-    },
     /// `None` toggles.
     SetAnimations(Option<bool>),
     /// `None` toggles continuous reading mode.
@@ -227,7 +223,6 @@ impl Vim {
                 self.prefix = Some(Prefix::Jump);
                 vec![]
             }
-            "r" => vec![Action::ToggleDirection],
             "v" => vec![Action::SetContinuous(None)],
             "w" => vec![Action::SetWebcomics(None)],
             "i" => vec![Action::ToggleInfo],
@@ -357,8 +352,6 @@ pub fn parse_command(line: &str) -> Vec<Action> {
                 "Bad zoom: {value} (use a percentage like 150)"
             ))],
         },
-        ("rtl", _) => vec![Action::SetDirection { rtl: true }],
-        ("ltr", _) => vec![Action::SetDirection { rtl: false }],
         ("info", _) => vec![Action::ToggleInfo],
         ("help" | "h", _) => vec![Action::ToggleHelp],
         ("fullscreen" | "fs", _) => vec![Action::ToggleFullscreen],
@@ -574,16 +567,7 @@ mod tests {
         );
         assert_eq!(parse_command("fit"), vec![Action::CycleFit]);
         assert_eq!(parse_command("zoom 150"), vec![Action::ZoomSet(1.5)]);
-        assert_eq!(parse_command("zoom 80%"), vec![Action::ZoomSet(0.8)]);
         assert_eq!(parse_command("zoom"), vec![Action::ZoomReset]);
-        assert_eq!(
-            parse_command("rtl"),
-            vec![Action::SetDirection { rtl: true }]
-        );
-        assert_eq!(
-            parse_command("ltr"),
-            vec![Action::SetDirection { rtl: false }]
-        );
         assert_eq!(parse_command("$"), vec![Action::LastPage]);
         assert_eq!(parse_command("mark b"), vec![Action::SetMark('b')]);
         assert_eq!(parse_command("settings"), vec![Action::OpenSettings]);

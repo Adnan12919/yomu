@@ -12,7 +12,6 @@ rendering is GPU-accelerated, and it talks to Wayland directly (no webview, no T
 - Fit page / width / height / original size, zoom in and out, pan by dragging
 - Continuous vertical reading mode and gapless webcomics strip mode; single-page mode remains available
 - Vim motions (counts, `gg`, `G`, marks, `:` commands) next to the normal keys
-- Left-to-right by default, like a Western comic; right-to-left (manga) is a preference (`r` or `:rtl`)
 - A short slide between pages and a smooth scroll glide, frame-rate independent, switchable (`:animate off`)
 - Progress is saved on every page turn and restored when you reopen a book
 - Pages are decoded on background threads at the resolution the current zoom needs, with the next pages prefetched
@@ -124,7 +123,6 @@ Counts work on motions: `5j` scrolls five steps, `3J` skips three pages. Marks a
 | `0`, `z0` | Reset zoom to the fit size |
 | `Ctrl` + wheel | Zoom at the pointer |
 | `zt` `zz` `zb` | Scroll to the top / middle / bottom of the page |
-| `r` | Toggle right-to-left / left-to-right |
 | `v` | Toggle continuous vertical scrolling |
 | `w` | Toggle gapless webcomics mode (forces continuous scrolling) |
 | `i` | Show page number, fit mode and zoom |
@@ -144,19 +142,13 @@ and show the parser's error message when run.
 | `:12` | Go to page 12 |
 | `:fit width`, `:fit page`, `:fit height`, `:fit original` | Set the fit mode |
 | `:zoom 150` | Zoom to 150% of the fit size (`:zoom` resets) |
-| `:rtl`, `:ltr` | Reading direction |
 | `:continuous on`, `:continuous off` | Stack pages vertically or return to single-page reading |
 | `:webcomics on`, `:webcomics off` | Force gapless pages or restore the normal reading mode |
 | `:q` | Back to the library |
 | `:qa` | Quit |
 
-By default pages run left to right: `Right` and `l` go forward, `Left` and `h` go back. In right-to-left mode
-(`r` or `:rtl`) it is the other way round, like turning a printed manga. The fit mode, reading direction and
+By default pages run left to right: `Right` and `l` go forward, `Left` and `h` go back. The fit mode and
 animation preference are remembered between books.
-
-Libraries from versions that defaulted to right-to-left are moved to left-to-right once when they are first
-opened (the old default was stored in every library file, so it cannot be told apart from a deliberate choice).
-Manga readers press `r` once and it sticks.
 
 ## Selecting several books
 

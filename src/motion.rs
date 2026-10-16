@@ -58,10 +58,9 @@ pub fn step_scroll(current: (f32, f32), target: (f32, f32), dt: f32) -> ((f32, f
 /// Which way the page content travels during a turn: `-1.0` means it moves left (the new page
 /// slides in from the right), `+1.0` means it moves right.
 ///
-/// Left-to-right: going forward moves content left, going back moves it right.
-/// Right-to-left (manga) is the mirror image.
-pub fn travel(forward: bool, rtl: bool) -> f32 {
-    if forward != rtl { -1.0 } else { 1.0 }
+/// Going forward moves content left, going back moves it right.
+pub fn travel(forward: bool) -> f32 {
+    if forward { -1.0 } else { 1.0 }
 }
 
 /// A page-turn slide. Shifts are expressed in viewport widths so a window resize cannot leave the
@@ -242,13 +241,9 @@ mod tests {
     }
 
     #[test]
-    fn travel_follows_reading_direction_and_navigation_action() {
-        // left to right
-        assert_eq!(travel(true, false), -1.0, "forward: content moves left");
-        assert_eq!(travel(false, false), 1.0, "back: content moves right");
-        // right to left (manga) is the mirror image
-        assert_eq!(travel(true, true), 1.0);
-        assert_eq!(travel(false, true), -1.0);
+    fn travel_follows_navigation_action() {
+        assert_eq!(travel(true), -1.0, "forward: content moves left");
+        assert_eq!(travel(false), 1.0, "back: content moves right");
     }
 
     #[test]

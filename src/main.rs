@@ -35,12 +35,12 @@ use yomu::{
     archive::{self, SourceKind},
     imaging,
     layout::{self, Arrive, FitMode, Viewport},
-    library::{self, Book, DataDirs, Library, Settings},
+    library::{self, Book, DataDirs, Library, Settings, ThumbnailSize},
     menu::{self, BookAction, Entry, Item},
     motion::{self, PageTransition},
     pagecache, search,
     selection::Selection,
-    util::now_secs,
+    util::{format_size, now_secs},
     vim::{self, Action, Amount, Dir, Vim},
 };
 
@@ -307,9 +307,6 @@ fn load_custom_themes(path: &Path, cx: &App) -> Result<HashMap<String, Rc<ThemeC
     parse_custom_themes(&contents, &built_in_names)
 }
 
-const CARD_W: f32 = 180.0;
-const CARD_H: f32 = 270.0;
-
 /// How far `j`/`k`/`h`/`l` scroll, in logical pixels.
 const LINE_STEP: f32 = 64.0;
 /// A wheel notch scrolls this many pixels (and is one zoom step with Ctrl).
@@ -378,8 +375,6 @@ struct Reader {
     page: usize,
     total: usize,
 
-    /// Right-to-left reading order (manga). Off by default: pages run left to right.
-    rtl: bool,
     fit: FitMode,
     /// Multiplier on top of the fit size; `1.0` is exactly the fit.
     zoom: f32,
@@ -430,7 +425,6 @@ impl Reader {
             orig_sizes: Vec::new(),
             page: book.current_page.min(book.page_count.saturating_sub(1)),
             total: book.page_count,
-            rtl: settings.rtl,
             fit: settings.fit,
             zoom: 1.0,
             off: (0.0, 0.0),
@@ -525,7 +519,7 @@ impl Reader {
         let display = layout::display_size(self.fit, self.zoom, orig, vp);
         let max = layout::max_offset(display, vp);
         if let Some(arrive) = self.arrive.take() {
-            self.set_scroll(layout::arrival_offset(arrive, self.rtl, max));
+            self.set_scroll(layout::arrival_offset(arrive, max));
         }
         self.off = layout::clamp_offset(self.off, display, vp);
         self.scroll_target = layout::clamp_offset(self.scroll_target, display, vp);
@@ -576,7 +570,7 @@ impl Reader {
             return;
         };
 
-        let travel = motion::travel(forward, self.rtl);
+        let travel = motion::travel(forward);
         let display = layout::display_size(self.fit, self.zoom, orig, &vp);
         let origin = layout::origin(self.off, display, &vp);
         let next = match self.transition {
@@ -656,6 +650,8 @@ enum ConfirmAction {
     Book(BookAction, String),
     RemoveSelected,
     ResetSettings,
+    ClearThumbnailCache,
+    ClearAllData,
 }
 
 struct ConfirmDialog {
@@ -696,7 +692,14 @@ enum SettingsTab {
     Appearance,
     Library,
     Reader,
+    Storage,
     Keyboard,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SettingsDropdown {
+    ThumbnailSize,
+    PageFit,
 }
 
 struct LibraryGroup<'a> {
@@ -799,6 +802,7 @@ struct Yomu {
     frame_dt: Option<f32>,
     overlay: Option<Overlay>,
     settings_tab: SettingsTab,
+    settings_dropdown: Option<SettingsDropdown>,
     command_selection: usize,
     overlay_closed_at: Option<Instant>,
     /// Books picked for bulk actions in the library.
@@ -888,6 +892,7 @@ impl Yomu {
             frame_dt: None,
             overlay: None,
             settings_tab: SettingsTab::Appearance,
+            settings_dropdown: None,
             command_selection: 0,
             overlay_closed_at: None,
             selection: Selection::new(),
@@ -1054,6 +1059,7 @@ impl Yomu {
 
     /// Close the current overlay without touching anything else.
     fn dismiss(&mut self) {
+        self.settings_dropdown = None;
         if self.overlay.take().is_some() {
             self.overlay_closed_at = Some(Instant::now());
         }
@@ -1274,6 +1280,8 @@ impl Yomu {
             ConfirmAction::Book(action, id) => self.perform_book_action(action, &id, window, cx),
             ConfirmAction::RemoveSelected => self.remove_selected(cx),
             ConfirmAction::ResetSettings => self.reset_settings(cx),
+            ConfirmAction::ClearThumbnailCache => self.clear_thumbnail_cache(cx),
+            ConfirmAction::ClearAllData => self.clear_all_data(cx),
         }
     }
 
@@ -1294,6 +1302,66 @@ impl Yomu {
         self.open_settings(cx);
     }
 
+    fn set_thumbnail_size(&mut self, size: ThumbnailSize, cx: &mut Context<Self>) {
+        if self.library.settings().thumbnail_size == size {
+            return;
+        }
+        self.library.settings_mut().thumbnail_size = size;
+        self.save_library();
+        cx.notify();
+
+        let library = self.library.clone();
+        let dirs = (*self.dirs).clone();
+        cx.background_executor()
+            .spawn(async move {
+                library.ensure_covers_for_size(&dirs, size);
+            })
+            .detach();
+    }
+
+    fn request_clear_thumbnail_cache(&mut self, cx: &mut Context<Self>) {
+        self.overlay = Some(Overlay::Confirm(ConfirmDialog {
+            title: "Clear thumbnail cache?".into(),
+            message: "All cached cover thumbnails will be deleted and regenerated on demand. Comics and reading progress remain intact.".into(),
+            confirm_label: "Clear Cache",
+            action: ConfirmAction::ClearThumbnailCache,
+        }));
+        cx.notify();
+    }
+
+    fn clear_thumbnail_cache(&mut self, cx: &mut Context<Self>) {
+        let _ = self.library.clear_cover_cache(&self.dirs);
+        let size = self.library.settings().thumbnail_size;
+        let library = self.library.clone();
+        let dirs = (*self.dirs).clone();
+        cx.background_executor()
+            .spawn(async move {
+                library.ensure_covers_for_size(&dirs, size);
+            })
+            .detach();
+        self.overlay = Some(Overlay::Settings);
+        cx.notify();
+    }
+
+    fn request_clear_all_data(&mut self, cx: &mut Context<Self>) {
+        self.overlay = Some(Overlay::Confirm(ConfirmDialog {
+            title: "Reset all application data?".into(),
+            message: "This will permanently remove all books, reading progress, marks, settings, and cached thumbnails.".into(),
+            confirm_label: "Reset Everything",
+            action: ConfirmAction::ClearAllData,
+        }));
+        cx.notify();
+    }
+
+    fn clear_all_data(&mut self, cx: &mut Context<Self>) {
+        self.reader = None;
+        self.selection.clear();
+        self.open_group = None;
+        let _ = self.library.clear_all_data(&self.dirs);
+        self.overlay = Some(Overlay::Settings);
+        cx.notify();
+    }
+
     fn request_reset_settings(&mut self, cx: &mut Context<Self>) {
         if *self.library.settings() == Settings::default() {
             return;
@@ -1312,7 +1380,6 @@ impl Yomu {
         let defaults = self.library.settings().clone();
         self.apply_theme(&defaults.theme_name, cx);
         if let Some(reader) = self.reader.as_mut() {
-            reader.rtl = defaults.rtl;
             reader.fit = defaults.fit;
             reader.zoom = 1.0;
             reader.continuous = defaults.continuous;
@@ -2009,13 +2076,12 @@ impl Yomu {
         self.goto_page(target, arrive, cx);
     }
 
-    /// Screen-edge clicks are about screen direction, so which one advances depends on the
-    /// reading direction.
+    /// Screen-edge clicks: left goes back, right advances.
     fn step(&mut self, side: Side, cx: &mut Context<Self>) {
-        let Some(rtl) = self.reader.as_ref().map(|r| r.rtl) else {
+        if self.reader.is_none() {
             return;
-        };
-        let forward = matches!((side, rtl), (Side::Left, true) | (Side::Right, false));
+        }
+        let forward = matches!(side, Side::Right);
         let arrive = if forward { Arrive::Start } else { Arrive::End };
         self.turn_by(forward, 1, arrive, cx);
     }
@@ -2062,13 +2128,8 @@ impl Yomu {
             (max.0, vp.width, reader.scroll_target.0)
         };
 
-        // Which way a page turn goes when the page cannot scroll: down is forward, and
-        // left/right depend on the reading direction.
-        let turn_forward = if vertical {
-            positive
-        } else {
-            positive != reader.rtl
-        };
+        // Which way a page turn goes when the page cannot scroll: down/right is forward.
+        let turn_forward = positive;
         let arrive = if turn_forward {
             Arrive::Start
         } else {
@@ -2189,33 +2250,16 @@ impl Yomu {
     }
 
     fn set_fit(&mut self, mode: FitMode, cx: &mut Context<Self>) {
-        let Some(reader) = self.reader.as_mut() else {
-            return;
-        };
-        reader.cancel_transition();
-        reader.fit = mode;
-        reader.zoom = 1.0;
-        reader.arrive = Some(Arrive::Start);
+        if let Some(reader) = self.reader.as_mut() {
+            reader.cancel_transition();
+            reader.fit = mode;
+            reader.zoom = 1.0;
+            reader.arrive = Some(Arrive::Start);
+            self.show_hud(mode.label(), cx);
+        }
         self.library.settings_mut().fit = mode;
         self.save_library();
-        self.show_hud(mode.label(), cx);
-    }
-
-    fn set_direction(&mut self, rtl: bool, cx: &mut Context<Self>) {
-        let Some(reader) = self.reader.as_mut() else {
-            return;
-        };
-        reader.rtl = rtl;
-        self.library.settings_mut().rtl = rtl;
-        self.save_library();
-        self.show_hud(
-            if rtl {
-                "right to left"
-            } else {
-                "left to right"
-            },
-            cx,
-        );
+        cx.notify();
     }
 
     fn set_animations(&mut self, value: Option<bool>, cx: &mut Context<Self>) {
@@ -2567,12 +2611,6 @@ impl Yomu {
                     None => self.show_hud("No previous position", cx),
                 }
             }
-            Action::ToggleDirection => {
-                if let Some(rtl) = self.reader.as_ref().map(|r| r.rtl) {
-                    self.set_direction(!rtl, cx);
-                }
-            }
-            Action::SetDirection { rtl } => self.set_direction(rtl, cx),
             Action::SetAnimations(value) => self.set_animations(value, cx),
             Action::SetContinuous(value) => self.set_continuous(value, cx),
             Action::SetWebcomics(value) => self.set_webcomics(value, cx),
@@ -2854,10 +2892,12 @@ impl Yomu {
 
     /// Full-window layer behind a dialog: swallows clicks meant for the view underneath and
     /// closes the dialog when clicked. `dim` darkens the view behind it.
-    fn scrim(&self, dim: bool, cx: &mut Context<Self>) -> gpui_kit::Div {
+    fn scrim(&self, dim: bool, cx: &mut Context<Self>) -> gpui_kit::Stateful<gpui_kit::Div> {
         // Explicit insets matter: an absolutely positioned child without them is placed after the
         // in-flow content (below the window) instead of covering it.
         div()
+            .id("overlay-scrim")
+            .occlude()
             .absolute()
             .top_0()
             .left_0()
@@ -2913,6 +2953,8 @@ impl Yomu {
         // `deferred` paints it above everything else.
         deferred(
             div()
+                .id("book-menu-scrim")
+                .occlude()
                 .absolute()
                 .top_0()
                 .left_0()
@@ -2957,12 +2999,16 @@ impl Yomu {
                 } else {
                     "Group into folders"
                 },
-                "Group volumes by source folder or assigned series",
+                if self.library.settings().group_series {
+                    "Display books ungrouped"
+                } else {
+                    "Group volumes by folder"
+                },
             ),
             (IconName::LogOut, "Quit", "Close yomu"),
         ];
         let mut list = div()
-            .w(px(260.))
+            .w(px(280.))
             .flex()
             .flex_col()
             .gap_1()
@@ -3000,6 +3046,8 @@ impl Yomu {
                     .child(Icon::new(icon).size_4().text_color(self.colors.foreground))
                     .child(
                         div()
+                            .flex_1()
+                            .min_w_0()
                             .flex()
                             .flex_col()
                             .gap(px(2.))
@@ -3013,6 +3061,7 @@ impl Yomu {
                                 div()
                                     .text_xs()
                                     .text_color(self.colors.muted)
+                                    .truncate()
                                     .child(description),
                             ),
                     )
@@ -3030,6 +3079,8 @@ impl Yomu {
 
         deferred(
             div()
+                .id("library-menu-scrim")
+                .occlude()
                 .absolute()
                 .top_0()
                 .left_0()
@@ -3127,8 +3178,10 @@ impl Yomu {
         .into_any_element()
     }
 
-    fn panel(&self, width: f32) -> gpui_kit::Div {
+    fn panel(&self, width: f32) -> gpui_kit::Stateful<gpui_kit::Div> {
         div()
+            .id(SharedString::from(format!("panel-{}", width as u32)))
+            .occlude()
             .w(px(width))
             .max_w_full()
             .flex()
@@ -3336,126 +3389,504 @@ impl Yomu {
         let theme_status = self.theme_status.clone();
         let continuous = settings.continuous;
         let webcomics = settings.webcomics;
-        let rtl = settings.rtl;
         let fit = settings.fit;
         let animate = settings.animate;
         let grouped = settings.group_series;
+        let thumb_size = settings.thumbnail_size;
         let is_default = *settings == Settings::default();
+        let cache_bytes = self.dirs.cache_size_bytes();
+        let book_count = self.library.books().len();
 
-        // No dimming scrim here: you want to see the window behind the panel while dragging.
-        let tab_button = |tab, label| {
+        let tab_button = |tab, label, icon: IconName| {
             let selected = self.settings_tab == tab;
             let id = match tab {
                 SettingsTab::Appearance => "settings-tab-appearance",
                 SettingsTab::Library => "settings-tab-library",
                 SettingsTab::Reader => "settings-tab-reader",
+                SettingsTab::Storage => "settings-tab-storage",
                 SettingsTab::Keyboard => "settings-tab-keyboard",
             };
-            panel_button(
-                id,
-                label,
-                if selected {
-                    ButtonKind::Primary
+            div()
+                .id(id)
+                .flex_1()
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_center()
+                .gap_1p5()
+                .px_2()
+                .py_2()
+                .rounded_lg()
+                .cursor_pointer()
+                .text_sm()
+                .font_weight(if selected {
+                    FontWeight::SEMIBOLD
                 } else {
-                    ButtonKind::Normal
-                },
-                self.colors,
-                true,
-                cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    FontWeight::MEDIUM
+                })
+                .when(selected, |s| s.bg(self.colors.accent))
+                .text_color(if selected {
+                    self.colors.foreground
+                } else {
+                    self.colors.muted
+                })
+                .hover(|s| {
+                    if !selected {
+                        s.bg(self.colors.surface_hover)
+                            .text_color(self.colors.foreground)
+                    } else {
+                        s
+                    }
+                })
+                .child(Icon::new(icon).size(px(15.)))
+                .child(label)
+                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                     this.settings_tab = tab;
+                    this.settings_dropdown = None;
                     cx.notify();
-                }),
-            )
+                }))
         };
-        let appearance_tab = tab_button(SettingsTab::Appearance, "Appearance");
-        let library_tab = tab_button(SettingsTab::Library, "Library");
-        let reader_tab = tab_button(SettingsTab::Reader, "Reader");
-        let keyboard_tab = tab_button(SettingsTab::Keyboard, "Keyboard & Commands");
+        let appearance_tab = tab_button(SettingsTab::Appearance, "Appearance", IconName::Palette);
+        let library_tab = tab_button(SettingsTab::Library, "Library", IconName::Library);
+        let reader_tab = tab_button(SettingsTab::Reader, "Reader", IconName::BookOpen);
+        let storage_tab = tab_button(SettingsTab::Storage, "Storage", IconName::HardDrive);
+        let keyboard_tab = tab_button(SettingsTab::Keyboard, "Shortcuts", IconName::Keyboard);
+
+        let adw_group = |title: &'static str, rows: Vec<AnyElement>| {
+            div()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .child(
+                    div()
+                        .px_1()
+                        .text_xs()
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(self.colors.muted)
+                        .child(title),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .rounded_xl()
+                        .border_1()
+                        .border_color(self.colors.border)
+                        .bg(self.widget_surface(self.colors.surface))
+                        .children(rows),
+                )
+        };
+
+        let adw_row = |icon: IconName,
+                       title: &'static str,
+                       subtitle: Option<String>,
+                       control: AnyElement,
+                       is_last: bool| {
+            let mut row = div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .px_4()
+                .py_3()
+                .gap_4();
+            if !is_last {
+                row = row.border_b_1().border_color(self.colors.border);
+            }
+            row.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_3()
+                    .flex_1()
+                    .min_w_0()
+                    .child(
+                        div()
+                            .p_2()
+                            .rounded_lg()
+                            .bg(self.colors.surface_hover)
+                            .text_color(self.colors.accent)
+                            .child(Icon::new(icon).size(px(16.))),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_0p5()
+                            .min_w_0()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(self.colors.foreground)
+                                    .child(title),
+                            )
+                            .children(subtitle.map(|sub| {
+                                div().text_xs().text_color(self.colors.muted).child(sub)
+                            })),
+                    ),
+            )
+            .child(control)
+            .into_any_element()
+        };
 
         let body = match self.settings_tab {
-            SettingsTab::Appearance => div()
-                .flex().flex_col().gap_3()
-                .child(div().font_weight(FontWeight::SEMIBOLD).child("Theme"))
-                .child(div().flex().flex_row().items_center().gap_2()
-                    .child(panel_button("settings-theme-previous", "‹", ButtonKind::Normal, self.colors, true,
-                        cx.listener(|this, _: &ClickEvent, _, cx| this.cycle_theme(-1, cx))))
-                    .child(div().flex_1().text_center().text_color(self.colors.muted).child(theme_name))
-                    .child(panel_button("settings-theme-next", "›", ButtonKind::Normal, self.colors, true,
-                        cx.listener(|this, _: &ClickEvent, _, cx| this.cycle_theme(1, cx))))
-                )
-                .child(div().flex().flex_row().items_center().justify_between().gap_2()
-                    .child(div().min_w_0().text_xs().text_color(self.colors.muted).truncate().child(theme_path))
-                    .child(panel_button("settings-theme-reload", "Reload custom themes", ButtonKind::Normal,
-                        self.colors, true, cx.listener(|this, _: &ClickEvent, _, cx| this.reload_custom_themes(cx)))))
-                .children(theme_status.map(|status| div().text_xs().text_color(self.colors.muted).child(status)))
-                .into_any_element(),
-            SettingsTab::Library => div().flex().flex_col().gap_3()
-                .child(div().font_weight(FontWeight::SEMIBOLD).child("Library"))
-                .child(panel_button("settings-group-series", if grouped { "Folder grouping: On" } else { "Folder grouping: Off" },
-                    if grouped { ButtonKind::Primary } else { ButtonKind::Normal }, self.colors, true, cx.listener(|this, _: &ClickEvent, _, cx| {
-                        this.library.settings_mut().group_series = !this.library.settings().group_series;
-                        this.open_group = None;
-                        this.save_library();
-                        cx.notify();
-                    })))
-                .child(div().text_xs().text_color(self.colors.muted).child("Group volumes from the same directory into folder cards. A manually assigned series takes precedence; clearing it restores the directory group."))
-                .into_any_element(),
-            SettingsTab::Reader => div().flex().flex_col().gap_3()
-                .child(div().font_weight(FontWeight::SEMIBOLD).child("Reader"))
-                .child(panel_button("settings-direction", if rtl { "Reading direction: Right to left" } else { "Reading direction: Left to right" },
-                    if rtl { ButtonKind::Primary } else { ButtonKind::Normal }, self.colors, true, cx.listener(move |this, _: &ClickEvent, _, cx| this.set_direction(!rtl, cx))))
-                .child(panel_button("settings-fit", format!("Page fit: {} (click to cycle)", fit.label()),
-                    ButtonKind::Normal, self.colors, true, cx.listener(move |this, _: &ClickEvent, _, cx| this.set_fit(fit.next(), cx))))
-                    .child(panel_button("settings-animations", if animate { "Page animations: On" } else { "Page animations: Off" },
-                    if animate { ButtonKind::Primary } else { ButtonKind::Normal }, self.colors, true, cx.listener(|this, _: &ClickEvent, _, cx| this.set_animations(None, cx))))
-                .child(panel_button("settings-continuous", if continuous { "Reading mode: Continuous" } else { "Reading mode: Single page" },
-                    if continuous { ButtonKind::Primary } else { ButtonKind::Normal }, self.colors, true, cx.listener(|this, _: &ClickEvent, _, cx| this.set_continuous(None, cx))))
-                .child(panel_button("settings-webcomics", if webcomics { "Webcomics mode: On" } else { "Webcomics mode: Off" },
-                    if webcomics { ButtonKind::Primary } else { ButtonKind::Normal }, self.colors, true, cx.listener(|this, _: &ClickEvent, _, cx| this.set_webcomics(None, cx))))
-                .child(div().text_xs().text_color(self.colors.muted).child("Webcomics mode forces a gapless vertical strip. Turning it off restores the selected single-page or continuous mode."))
-                .into_any_element(),
-            SettingsTab::Keyboard => {
-                let mut content = div().flex().flex_col().gap_3().child(div().font_weight(FontWeight::SEMIBOLD).child("Keyboard & Commands"));
-                for (section, rows) in HELP {
-                    let mut group = div().flex().flex_col().gap_1()
-                        .child(div().text_xs().font_weight(FontWeight::SEMIBOLD).text_color(self.colors.muted).child(*section));
-                    for (keys, description) in *rows {
-                        group = group.child(div().flex().justify_between().gap_4()
-                            .child(div().min_w(px(150.)).text_color(self.colors.accent).child(*keys))
-                            .child(div().flex_1().text_color(self.colors.foreground).child(*description)));
-                    }
-                    content = content.child(group);
+            SettingsTab::Appearance => {
+                let theme_row = adw_row(
+                    IconName::Palette,
+                    "Color Theme",
+                    Some("Select the theme used for all windows and controls".into()),
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
+                        .child(panel_button(
+                            "settings-theme-previous",
+                            "‹",
+                            ButtonKind::Normal,
+                            self.colors,
+                            true,
+                            cx.listener(|this, _: &ClickEvent, _, cx| this.cycle_theme(-1, cx)),
+                        ))
+                        .child(
+                            div()
+                                .min_w(px(120.))
+                                .text_center()
+                                .text_sm()
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(self.colors.foreground)
+                                .child(theme_name),
+                        )
+                        .child(panel_button(
+                            "settings-theme-next",
+                            "›",
+                            ButtonKind::Normal,
+                            self.colors,
+                            true,
+                            cx.listener(|this, _: &ClickEvent, _, cx| this.cycle_theme(1, cx)),
+                        ))
+                        .into_any_element(),
+                    false,
+                );
+                let reload_row = adw_row(
+                    IconName::FolderOpen,
+                    "Custom Themes Directory",
+                    Some(theme_path),
+                    panel_button(
+                        "settings-theme-reload",
+                        "Reload Themes",
+                        ButtonKind::Normal,
+                        self.colors,
+                        true,
+                        cx.listener(|this, _: &ClickEvent, _, cx| this.reload_custom_themes(cx)),
+                    ),
+                    true,
+                );
+                let mut app_group = adw_group("APPEARANCE", vec![theme_row, reload_row]);
+                if let Some(status) = theme_status {
+                    app_group = app_group.child(
+                        div()
+                            .px_1()
+                            .text_xs()
+                            .text_color(self.colors.muted)
+                            .child(status),
+                    );
                 }
-                content.into_any_element()
+                app_group.into_any_element()
+            }
+            SettingsTab::Library => {
+                const THUMB_OPTIONS: &[(ThumbnailSize, &str)] = &[
+                    (ThumbnailSize::Small, "Small (180px)"),
+                    (ThumbnailSize::Medium, "Medium (210px)"),
+                    (ThumbnailSize::Large, "Large (240px)"),
+                    (ThumbnailSize::ExtraLarge, "Extra Large (280px)"),
+                ];
+                let thumb_row = adw_row(
+                    IconName::Layers,
+                    "Thumbnail Card Size",
+                    Some("Size of cover art cards displayed in the library grid".into()),
+                    adw_dropdown(
+                        "settings-thumbnail-size",
+                        thumb_size.label(),
+                        self.settings_dropdown == Some(SettingsDropdown::ThumbnailSize),
+                        THUMB_OPTIONS,
+                        thumb_size,
+                        self.colors,
+                        cx,
+                        |this, _, _, cx| {
+                            this.settings_dropdown = if this.settings_dropdown
+                                == Some(SettingsDropdown::ThumbnailSize)
+                            {
+                                None
+                            } else {
+                                Some(SettingsDropdown::ThumbnailSize)
+                            };
+                            cx.notify();
+                        },
+                        |this, size, cx| {
+                            this.set_thumbnail_size(size, cx);
+                            this.settings_dropdown = None;
+                        },
+                    ),
+                    false,
+                );
+                let group_row = adw_row(
+                    IconName::FolderArchive,
+                    "Folder Grouping",
+                    Some("Group volumes from the same directory into folder cards".into()),
+                    adw_switch(
+                        "settings-group-series",
+                        grouped,
+                        self.colors,
+                        cx.listener(|this, _: &ClickEvent, _, cx| {
+                            this.library.settings_mut().group_series =
+                                !this.library.settings().group_series;
+                            this.open_group = None;
+                            this.save_library();
+                            cx.notify();
+                        }),
+                    ),
+                    true,
+                );
+                adw_group("LIBRARY DISPLAY & LAYOUT", vec![thumb_row, group_row]).into_any_element()
+            }
+            SettingsTab::Reader => {
+                const FIT_OPTIONS: &[(FitMode, &str)] = &[
+                    (FitMode::Page, "Fit Page"),
+                    (FitMode::Width, "Fit Width"),
+                    (FitMode::Height, "Fit Height"),
+                    (FitMode::Original, "Original Size"),
+                ];
+                let fit_row = adw_row(
+                    IconName::Maximize2,
+                    "Default Page Fit",
+                    Some("How pages scale to fit the window viewport".into()),
+                    adw_dropdown(
+                        "settings-fit",
+                        fit.label(),
+                        self.settings_dropdown == Some(SettingsDropdown::PageFit),
+                        FIT_OPTIONS,
+                        fit,
+                        self.colors,
+                        cx,
+                        |this, _, _, cx| {
+                            this.settings_dropdown =
+                                if this.settings_dropdown == Some(SettingsDropdown::PageFit) {
+                                    None
+                                } else {
+                                    Some(SettingsDropdown::PageFit)
+                                };
+                            cx.notify();
+                        },
+                        |this, mode, cx| {
+                            this.set_fit(mode, cx);
+                            this.settings_dropdown = None;
+                        },
+                    ),
+                    false,
+                );
+                let anim_row = adw_row(
+                    IconName::Sparkles,
+                    "Page Animations",
+                    Some("Slide transitions between page turns and smooth scroll gliding".into()),
+                    adw_switch(
+                        "settings-animations",
+                        animate,
+                        self.colors,
+                        cx.listener(|this, _: &ClickEvent, _, cx| this.set_animations(None, cx)),
+                    ),
+                    false,
+                );
+                let cont_row = adw_row(
+                    IconName::AlignVerticalSpaceBetween,
+                    "Continuous Vertical Mode",
+                    Some("Stack pages vertically and scroll through the whole book".into()),
+                    adw_switch(
+                        "settings-continuous",
+                        continuous,
+                        self.colors,
+                        cx.listener(|this, _: &ClickEvent, _, cx| this.set_continuous(None, cx)),
+                    ),
+                    false,
+                );
+                let webc_row = adw_row(
+                    IconName::Film,
+                    "Webcomics Mode",
+                    Some(
+                        "Forces a connected, gapless vertical strip for continuous reading".into(),
+                    ),
+                    adw_switch(
+                        "settings-webcomics",
+                        webcomics,
+                        self.colors,
+                        cx.listener(|this, _: &ClickEvent, _, cx| this.set_webcomics(None, cx)),
+                    ),
+                    true,
+                );
+                adw_group(
+                    "READING BEHAVIOR",
+                    vec![fit_row, anim_row, cont_row, webc_row],
+                )
+                .into_any_element()
+            }
+            SettingsTab::Storage => {
+                let cache_row = adw_row(
+                    IconName::HardDrive,
+                    "Thumbnail Cache",
+                    Some(format!(
+                        "{} used across cached cover sizes",
+                        format_size(cache_bytes)
+                    )),
+                    panel_button(
+                        "settings-clear-cache",
+                        "Clear Cache",
+                        ButtonKind::Normal,
+                        self.colors,
+                        true,
+                        cx.listener(|this, _: &ClickEvent, _, cx| {
+                            this.request_clear_thumbnail_cache(cx)
+                        }),
+                    ),
+                    false,
+                );
+                let data_row = adw_row(
+                    IconName::Database,
+                    "Application Data",
+                    Some(format!(
+                        "{} comics registered · permanently wipes library and progress",
+                        book_count
+                    )),
+                    adw_destructive_button(
+                        "settings-clear-all",
+                        "Reset All Data",
+                        self.colors,
+                        cx.listener(|this, _: &ClickEvent, _, cx| this.request_clear_all_data(cx)),
+                    ),
+                    true,
+                );
+                adw_group("STORAGE & DATA MANAGEMENT", vec![cache_row, data_row]).into_any_element()
+            }
+            SettingsTab::Keyboard => {
+                let mut shortcut_rows = Vec::new();
+                for (section, rows) in HELP {
+                    let mut group = div()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .p_3()
+                        .border_b_1()
+                        .border_color(self.colors.border)
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_weight(FontWeight::BOLD)
+                                .text_color(self.colors.muted)
+                                .child(*section),
+                        );
+                    for (keys, description) in *rows {
+                        group = group.child(
+                            div()
+                                .flex()
+                                .justify_between()
+                                .items_center()
+                                .gap_4()
+                                .child(
+                                    div()
+                                        .px_2()
+                                        .py_0p5()
+                                        .rounded_md()
+                                        .bg(self.colors.surface_hover)
+                                        .text_xs()
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .text_color(self.colors.accent)
+                                        .child(*keys),
+                                )
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .text_xs()
+                                        .text_color(self.colors.foreground)
+                                        .child(*description),
+                                ),
+                        );
+                    }
+                    shortcut_rows.push(group.into_any_element());
+                }
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(
+                        div()
+                            .px_1()
+                            .text_xs()
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(self.colors.muted)
+                            .child("KEYBOARD SHORTCUTS & COMMANDS"),
+                    )
+                    .child(
+                        div()
+                            .id("settings-shortcuts-scroll")
+                            .flex()
+                            .flex_col()
+                            .max_h(px(320.))
+                            .overflow_y_scroll()
+                            .rounded_xl()
+                            .border_1()
+                            .border_color(self.colors.border)
+                            .bg(self.widget_surface(self.colors.surface))
+                            .children(shortcut_rows),
+                    )
+                    .into_any_element()
             }
         };
 
         self.scrim(true, cx)
             .child(
-                self.animate_popup("settings-dialog", self.panel(640.))
+                self.animate_popup("settings-dialog", self.panel(680.))
                     .child(
                         div()
-                            .text_lg()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child("Settings"),
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .text_lg()
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_color(self.colors.foreground)
+                                    .child("Settings"),
+                            ),
                     )
                     .child(
                         div()
                             .flex()
                             .flex_row()
-                            .gap_2()
+                            .items_center()
+                            .gap_1()
+                            .p_1()
+                            .rounded_xl()
+                            .bg(self.widget_surface(self.colors.background))
+                            .border_1()
+                            .border_color(self.colors.border)
                             .child(appearance_tab)
                             .child(library_tab)
                             .child(reader_tab)
+                            .child(storage_tab)
                             .child(keyboard_tab),
                     )
-                    .child(div().min_h(px(250.)).child(body))
+                    .child(div().min_h(px(280.)).child(body))
                     .child(
                         div()
                             .flex()
                             .flex_row()
-                            .justify_end()
-                            .gap_2()
+                            .justify_between()
+                            .items_center()
+                            .pt_2()
+                            .border_t_1()
+                            .border_color(self.colors.border)
                             .child(panel_button(
                                 "settings-reset",
                                 "Reset to Defaults",
@@ -3479,7 +3910,7 @@ impl Yomu {
             .into_any_element()
     }
 
-    fn render_library(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_library(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let all_books = self.library.books();
         let count = all_books.len();
         let books: Vec<&Book> = all_books
@@ -3493,6 +3924,27 @@ impl Yomu {
                 )
             })
             .collect();
+
+        let thumb_size = self.library.settings().thumbnail_size;
+        let card_w = thumb_size.card_width();
+        let gap = 24.0;
+        let pad_x = 24.0;
+        let vp_w: f32 = window.viewport_size().width.into();
+        let avail_w = (vp_w - pad_x * 2.0).max(card_w);
+        let cols = ((avail_w + gap) / (card_w + gap)).floor().max(1.0) as usize;
+        let grid_w = (cols as f32 * card_w + (cols.saturating_sub(1) as f32) * gap).min(avail_w);
+
+        let make_grid = |elements: Vec<AnyElement>| {
+            div().w_full().flex().flex_row().justify_center().child(
+                div()
+                    .w(px(grid_w))
+                    .flex()
+                    .flex_row()
+                    .flex_wrap()
+                    .gap_6()
+                    .children(elements),
+            )
+        };
         let status: Option<SharedString> = if self.importing {
             Some(
                 self.importing_title
@@ -3722,14 +4174,12 @@ impl Yomu {
                                 .child(format!("{} · {}", group.name, members.len())),
                         ),
                 );
-                content = content.child(
-                    div()
-                        .flex()
-                        .flex_row()
-                        .flex_wrap()
-                        .gap_6()
-                        .children(members.iter().map(|book| self.book_card(book, cx))),
-                );
+                content = content.child(make_grid(
+                    members
+                        .iter()
+                        .map(|book| self.book_card(book, cx))
+                        .collect(),
+                ));
                 div()
                     .id("grid")
                     .flex_1()
@@ -3761,7 +4211,7 @@ impl Yomu {
                     .overflow_y_scroll()
                     .px_6()
                     .pb_6()
-                    .child(div().flex().flex_row().flex_wrap().gap_6().children(cards))
+                    .child(make_grid(cards))
                     .into_any_element()
             }
         } else {
@@ -3772,14 +4222,9 @@ impl Yomu {
                 .overflow_y_scroll()
                 .px_6()
                 .pb_6()
-                .child(
-                    div()
-                        .flex()
-                        .flex_row()
-                        .flex_wrap()
-                        .gap_6()
-                        .children(books.iter().map(|book| self.book_card(book, cx))),
-                )
+                .child(make_grid(
+                    books.iter().map(|book| self.book_card(book, cx)).collect(),
+                ))
                 .into_any_element()
         };
 
@@ -3811,9 +4256,12 @@ impl Yomu {
     ) -> AnyElement {
         let first = books[0];
         let group_key = group.key.clone();
+        let thumb_size = self.library.settings().thumbnail_size;
+        let card_w = thumb_size.card_width();
+        let card_h = thumb_size.card_height();
         div()
             .id(SharedString::from(format!("folder-{}", group.key)))
-            .w(px(CARD_W))
+            .w(px(card_w))
             .flex_none()
             .flex()
             .flex_col()
@@ -3823,7 +4271,9 @@ impl Yomu {
             .bg(self.widget_surface(self.colors.surface))
             .overflow_hidden()
             .cursor_pointer()
-            .hover(|style| style.border_color(self.colors.accent).shadow_md())
+            .when(self.overlay.is_none(), |card| {
+                card.hover(|style| style.border_color(self.colors.accent).shadow_md())
+            })
             .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                 this.open_group = Some(group_key.clone());
                 cx.notify();
@@ -3831,13 +4281,13 @@ impl Yomu {
             .child(
                 div()
                     .relative()
-                    .w(px(CARD_W))
-                    .h(px(CARD_H))
+                    .w(px(card_w))
+                    .h(px(card_h))
                     .overflow_hidden()
                     .rounded_lg()
                     .bg(self.widget_surface(self.colors.surface))
                     .child(
-                        img(self.dirs.cover(&first.id))
+                        img(self.dirs.cover_for_size(&first.id, thumb_size))
                             .w_full()
                             .h_full()
                             .object_fit(ObjectFit::Cover),
@@ -3886,11 +4336,14 @@ impl Yomu {
             format!("{} pages", book.page_count)
         };
 
+        let thumb_size = self.library.settings().thumbnail_size;
+        let card_w = thumb_size.card_width();
+        let card_h = thumb_size.card_height();
         let selected = self.selection.contains(&book.id);
         let cover = div()
             .relative()
-            .w(px(CARD_W))
-            .h(px(CARD_H))
+            .w(px(card_w))
+            .h(px(card_h))
             .flex_none()
             .rounded_lg()
             .overflow_hidden()
@@ -3902,7 +4355,7 @@ impl Yomu {
                 self.colors.surface
             })
             .child(
-                img(self.dirs.cover(&book.id))
+                img(self.dirs.cover_for_size(&book.id, thumb_size))
                     .w_full()
                     .h_full()
                     .object_fit(ObjectFit::Cover),
@@ -3932,7 +4385,7 @@ impl Yomu {
 
         div()
             .id(SharedString::from(format!("book-{}", book.id)))
-            .w(px(CARD_W))
+            .w(px(card_w))
             .flex_none()
             .flex()
             .flex_col()
@@ -3946,7 +4399,9 @@ impl Yomu {
             .bg(self.widget_surface(self.colors.surface))
             .overflow_hidden()
             .cursor_pointer()
-            .hover(|style| style.border_color(self.colors.accent).shadow_md())
+            .when(self.overlay.is_none(), |card| {
+                card.hover(|style| style.border_color(self.colors.accent).shadow_md())
+            })
             // `on_click` only ever fires for the left button, so right-clicking never opens a book.
             .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                 if this.overlay_recently_closed() {
@@ -4081,27 +4536,17 @@ impl Yomu {
             .h(px(2.))
             .w(relative(fraction))
             .bg(self.colors.accent);
-        // Manga fills right to left; western comics left to right.
-        let progress_line = if reader.rtl {
-            progress_line.right_0()
-        } else {
-            progress_line.left_0()
-        };
+        let progress_line = progress_line.left_0();
 
         let info = reader.show_info.then(|| {
             pill(
                 div().absolute().bottom_4().left_0().right_0(),
                 format!(
-                    "{} / {}  ·  {}  ·  {}%  ·  {}  ·  {}",
+                    "{} / {}  ·  {}  ·  {}%  ·  {}",
                     reader.page + 1,
                     reader.total,
                     reader.fit.label(),
                     (reader.zoom * 100.0).round() as i32,
-                    if reader.rtl {
-                        "right to left"
-                    } else {
-                        "left to right"
-                    },
                     if reader.webcomics {
                         "webcomics"
                     } else if reader.continuous {
@@ -4295,7 +4740,7 @@ impl Render for Yomu {
         let reading = self.reader.is_some();
         let content = match self.reader.as_ref() {
             Some(reader) => self.render_reader(reader, cx),
-            None => self.render_library(cx),
+            None => self.render_library(window, cx),
         };
 
         let root_bg = self.colors.background;
@@ -4400,8 +4845,8 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
             ("ctrl+wheel   drag", "zoom at the pointer   pan the page"),
             ("zt  zz  zb", "scroll to top / middle / bottom"),
             (
-                "r  v  w  i  f",
-                "direction, continuous mode, webcomics, page info, fullscreen",
+                "v  w  i  f",
+                "continuous mode, webcomics, page info, fullscreen",
             ),
         ],
     ),
@@ -4410,7 +4855,7 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
         &[
             (":fit width", "page, width, height or original"),
             (":zoom 150", "150% of the fit size"),
-            (":rtl  :ltr  :q  :qa", "direction, back to library, quit"),
+            (":q  :qa", "back to library, quit"),
             (":settings  Ctrl+,", "open the settings"),
             (":animate [on|off]", "page-turn slide and scroll glide"),
             (":continuous [on|off]", "toggle stacked continuous reading"),
@@ -4424,8 +4869,6 @@ fn command_suggestions(input: &str) -> Vec<(String, String, &'static str)> {
     const COMMANDS: &[(&str, &str)] = &[
         ("fit", "Choose page fit mode"),
         ("zoom", "Set zoom percentage or reset"),
-        ("rtl", "Read right to left"),
-        ("ltr", "Read left to right"),
         ("animate", "Toggle page animations"),
         ("continuous", "Toggle continuous scrolling"),
         ("webcomics", "Toggle gapless webcomics mode"),
@@ -4573,7 +5016,7 @@ fn panel_button(
 ) -> AnyElement {
     let button = Button::new(id)
         .label(label)
-        .rounded(ButtonRounded::Large)
+        .rounded(ButtonRounded::Medium)
         .small()
         .disabled(!enabled)
         .on_click(on_click);
@@ -4585,6 +5028,165 @@ fn panel_button(
             .into_any_element(),
         ButtonKind::Primary => button.primary().bg(colors.accent).into_any_element(),
     }
+}
+
+fn adw_switch(
+    id: &'static str,
+    active: bool,
+    colors: UiColors,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> AnyElement {
+    div()
+        .id(id)
+        .w(px(46.))
+        .h(px(26.))
+        .rounded_full()
+        .relative()
+        .cursor_pointer()
+        .bg(if active {
+            colors.accent
+        } else {
+            colors.surface_hover
+        })
+        .border_1()
+        .border_color(if active { colors.accent } else { colors.border })
+        .child(
+            div()
+                .absolute()
+                .top(px(1.))
+                .left(px(if active { 21. } else { 1. }))
+                .size(px(22.))
+                .rounded_full()
+                .bg(colors.foreground)
+                .shadow_sm(),
+        )
+        .on_click(on_click)
+        .into_any_element()
+}
+
+fn adw_dropdown<T: Copy + PartialEq + 'static>(
+    id: &'static str,
+    label: impl Into<SharedString>,
+    is_open: bool,
+    options: &'static [(T, &'static str)],
+    current: T,
+    colors: UiColors,
+    cx: &mut Context<Yomu>,
+    on_toggle: impl Fn(&mut Yomu, &ClickEvent, &mut Window, &mut Context<Yomu>) + 'static,
+    on_select: impl Fn(&mut Yomu, T, &mut Context<Yomu>) + 'static + Copy,
+) -> AnyElement {
+    let mut container = div().relative();
+
+    let trigger = Button::new(id)
+        .label(label)
+        .dropdown_caret(true)
+        .rounded(ButtonRounded::Medium)
+        .small()
+        .secondary()
+        .outline()
+        .bg(colors.surface)
+        .on_click(cx.listener(move |this, e: &ClickEvent, window, cx| {
+            on_toggle(this, e, window, cx);
+        }));
+
+    container = container.child(trigger);
+
+    if is_open {
+        let mut menu = div()
+            .id(SharedString::from(format!("{id}-menu")))
+            .occlude()
+            .absolute()
+            .top(px(32.))
+            .right_0()
+            .min_w(px(170.))
+            .flex()
+            .flex_col()
+            .gap_0p5()
+            .p_1()
+            .rounded_xl()
+            .bg(colors.surface)
+            .border_1()
+            .border_color(colors.border)
+            .shadow_lg()
+            .on_mouse_down(MouseButton::Left, |_: &MouseDownEvent, _, cx| {
+                cx.stop_propagation();
+            })
+            .on_mouse_down(MouseButton::Right, |_: &MouseDownEvent, _, cx| {
+                cx.stop_propagation();
+            });
+
+        for (idx, (val, opt_label)) in options.iter().enumerate() {
+            let is_current = *val == current;
+            let val_copy = *val;
+            menu = menu.child(
+                div()
+                    .id(SharedString::from(format!("{id}-opt-{idx}")))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .gap_3()
+                    .px_3()
+                    .py_1p5()
+                    .rounded_lg()
+                    .cursor_pointer()
+                    .when(is_current, |s| s.bg(with_alpha(colors.accent, 0.2)))
+                    .hover(|s| s.bg(colors.surface_hover))
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(if is_current {
+                                FontWeight::SEMIBOLD
+                            } else {
+                                FontWeight::MEDIUM
+                            })
+                            .text_color(if is_current {
+                                colors.accent
+                            } else {
+                                colors.foreground
+                            })
+                            .child(*opt_label),
+                    )
+                    .when(is_current, |s| {
+                        s.child(
+                            Icon::new(IconName::Check)
+                                .size(px(14.))
+                                .text_color(colors.accent),
+                        )
+                    })
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        on_select(this, val_copy, cx);
+                    })),
+            );
+        }
+        container = container.child(deferred(menu).with_priority(3));
+    }
+
+    container.into_any_element()
+}
+
+fn adw_destructive_button(
+    id: &'static str,
+    label: impl Into<SharedString>,
+    colors: UiColors,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> AnyElement {
+    div()
+        .id(id)
+        .px_3()
+        .py_1p5()
+        .rounded_lg()
+        .bg(with_alpha(colors.danger, 0.15))
+        .border_1()
+        .border_color(colors.danger)
+        .cursor_pointer()
+        .hover(|s| s.bg(with_alpha(colors.danger, 0.28)))
+        .text_sm()
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(colors.danger)
+        .child(label.into())
+        .on_click(on_click)
+        .into_any_element()
 }
 
 fn button(
@@ -4605,7 +5207,7 @@ fn icon_button(
 ) -> AnyElement {
     let button = Button::new(id)
         .accessibility_label(label)
-        .rounded(ButtonRounded::Large)
+        .rounded(ButtonRounded::Medium)
         .small()
         .ghost()
         .text_color(colors.foreground)
@@ -4637,7 +5239,7 @@ fn button_colored(
 ) -> impl IntoElement {
     let button = Button::new(id)
         .label(label)
-        .rounded(ButtonRounded::Large)
+        .rounded(ButtonRounded::Medium)
         .small()
         .on_click(on_click);
     let button = if label == "Remove" {
@@ -5285,7 +5887,6 @@ mod tests {
 
         view.update(cx, |this, _| {
             let settings = this.library.settings_mut();
-            settings.rtl = true;
             settings.fit = FitMode::Width;
             this.save_library();
         });
@@ -5297,8 +5898,8 @@ mod tests {
         cx.simulate_keystrokes("escape");
         assert_eq!(overlay_kind(&view, cx), "settings");
         assert_eq!(
-            view.read_with(cx, |this, _| this.library.settings().rtl),
-            true
+            view.read_with(cx, |this, _| this.library.settings().fit),
+            FitMode::Width
         );
 
         view.update(cx, |this, cx| this.request_reset_settings(cx));
@@ -5318,7 +5919,6 @@ mod tests {
         let id = fx.ids[0].clone();
         act(&view, cx, &id, BookAction::Open);
         view.update(cx, |this, cx| {
-            this.set_direction(true, cx);
             this.set_fit(FitMode::Width, cx);
         });
         view.update(cx, |this, cx| {
@@ -5326,11 +5926,10 @@ mod tests {
             this.request_reset_settings(cx);
         });
         cx.simulate_keystrokes("enter");
-        let (rtl, fit) = view.read_with(cx, |this, _| {
+        let fit = view.read_with(cx, |this, _| {
             let reader = this.reader.as_ref().unwrap();
-            (reader.rtl, reader.fit)
+            reader.fit
         });
-        assert!(!rtl, "left to right is the default");
         assert_eq!(fit, FitMode::Page);
     }
 
@@ -5341,7 +5940,7 @@ mod tests {
             let (view, cx) = launch(&fx, cx);
             let id = fx.ids[2].clone();
             view.update(cx, |this, _| {
-                this.library.settings_mut().rtl = true;
+                this.library.settings_mut().fit = FitMode::Width;
                 this.save_library();
             });
             set_progress(&view, cx, &id, 2);
@@ -5350,8 +5949,8 @@ mod tests {
         // a brand new app instance reads the same files
         let (view, cx) = launch(&fx, cx);
         assert_eq!(
-            view.read_with(cx, |this, _| this.library.settings().rtl),
-            true
+            view.read_with(cx, |this, _| this.library.settings().fit),
+            FitMode::Width
         );
         assert!(book(&view, cx, &fx.ids[2]).is_finished());
     }
@@ -5361,7 +5960,7 @@ mod tests {
         let fx = fixture("corrupt");
         let text = fs::read_to_string(fx.dirs.library_file()).unwrap();
         let mut json: serde_json::Value = serde_json::from_str(&text).unwrap();
-        json["settings"] = serde_json::json!({"opacity": "bogus", "fit": 17, "rtl": null});
+        json["settings"] = serde_json::json!({"opacity": "bogus", "fit": 17, "card_size": "huge"});
         fs::write(fx.dirs.library_file(), json.to_string()).unwrap();
 
         let (view, cx) = launch(&fx, cx);
@@ -5736,29 +6335,18 @@ mod tests {
     }
 
     #[test]
-    fn default_reading_direction_is_left_to_right() {
-        assert!(!Settings::default().rtl);
-        assert!(!test_reader(3, &Settings::default()).rtl);
-    }
-
-    #[test]
     fn page_turn_slides_in_the_direction_of_reading() {
-        for (rtl, forward, expected) in [
-            (false, true, -1.0), // left to right, next page: content moves left
-            (false, false, 1.0), // left to right, previous page: content moves right
-            (true, true, 1.0),   // right to left (manga) mirrors it
-            (true, false, -1.0),
+        for (forward, expected) in [
+            (true, -1.0), // next page: content moves left
+            (false, 1.0), // previous page: content moves right
         ] {
-            let settings = Settings {
-                rtl,
-                ..Settings::default()
-            };
+            let settings = Settings::default();
             let mut reader = test_reader(4, &settings);
             reader.page = 2;
             let leaving = reader.images[&2].image.clone();
             turn(&mut reader, forward);
             let transition = reader.transition.expect("a slide started");
-            assert_eq!(transition.travel(), expected, "rtl={rtl} forward={forward}");
+            assert_eq!(transition.travel(), expected, "forward={forward}");
             assert!(Arc::ptr_eq(
                 &reader.outgoing.as_ref().unwrap().image,
                 &leaving
@@ -6028,10 +6616,6 @@ mod tests {
         let fx = fixture("ltr");
         let (view, cx) = launch(&fx, cx);
         open_book_by_index(&fx, &view, cx, 0);
-        assert!(
-            !with_reader(&view, cx, |r| r.rtl),
-            "left to right by default"
-        );
 
         cx.simulate_keystrokes("left");
         assert_eq!(page(&view, cx), 0, "cannot go before the first page");
@@ -6067,115 +6651,67 @@ mod tests {
     }
 
     #[gpui_kit::test]
-    fn right_to_left_is_an_option_and_mirrors_left_right(cx: &mut TestAppContext) {
-        let fx = fixture("rtl");
-        let (view, cx) = launch(&fx, cx);
-        open_book_by_index(&fx, &view, cx, 0);
-        view.update(cx, |this, cx| this.set_direction(true, cx));
-        assert!(saved_settings(&fx).rtl, "the choice is remembered");
-
-        cx.simulate_keystrokes("right");
-        assert_eq!(
-            page(&view, cx),
-            0,
-            "right goes back in a right-to-left book"
-        );
-        cx.simulate_keystrokes("left");
-        assert_eq!(page(&view, cx), 1);
-        cx.simulate_keystrokes("h h");
-        assert_eq!(page(&view, cx), 3, "h is left, which is forward");
-        cx.simulate_keystrokes("shift-g");
-        cx.simulate_keystrokes("left");
-        assert_eq!(page(&view, cx), 4, "no further than the last page");
-        cx.simulate_keystrokes("right");
-        assert_eq!(page(&view, cx), 3);
-        // pages keep their order: j/k, J/K and gg/G do not depend on the direction
-        cx.simulate_keystrokes("g g");
-        cx.simulate_keystrokes("shift-j");
-        assert_eq!(page(&view, cx), 1);
-
-        // the next book starts with the remembered preference
-        view.update_in(cx, |this, window, cx| this.close_book(window, cx));
-        open_book_by_index(&fx, &view, cx, 1);
-        assert!(with_reader(&view, cx, |r| r.rtl));
-    }
-
-    #[gpui_kit::test]
-    fn clicking_the_screen_edges_and_the_wheel_follow_the_reading_direction(
-        cx: &mut TestAppContext,
-    ) {
+    fn clicking_the_screen_edges_and_the_wheel_turn_the_page(cx: &mut TestAppContext) {
         let fx = fixture("clicks");
         let (view, cx) = launch(&fx, cx);
         open_book_by_index(&fx, &view, cx, 0);
         let (left, right) = (point(px(100.), px(500.)), point(px(1800.), px(500.)));
 
         click(cx, right, MouseButton::Left);
-        assert_eq!(page(&view, cx), 1, "right edge advances left to right");
+        assert_eq!(page(&view, cx), 1, "right edge advances page");
         click(cx, left, MouseButton::Left);
         assert_eq!(page(&view, cx), 0);
 
-        view.update(cx, |this, cx| this.set_direction(true, cx));
-        click(cx, left, MouseButton::Left);
-        assert_eq!(page(&view, cx), 1, "the left edge advances right to left");
-        click(cx, right, MouseButton::Left);
+        // a wheel notch on a page that fits turns the page
+        view.update_in(cx, |this, window, cx| {
+            this.on_wheel(
+                (0.0, -96.0),
+                false,
+                (0.0, 0.0),
+                true,
+                viewport_of(window),
+                cx,
+            )
+        });
+        assert_eq!(page(&view, cx), 1);
+        view.update_in(cx, |this, window, cx| {
+            this.on_wheel(
+                (0.0, 96.0),
+                false,
+                (0.0, 0.0),
+                true,
+                viewport_of(window),
+                cx,
+            )
+        });
         assert_eq!(page(&view, cx), 0);
-
-        // a wheel notch on a page that fits turns the page, whichever way you read
-        for rtl in [false, true] {
-            view.update(cx, |this, cx| this.set_direction(rtl, cx));
-            view.update_in(cx, |this, window, cx| {
-                this.on_wheel(
-                    (0.0, -96.0),
-                    false,
-                    (0.0, 0.0),
-                    true,
-                    viewport_of(window),
-                    cx,
-                )
-            });
-            assert_eq!(page(&view, cx), 1);
-            view.update_in(cx, |this, window, cx| {
-                this.on_wheel(
-                    (0.0, 96.0),
-                    false,
-                    (0.0, 0.0),
-                    true,
-                    viewport_of(window),
-                    cx,
-                )
-            });
-            assert_eq!(page(&view, cx), 0);
-        }
     }
 
     #[gpui_kit::test]
-    fn decoded_pages_stay_in_a_small_window_whatever_the_direction(cx: &mut TestAppContext) {
-        for rtl in [false, true] {
-            let fx = fixture(if rtl { "cache-rtl" } else { "cache-ltr" });
-            let (view, cx) = launch(&fx, cx);
-            open_book_by_index(&fx, &view, cx, 0);
-            view.update(cx, |this, cx| this.set_direction(rtl, cx));
-            cx.simulate_keystrokes("shift-g");
-            cx.run_until_parked();
-            settle_animations(&view, cx);
+    fn decoded_pages_stay_in_a_small_window(cx: &mut TestAppContext) {
+        let fx = fixture("cache-ltr");
+        let (view, cx) = launch(&fx, cx);
+        open_book_by_index(&fx, &view, cx, 0);
+        cx.simulate_keystrokes("shift-g");
+        cx.run_until_parked();
+        settle_animations(&view, cx);
 
-            let (cached, current) = with_reader(&view, cx, |r| {
-                let mut keys: Vec<usize> = r.images.keys().copied().collect();
-                keys.sort();
-                (keys, r.page)
-            });
-            assert_eq!(current, 4);
-            assert!(
-                cached.contains(&4) && cached.contains(&3),
-                "the page behind is ready: {cached:?}"
-            );
-            assert!(
-                cached.len() <= 1 + pagecache::KEEP_BEHIND + pagecache::KEEP_AHEAD,
-                "{cached:?}"
-            );
-            let garbage = view.read_with(cx, |this, _| this.garbage.len());
-            assert_eq!(garbage, 0, "no textures waiting to be freed once idle");
-        }
+        let (cached, current) = with_reader(&view, cx, |r| {
+            let mut keys: Vec<usize> = r.images.keys().copied().collect();
+            keys.sort();
+            (keys, r.page)
+        });
+        assert_eq!(current, 4);
+        assert!(
+            cached.contains(&4) && cached.contains(&3),
+            "the page behind is ready: {cached:?}"
+        );
+        assert!(
+            cached.len() <= 1 + pagecache::KEEP_BEHIND + pagecache::KEEP_AHEAD,
+            "{cached:?}"
+        );
+        let garbage = view.read_with(cx, |this, _| this.garbage.len());
+        assert_eq!(garbage, 0, "no textures waiting to be freed once idle");
     }
 
     // ---- page-turn slide through the app ----
@@ -6210,18 +6746,9 @@ mod tests {
         assert_eq!(page(&view, cx), 1);
         assert_eq!(view.read_with(cx, |this, _| this.garbage.len()), 0);
 
-        // backward slides the other way, and right to left mirrors both
+        // backward slides the other way
         view.update(cx, |this, cx| {
             this.goto_page(0, Arrive::End, cx);
-            assert_eq!(
-                this.reader.as_ref().unwrap().transition.unwrap().travel(),
-                1.0
-            );
-        });
-        settle_animations(&view, cx);
-        view.update(cx, |this, cx| {
-            this.set_direction(true, cx);
-            this.goto_page(1, Arrive::Start, cx);
             assert_eq!(
                 this.reader.as_ref().unwrap().transition.unwrap().travel(),
                 1.0
