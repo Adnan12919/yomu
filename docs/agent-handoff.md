@@ -160,6 +160,29 @@ Settings uses active Kit themes rather than a Yomu palette. Tabs are open to fut
 - **Dynamic Menu Sizing:** Replaced static pixel widths on context menus and library menus (`MENU_W` = 224px, 280px) with content-driven dynamic constraints: `min_w(px(200.))`/`min_w(px(240.))`, `max_w(px(320.))`/`max_w(px(360.))`, and `w_auto()`. Removed unused `MENU_W` constant.
 - **Native GPUI Kit Table for Keyboard Shortcuts:** Migrated `SettingsTab::Keyboard` to GPUI Kit's native `Table`, `TableHeader`, `TableBody`, `TableRow`, `TableHead`, and `TableCell` components. Configured with a `TableHead` header ("ACTION" on the leftmost side and "SHORTCUT" on the rightmost side with `.text_right()`), section divider banner rows with `col_span(2)` and shortcut counts (`Tag::secondary().small()`), and row borders with theme-derived styling. Key badges are positioned flush against the right margin with action descriptions flush against the left. Fixed scrolling by separating the outer card border/surface from the inner scroll container (`#settings-shortcuts-scroll` with `overflow_y_scroll()` and fixed height without conflicting `overflow_hidden()`). Refined all shortcut descriptions in `HELP` to be concise, grammatically precise, and terminated with periods.
 
+### 11. Core Engine Performance, Memory & Zero-Allocation Algorithms
+- **Zero-Allocation Natural String Sort (`src/util.rs`):** Completely rewrote `natural_cmp` to compare character streams and numeric runs in place. Replaced string-allocating lowercase conversions (`to_lowercase()`) and digit buffers (`take_number()`) with zero-allocation char folding and dynamic digit scanning, eliminating tens of thousands of temporary heap allocations during archive and folder sorting.
+- **Zero-Allocation Library Search Matching (`src/search.rs`):** Replaced lowercased string allocation (`title.to_lowercase()`, `path.to_string_lossy().to_lowercase()`, `series.to_lowercase()`) with an optimized `contains_ignore_case` helper featuring an ASCII fast-path and short-circuiting title/series/path evaluations.
+- **Archive I/O Buffering & In-Memory Handle Cache (`src/archive.rs`):**
+  - Wrapped `File` in a 64 KiB `BufReader` during zip archive inspection to collapse thousands of syscall reads into block operations.
+  - Implemented `ARCHIVE_CACHE` (a thread-safe MRU handle pool) in `read_page`: subsequent page reads reuse parsed zip central directories and open file descriptors, eliminating disk open and header parse overhead on page flips.
+  - Converted `is_image_name` and `is_archive_name` to slice extension checks using `.eq_ignore_ascii_case()` with zero heap allocations.
+- **Resampling Scratch Buffer Reuse & Direct JPEG Cover Output (`src/imaging.rs`):**
+  - Replaced per-call `Resizer::new()` instantiation with a `thread_local!` `RefCell<Resizer>` to reuse internal SIMD scratch memory and convolution buffers across all page and thumbnail scaling jobs.
+  - Streamlined `make_cover_jpeg` to encode directly to `ExtendedColorType::Rgb8`, eliminating redundant `DynamicImage` wrapping and intermediate conversions.
+
+### 12. Native Touchpad & Touchscreen Inertial Momentum Scrolling (`src/motion.rs`, `src/main.rs`)
+- **Native Physics Model (`InertialScroll`, `VelocityTracker`):**
+  - Integrated rolling-sample velocity estimation (`VelocityTracker`) over the exit gesture window without artificial delays or allocations.
+  - Implemented exact closed-form analytical integration: $\Delta x = v_0 \cdot \tau \cdot (1 - e^{-dt / \tau})$ with natural exponential friction (`INERTIA_TAU_SECS = 0.32`).
+  - Frame-rate independent: identical total scroll displacement and glide curve across 60 Hz, 120 Hz, 144 Hz, and 240 Hz displays (verified by analytical unit tests).
+- **Native GPUI Kit / GPUI Event Integration:**
+  - Leveraged GPUI Kit's native `ScrollWheelEvent.touch_phase` (`TouchPhase::Started`, `TouchPhase::Moved`, `TouchPhase::Ended`, `TouchPhase::Cancelled`) and drag handlers (`drag_start`, `drag_move`, `drag_end`).
+  - Clamped event `dt` to `[0.001, 0.1]` seconds and prevented zero-movement release deltas from polluting exit velocity upon finger lift-off.
+  - Immediate interruption / touch-catch: touching down (`TouchPhase::Started` or `drag_start`) instantly resets `reader.inertia`, delivering instantaneous tactile response without fighting the user's fingers.
+  - Hard boundary collision: automatically zeroes momentum along an axis when reaching edge limits (`0.0` or max offset/continuous document boundaries).
+  - Accessibility & Reduced Motion: strictly respects `!reader.animate` and `reduce_motion` (GNOME `enable-animations` / `YOMU_REDUCE_MOTION`), disabling momentum immediately when reduced motion is requested.
+
 ## Build and verification
 
 On the configured NixOS system, use `devenv shell` (or `nix develop`) before launching. Useful commands:

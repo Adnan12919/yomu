@@ -1,9 +1,8 @@
 use std::{cmp::Ordering, iter::Peekable, str::Chars, time::SystemTime};
 
 /// Natural ordering so that `page2.jpg` sorts before `page10.jpg`.
+/// Implemented with zero heap allocations.
 pub fn natural_cmp(a: &str, b: &str) -> Ordering {
-    let a = a.to_lowercase();
-    let b = b.to_lowercase();
     let mut ai = a.chars().peekable();
     let mut bi = b.chars().peekable();
 
@@ -13,16 +12,27 @@ pub fn natural_cmp(a: &str, b: &str) -> Ordering {
             (None, Some(_)) => return Ordering::Less,
             (Some(_), None) => return Ordering::Greater,
             (Some(x), Some(y)) if x.is_ascii_digit() && y.is_ascii_digit() => {
-                let na = take_number(&mut ai);
-                let nb = take_number(&mut bi);
-                let ord = na.len().cmp(&nb.len()).then_with(|| na.cmp(&nb));
+                let ord = compare_numeric_run(&mut ai, &mut bi);
                 if ord != Ordering::Equal {
                     return ord;
                 }
             }
             (Some(x), Some(y)) => {
                 if x != y {
-                    return x.cmp(&y);
+                    let mut x_it = x.to_lowercase();
+                    let mut y_it = y.to_lowercase();
+                    loop {
+                        match (x_it.next(), y_it.next()) {
+                            (None, None) => break,
+                            (None, Some(_)) => return Ordering::Less,
+                            (Some(_), None) => return Ordering::Greater,
+                            (Some(cx), Some(cy)) => {
+                                if cx != cy {
+                                    return cx.cmp(&cy);
+                                }
+                            }
+                        }
+                    }
                 }
                 ai.next();
                 bi.next();
@@ -31,18 +41,48 @@ pub fn natural_cmp(a: &str, b: &str) -> Ordering {
     }
 }
 
-/// Consume a run of ASCII digits and return it without leading zeros.
-fn take_number(it: &mut Peekable<Chars<'_>>) -> String {
-    let mut digits = String::new();
-    while let Some(c) = it.peek().copied() {
-        if !c.is_ascii_digit() {
-            break;
-        }
-        digits.push(c);
-        it.next();
+/// Compare a run of digits numerically without any heap allocations.
+fn compare_numeric_run(ai: &mut Peekable<Chars<'_>>, bi: &mut Peekable<Chars<'_>>) -> Ordering {
+    // 1. Skip leading zeros
+    while ai.peek().copied() == Some('0') {
+        ai.next();
     }
-    let trimmed = digits.trim_start_matches('0');
-    trimmed.to_string()
+    while bi.peek().copied() == Some('0') {
+        bi.next();
+    }
+
+    // 2. Count significant digits and compare
+    let mut first_diff = Ordering::Equal;
+
+    loop {
+        let a_digit = ai.peek().copied().filter(|c| c.is_ascii_digit());
+        let b_digit = bi.peek().copied().filter(|c| c.is_ascii_digit());
+
+        match (a_digit, b_digit) {
+            (Some(da), Some(db)) => {
+                if first_diff == Ordering::Equal && da != db {
+                    first_diff = da.cmp(&db);
+                }
+                ai.next();
+                bi.next();
+            }
+            (Some(_), None) => {
+                while ai.peek().copied().is_some_and(|c| c.is_ascii_digit()) {
+                    ai.next();
+                }
+                return Ordering::Greater;
+            }
+            (None, Some(_)) => {
+                while bi.peek().copied().is_some_and(|c| c.is_ascii_digit()) {
+                    bi.next();
+                }
+                return Ordering::Less;
+            }
+            (None, None) => {
+                return first_diff;
+            }
+        }
+    }
 }
 
 /// FNV-1a. Unlike `DefaultHasher` its output is stable across Rust versions,

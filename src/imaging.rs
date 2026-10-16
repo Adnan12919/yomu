@@ -1,11 +1,16 @@
-//! Decoding and resizing. Nothing here depends on gpui, so it can run on any thread.
+use std::cell::RefCell;
 
 use anyhow::{Context, Result, bail};
 use fast_image_resize::{
     FilterType as ResizeFilter, PixelType, ResizeAlg, ResizeOptions, Resizer,
     images::Image as FirImage,
 };
-use image::{DynamicImage, RgbaImage};
+use image::{DynamicImage, ExtendedColorType, RgbaImage};
+
+thread_local! {
+    /// Reusable thread-local resizer to avoid reallocating internal SIMD scratch buffers.
+    static RESIZER: RefCell<Resizer> = RefCell::new(Resizer::new());
+}
 
 /// Longest side of a stored cover thumbnail, in pixels.
 pub const COVER_MAX_W: u32 = 400;
@@ -74,7 +79,7 @@ fn resize_rgba(
     let mut dst = FirImage::new(nw, nh, PixelType::U8x4);
     let mut options = ResizeOptions::new().resize_alg(ResizeAlg::Convolution(filter));
     options.mul_div_alpha = alpha;
-    Resizer::new().resize(&src, &mut dst, &options)?;
+    RESIZER.with(|resizer| resizer.borrow_mut().resize(&src, &mut dst, &options))?;
     RgbaImage::from_raw(nw, nh, dst.into_vec()).context("resized buffer has the wrong size")
 }
 
@@ -94,12 +99,11 @@ pub fn make_cover_jpeg(bytes: &[u8], max_w: u32, max_h: u32) -> Result<Vec<u8>> 
     } else {
         resize_rgba(img.into_rgba8(), nw, nh, ResizeFilter::Lanczos3, alpha)?
     };
-    let rgb = DynamicImage::ImageRgba8(thumb).to_rgb8();
-    let rgb = DynamicImage::ImageRgb8(rgb);
+    let rgb = DynamicImage::ImageRgba8(thumb).into_rgb8();
 
     let mut out = Vec::new();
-    let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 88);
-    rgb.write_with_encoder(encoder)?;
+    let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 88);
+    encoder.encode(&rgb, nw, nh, ExtendedColorType::Rgb8)?;
     Ok(out)
 }
 

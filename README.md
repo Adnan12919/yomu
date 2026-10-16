@@ -11,6 +11,7 @@ rendering is GPU-accelerated, and it talks to Wayland directly (no webview, no T
 - Settings panel with theme selection, library/reader preferences, and keyboard shortcuts table (`Ctrl+,`)
 - Fit page / width / height / original size, zoom in and out, pan by dragging
 - Continuous vertical reading mode and gapless webcomics strip mode; single-page mode remains available
+- Touchpad and touchscreen kinetic momentum scrolling: closed-form exponential friction decay with instant touch-catch interruption
 - Vim motions (counts, `gg`, `G`, marks, `:` commands) next to the normal keys
 - A short slide between pages and a smooth scroll glide, frame-rate independent, switchable (`:animate off`)
 - Progress is saved on every page turn and restored when you reopen a book
@@ -104,8 +105,8 @@ Ctrl+wheel) work too. Press `?` in the reader for a cheat sheet.
 | `gg`, `G`, `12G`, `:12`, `Home`, `End` | First page, last page, page 12 |
 | `ma`, `'a`, `''` | Set mark `a`, jump to it, jump back to where you were |
 | Click left / right third of the window | Turn the page toward that side |
-| Mouse wheel | Scroll; at the edge it turns the page |
-| Drag | Pan a zoomed or width-fit page |
+| Mouse wheel / Touchpad | Scroll; touchpad two-finger flicks launch natural inertial momentum scrolling |
+| Drag | Pan a zoomed page or continuous strip; drag flicks launch inertial momentum |
 
 Counts work on motions: `5j` scrolls five steps, `3J` skips three pages. Marks are saved with the book.
 

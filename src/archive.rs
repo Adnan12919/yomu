@@ -1,9 +1,8 @@
-//! Reading pages out of a comic source: a `.cbz`/`.zip` archive or a plain folder of images.
-
 use std::{
     fs::{self, File},
-    io::{self, Read},
-    path::Path,
+    io::{self, BufReader, Read},
+    path::{Path, PathBuf},
+    sync::Mutex,
 };
 
 use anyhow::{Context, Result, bail};
@@ -22,15 +21,23 @@ pub enum SourceKind {
 }
 
 pub fn is_image_name(name: &str) -> bool {
-    let lower = name.to_ascii_lowercase();
-    [".jpg", ".jpeg", ".png", ".webp", ".gif"]
-        .iter()
-        .any(|ext| lower.ends_with(ext))
+    const EXTENSIONS: [&str; 5] = [".jpg", ".jpeg", ".png", ".webp", ".gif"];
+    EXTENSIONS.iter().any(|ext| {
+        if name.len() < ext.len() {
+            return false;
+        }
+        name[name.len() - ext.len()..].eq_ignore_ascii_case(ext)
+    })
 }
 
 pub fn is_archive_name(name: &str) -> bool {
-    let lower = name.to_ascii_lowercase();
-    lower.ends_with(".cbz") || lower.ends_with(".zip")
+    const EXTENSIONS: [&str; 2] = [".cbz", ".zip"];
+    EXTENSIONS.iter().any(|ext| {
+        if name.len() < ext.len() {
+            return false;
+        }
+        name[name.len() - ext.len()..].eq_ignore_ascii_case(ext)
+    })
 }
 
 /// Hidden files and macOS resource-fork folders are never pages.
@@ -39,12 +46,20 @@ fn is_junk(name: &str) -> bool {
         .any(|part| part.starts_with('.') || part == "__MACOSX")
 }
 
+struct CachedArchive {
+    path: PathBuf,
+    archive: zip::ZipArchive<BufReader<File>>,
+}
+
+static ARCHIVE_CACHE: Mutex<Vec<CachedArchive>> = Mutex::new(Vec::new());
+
 /// Names of every page in reading order.
 pub fn list_pages(path: &Path, kind: SourceKind) -> Result<Vec<String>> {
     let mut pages = match kind {
         SourceKind::Archive => {
             let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
-            let archive = zip::ZipArchive::new(file)
+            let reader = BufReader::with_capacity(64 * 1024, file);
+            let archive = zip::ZipArchive::new(reader)
                 .with_context(|| format!("{} is not a valid zip/cbz", path.display()))?;
             archive
                 .file_names()
@@ -105,21 +120,90 @@ pub fn folder_has_images(dir: &Path) -> bool {
 pub fn read_page(path: &Path, kind: SourceKind, name: &str) -> Result<Vec<u8>> {
     match kind {
         SourceKind::Archive => {
-            let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
-            let mut archive = zip::ZipArchive::new(file)?;
-            let entry = archive
-                .by_name(name)
-                .with_context(|| format!("page {name} missing from archive"))?;
-            if entry.size() > MAX_PAGE_BYTES {
-                bail!("page {name} is unreasonably large");
+            let mut cache = ARCHIVE_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+            let mut archive = if let Some(idx) = cache.iter().position(|c| c.path == path) {
+                cache.remove(idx).archive
+            } else {
+                let file =
+                    File::open(path).with_context(|| format!("opening {}", path.display()))?;
+                let reader = BufReader::with_capacity(64 * 1024, file);
+                zip::ZipArchive::new(reader)
+                    .with_context(|| format!("{} is not a valid zip/cbz", path.display()))?
+            };
+
+            let read_res = (|| -> Result<Vec<u8>> {
+                let entry = archive
+                    .by_name(name)
+                    .with_context(|| format!("page {name} missing from archive"))?;
+                if entry.size() > MAX_PAGE_BYTES {
+                    bail!("page {name} is unreasonably large");
+                }
+                let mut buf = Vec::with_capacity(entry.size() as usize);
+                entry.take(MAX_PAGE_BYTES).read_to_end(&mut buf)?;
+                Ok(buf)
+            })();
+
+            // Retain up to 4 most recently used archives in memory.
+            if cache.len() >= 4 {
+                cache.remove(0);
             }
-            let mut buf = Vec::with_capacity(entry.size() as usize);
-            entry.take(MAX_PAGE_BYTES).read_to_end(&mut buf)?;
-            Ok(buf)
+            cache.push(CachedArchive {
+                path: path.to_path_buf(),
+                archive,
+            });
+
+            read_res
         }
         SourceKind::Folder => {
             let full = path.join(name);
             fs::read(&full).with_context(|| format!("reading {}", full.display()))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn extension_checks() {
+        assert!(is_image_name("page.jpg"));
+        assert!(is_image_name("PAGE.JPEG"));
+        assert!(is_image_name("test.PNG"));
+        assert!(is_image_name("manga.webp"));
+        assert!(is_image_name("anim.gif"));
+        assert!(!is_image_name("notes.txt"));
+        assert!(!is_image_name("archive.zip"));
+
+        assert!(is_archive_name("book.cbz"));
+        assert!(is_archive_name("BOOK.ZIP"));
+        assert!(!is_archive_name("book.tar"));
+    }
+
+    #[test]
+    fn archive_cache_reads_repeatedly() {
+        let tmp = std::env::temp_dir().join(format!("yomu_test_{}.cbz", crate::util::now_secs()));
+        let file = File::create(&tmp).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default();
+        zip.start_file("001.jpg", options).unwrap();
+        zip.write_all(b"page1content").unwrap();
+        zip.start_file("002.jpg", options).unwrap();
+        zip.write_all(b"page2content").unwrap();
+        zip.finish().unwrap();
+
+        let pages = list_pages(&tmp, SourceKind::Archive).unwrap();
+        assert_eq!(pages, vec!["001.jpg", "002.jpg"]);
+
+        // First read populates cache
+        let p1 = read_page(&tmp, SourceKind::Archive, "001.jpg").unwrap();
+        assert_eq!(p1, b"page1content");
+
+        // Second read uses cached archive handle
+        let p2 = read_page(&tmp, SourceKind::Archive, "002.jpg").unwrap();
+        assert_eq!(p2, b"page2content");
+
+        let _ = fs::remove_file(&tmp);
     }
 }

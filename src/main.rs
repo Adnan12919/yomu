@@ -32,9 +32,9 @@ use gpui_kit::{
     Entity, ExternalPaths, FocusHandle, Focusable, FontWeight, KeyBinding, KeyDownEvent,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit, PathPromptOptions,
     Pixels, Point, RenderImage, Rgba, ScrollDelta, ScrollWheelEvent, SharedString, Styled,
-    Subscription, TitlebarOptions, Window, WindowBackgroundAppearance, WindowBounds, WindowKind,
-    WindowOptions, actions, anchored, application, canvas, deferred, div, ease_out_quint, img,
-    point, prelude::*, px, relative, size,
+    Subscription, TitlebarOptions, TouchPhase, Window, WindowBackgroundAppearance, WindowBounds,
+    WindowKind, WindowOptions, actions, anchored, application, canvas, deferred, div,
+    ease_out_quint, img, point, prelude::*, px, relative, size,
 };
 use image::Frame;
 use serde::Deserialize;
@@ -44,7 +44,7 @@ use yomu::{
     layout::{self, Arrive, FitMode, Viewport},
     library::{self, Book, DataDirs, Library, Settings, ThumbnailSize},
     menu::{self, BookAction, Entry, Item},
-    motion::{self, PageTransition},
+    motion::{self, InertialScroll, PageTransition, VelocityTracker},
     pagecache, search,
     selection::Selection,
     util::{format_size, now_secs},
@@ -374,6 +374,8 @@ struct Drag {
     start: (f32, f32),
     off0: (f32, f32),
     moved: bool,
+    last_at: (f32, f32),
+    last_time: Instant,
 }
 
 /// State of the book that is currently open.
@@ -423,6 +425,9 @@ struct Reader {
 
     vim: Vim,
     drag: Option<Drag>,
+    inertia: Option<InertialScroll>,
+    velocity_tracker: VelocityTracker,
+    last_motion_time: Option<Instant>,
     /// Where `''` jumps back to.
     back_page: Option<usize>,
     show_info: bool,
@@ -458,6 +463,9 @@ impl Reader {
             error: None,
             vim: Vim::new(),
             drag: None,
+            inertia: None,
+            velocity_tracker: VelocityTracker::new(),
+            last_motion_time: None,
             back_page: None,
             show_info: false,
             show_help: false,
@@ -616,6 +624,7 @@ impl Reader {
         }
         if !self.animate {
             self.cancel_transition();
+            self.inertia = None;
             self.off = self.scroll_target;
             return false;
         }
@@ -638,9 +647,68 @@ impl Reader {
             }
         }
 
-        let (off, moving) = motion::step_scroll(self.off, self.scroll_target, dt);
-        self.off = off;
-        animating || moving
+        let mut motion_active = false;
+        if self.inertia.is_none() {
+            if let Some(last_time) = self.last_motion_time {
+                let elapsed = Instant::now().duration_since(last_time);
+                if elapsed >= Duration::from_millis(35) {
+                    self.last_motion_time = None;
+                    if self.animate {
+                        let velocity = self.velocity_tracker.velocity();
+                        self.inertia = InertialScroll::new(velocity);
+                    }
+                } else {
+                    motion_active = true;
+                }
+            }
+        }
+
+        let mut moving = false;
+        if let Some(mut inertia) = self.inertia.take() {
+            let ((dx, dy), still) = inertia.step(dt);
+            let (max_w, max_h) = if self.continuous {
+                let (tops, heights) = self.continuous_layout(vp);
+                let w = (self.viewport.width * self.zoom - vp.width).max(0.0);
+                let h = (tops.last().copied().unwrap_or(0.0)
+                    + heights.last().copied().unwrap_or(0.0)
+                    - vp.height)
+                    .max(0.0);
+                (w, h)
+            } else if let Some(display) = self.settle(vp) {
+                layout::max_offset(display, vp)
+            } else {
+                (0.0, 0.0)
+            };
+
+            let next_x = (self.off.0 + dx).clamp(0.0, max_w);
+            let next_y = (self.off.1 + dy).clamp(0.0, max_h);
+
+            if next_x == 0.0 || next_x == max_w {
+                inertia.velocity.0 = 0.0;
+            }
+            if next_y == 0.0 || next_y == max_h {
+                inertia.velocity.1 = 0.0;
+            }
+
+            self.off = (next_x, next_y);
+            self.scroll_target = self.off;
+
+            let speed = (inertia.velocity.0 * inertia.velocity.0
+                + inertia.velocity.1 * inertia.velocity.1)
+                .sqrt();
+            if still && speed >= motion::INERTIA_STOP_VELOCITY {
+                self.inertia = Some(inertia);
+                moving = true;
+            } else {
+                self.inertia = None;
+            }
+        } else {
+            let (off, is_moving) = motion::step_scroll(self.off, self.scroll_target, dt);
+            self.off = off;
+            moving = is_moving;
+        }
+
+        animating || moving || motion_active
     }
 
     /// Every texture this reader still owns, for freeing when the book closes.
@@ -2311,6 +2379,7 @@ impl Yomu {
         zoom: bool,
         at: (f32, f32),
         discrete: bool,
+        touch_phase: TouchPhase,
         vp: Viewport,
         cx: &mut Context<Self>,
     ) {
@@ -2318,11 +2387,31 @@ impl Yomu {
         let Some(reader) = self.reader.as_mut() else {
             return;
         };
+
+        let now = Instant::now();
+        let is_new_gesture = reader
+            .last_motion_time
+            .map_or(true, |t| now.duration_since(t) > Duration::from_millis(80));
+
+        if is_new_gesture || touch_phase == TouchPhase::Started {
+            reader.inertia = None;
+            reader.velocity_tracker.reset();
+        } else if reader.inertia.is_some() {
+            reader.inertia = None;
+        }
+
+        if discrete {
+            reader.last_motion_time = None;
+            reader.velocity_tracker.reset();
+            reader.inertia = None;
+        }
+
         let Some(display) = reader.settle(&vp) else {
             return;
         };
 
         if zoom {
+            reader.inertia = None;
             // Wheel up (positive) zooms in, anchored at the pointer.
             self.zoom_by(1.2f32.powf(dy / WHEEL_LINE), at, vp, cx);
             return;
@@ -2339,6 +2428,41 @@ impl Yomu {
         } else {
             layout::max_offset(display, &vp)
         };
+
+        if !discrete
+            && (dx.abs() > 0.001 || dy.abs() > 0.001)
+            && touch_phase != TouchPhase::Cancelled
+        {
+            let dt = if is_new_gesture {
+                0.016
+            } else {
+                reader.last_motion_time.map_or(0.016, |t| {
+                    now.duration_since(t).as_secs_f32().clamp(0.001, 0.1)
+                })
+            };
+            reader.last_motion_time = Some(now);
+            // Delta displacement in offset space is (-dx, -dy)
+            reader.velocity_tracker.push(dt, -dx, -dy);
+        }
+
+        if touch_phase == TouchPhase::Ended {
+            reader.last_motion_time = None;
+            if reader.animate && !self.reduce_motion {
+                let velocity = reader.velocity_tracker.velocity();
+                reader.inertia = InertialScroll::new(velocity);
+                if reader.inertia.is_some() {
+                    self.wake();
+                    cx.notify();
+                    return;
+                }
+            }
+        } else if touch_phase == TouchPhase::Cancelled {
+            reader.inertia = None;
+            reader.velocity_tracker.reset();
+            reader.last_motion_time = None;
+            return;
+        }
+
         if reader.continuous {
             let target = (reader.scroll_target.1 - dy).clamp(0.0, max.1);
             reader.scroll_target.1 = target;
@@ -2380,11 +2504,15 @@ impl Yomu {
 
     fn drag_start(&mut self, at: (f32, f32)) {
         if let Some(reader) = self.reader.as_mut() {
+            reader.inertia = None;
+            reader.velocity_tracker.reset();
             let off0 = reader.off;
             reader.drag = Some(Drag {
                 start: at,
                 off0,
                 moved: false,
+                last_at: at,
+                last_time: Instant::now(),
             });
         }
     }
@@ -2407,8 +2535,18 @@ impl Yomu {
         let Some(display) = reader.settle(&vp) else {
             return;
         };
+        let now = Instant::now();
+        let dt = now
+            .duration_since(drag.last_time)
+            .as_secs_f32()
+            .clamp(0.001, 0.1);
+        let (step_x, step_y) = (at.0 - drag.last_at.0, at.1 - drag.last_at.1);
+        reader.velocity_tracker.push(dt, -step_x, -step_y);
+
         reader.drag = Some(Drag {
             moved: true,
+            last_at: at,
+            last_time: now,
             ..drag
         });
         let target = (drag.off0.0 - dx, drag.off0.1 - dy);
@@ -2427,7 +2565,7 @@ impl Yomu {
         cx.notify();
     }
 
-    /// Mouse released: if it was not a drag, treat it as a click on the left/right third.
+    /// Mouse released: if it was a drag flick, launch inertial glide; otherwise click.
     fn drag_end(&mut self, x: f32, vp: Viewport, cx: &mut Context<Self>) {
         let Some(reader) = self.reader.as_mut() else {
             return;
@@ -2436,6 +2574,14 @@ impl Yomu {
             return;
         };
         if drag.moved {
+            if reader.animate && !self.reduce_motion {
+                let velocity = reader.velocity_tracker.velocity();
+                reader.inertia = InertialScroll::new(velocity);
+                if reader.inertia.is_some() {
+                    self.wake();
+                    cx.notify();
+                }
+            }
             return;
         }
         if x < vp.width / 3.0 {
@@ -4668,6 +4814,7 @@ impl Yomu {
                     event.modifiers.control,
                     (f32::from(event.position.x), f32::from(event.position.y)),
                     discrete,
+                    event.touch_phase,
                     viewport_of(window),
                     cx,
                 );
@@ -5157,7 +5304,9 @@ mod tests {
     }
 
     fn fixture(tag: &str) -> Fixture {
-        let root = std::env::temp_dir().join(format!("yomu-ui-{tag}-{}", std::process::id()));
+        static FIXTURE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = FIXTURE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!("yomu-ui-{tag}-{}-{seq}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
         let dirs = DataDirs::at(root.join("data")).unwrap();
@@ -6486,6 +6635,7 @@ mod tests {
                 false,
                 (0.0, 0.0),
                 true,
+                TouchPhase::Moved,
                 viewport_of(window),
                 cx,
             )
@@ -6497,6 +6647,7 @@ mod tests {
                 false,
                 (0.0, 0.0),
                 true,
+                TouchPhase::Moved,
                 viewport_of(window),
                 cx,
             )
@@ -6775,7 +6926,15 @@ mod tests {
         view.update_in(cx, |this, window, cx| {
             let vp = viewport_of(window);
             // a touchpad: small pixel deltas, not discrete
-            this.on_wheel((0.0, -30.0), false, (0.0, 0.0), false, vp, cx);
+            this.on_wheel(
+                (0.0, -30.0),
+                false,
+                (0.0, 0.0),
+                false,
+                TouchPhase::Moved,
+                vp,
+                cx,
+            );
             let reader = this.reader.as_ref().unwrap();
             assert_eq!(
                 (reader.off.1, reader.scroll_target.1),
@@ -6783,7 +6942,15 @@ mod tests {
                 "no lag"
             );
             // a wheel notch: glides
-            this.on_wheel((0.0, -WHEEL_LINE), false, (0.0, 0.0), true, vp, cx);
+            this.on_wheel(
+                (0.0, -WHEEL_LINE),
+                false,
+                (0.0, 0.0),
+                true,
+                TouchPhase::Moved,
+                vp,
+                cx,
+            );
             let reader = this.reader.as_ref().unwrap();
             assert_eq!(reader.scroll_target.1, base + 30.0 + WHEEL_LINE);
             assert_eq!(reader.off.1, base + 30.0);
@@ -6793,6 +6960,180 @@ mod tests {
             with_reader(&view, cx, |r| r.off.1),
             base + 30.0 + WHEEL_LINE
         );
+    }
+
+    #[gpui_kit::test]
+    fn touchpad_flick_triggers_inertial_scroll_glide(cx: &mut TestAppContext) {
+        let fx = fixture("wheel");
+        let (view, cx) = launch(&fx, cx);
+        open_book_by_index(&fx, &view, cx, 0);
+        view.update_in(cx, |this, window, cx| {
+            let vp = viewport_of(window);
+            this.zoom_to(2.0, (vp.width / 2.0, vp.height / 2.0), vp, cx);
+        });
+        settle_animations(&view, cx);
+
+        let base = with_reader(&view, cx, |r| r.off.1);
+        view.update_in(cx, |this, window, cx| {
+            let vp = viewport_of(window);
+            // Simulate a fast touchpad flick:
+            this.on_wheel(
+                (0.0, -20.0),
+                false,
+                (0.0, 0.0),
+                false,
+                TouchPhase::Started,
+                vp,
+                cx,
+            );
+            this.on_wheel(
+                (0.0, -40.0),
+                false,
+                (0.0, 0.0),
+                false,
+                TouchPhase::Moved,
+                vp,
+                cx,
+            );
+            this.on_wheel(
+                (0.0, -60.0),
+                false,
+                (0.0, 0.0),
+                false,
+                TouchPhase::Moved,
+                vp,
+                cx,
+            );
+            this.on_wheel(
+                (0.0, 0.0),
+                false,
+                (0.0, 0.0),
+                false,
+                TouchPhase::Ended,
+                vp,
+                cx,
+            );
+
+            let reader = this.reader.as_ref().unwrap();
+            assert!(
+                reader.inertia.is_some(),
+                "inertia must be active after flick"
+            );
+        });
+
+        // Let the inertial glide settle to rest
+        settle_animations(&view, cx);
+        let final_off = with_reader(&view, cx, |r| r.off.1);
+        assert!(
+            final_off > base + 120.0,
+            "inertial glide carried past the physical touch release"
+        );
+        assert!(
+            with_reader(&view, cx, |r| r.inertia.is_none()),
+            "inertia halts cleanly when done"
+        );
+    }
+
+    #[gpui_kit::test]
+    fn touchpad_flick_without_ended_event_triggers_inertia_on_linux(cx: &mut TestAppContext) {
+        let fx = fixture("wheel-linux");
+        let (view, cx) = launch(&fx, cx);
+        open_book_by_index(&fx, &view, cx, 0);
+        view.update_in(cx, |this, window, cx| {
+            let vp = viewport_of(window);
+            this.zoom_to(2.0, (vp.width / 2.0, vp.height / 2.0), vp, cx);
+        });
+        settle_animations(&view, cx);
+        let base = with_reader(&view, cx, |r| r.off.1);
+
+        view.update_in(cx, |this, window, cx| {
+            let vp = viewport_of(window);
+            // On Linux, Wayland only ever dispatches TouchPhase::Moved:
+            this.on_wheel(
+                (0.0, -40.0),
+                false,
+                (0.0, 0.0),
+                false,
+                TouchPhase::Moved,
+                vp,
+                cx,
+            );
+            this.on_wheel(
+                (0.0, -60.0),
+                false,
+                (0.0, 0.0),
+                false,
+                TouchPhase::Moved,
+                vp,
+                cx,
+            );
+            // Simulate 40ms passing without new events (fingers lifted off pad)
+            if let Some(reader) = this.reader.as_mut() {
+                reader.last_motion_time = Some(Instant::now() - Duration::from_millis(40));
+            }
+        });
+
+        // Next frame triggers inertia and glides
+        settle_animations(&view, cx);
+        let final_off = with_reader(&view, cx, |r| r.off.1);
+        assert!(
+            final_off > base + 100.0,
+            "inertial glide carried past the physical touch release on Linux"
+        );
+        assert!(
+            with_reader(&view, cx, |r| r.inertia.is_none()),
+            "inertia halts cleanly when done"
+        );
+    }
+
+    #[gpui_kit::test]
+    fn touch_down_mid_inertia_cancels_immediately(cx: &mut TestAppContext) {
+        let fx = fixture("wheel");
+        let (view, cx) = launch(&fx, cx);
+        open_book_by_index(&fx, &view, cx, 0);
+        view.update_in(cx, |this, window, cx| {
+            let vp = viewport_of(window);
+            this.zoom_to(2.0, (vp.width / 2.0, vp.height / 2.0), vp, cx);
+        });
+        settle_animations(&view, cx);
+
+        view.update_in(cx, |this, window, cx| {
+            let vp = viewport_of(window);
+            this.on_wheel(
+                (0.0, -40.0),
+                false,
+                (0.0, 0.0),
+                false,
+                TouchPhase::Moved,
+                vp,
+                cx,
+            );
+            this.on_wheel(
+                (0.0, -40.0),
+                false,
+                (0.0, 0.0),
+                false,
+                TouchPhase::Ended,
+                vp,
+                cx,
+            );
+            assert!(this.reader.as_ref().unwrap().inertia.is_some());
+
+            // User touches the touchpad again:
+            this.on_wheel(
+                (0.0, 0.0),
+                false,
+                (0.0, 0.0),
+                false,
+                TouchPhase::Started,
+                vp,
+                cx,
+            );
+            assert!(
+                this.reader.as_ref().unwrap().inertia.is_none(),
+                "touch started cancels inertia"
+            );
+        });
     }
 
     #[gpui_kit::test]

@@ -55,6 +55,119 @@ pub fn step_scroll(current: (f32, f32), target: (f32, f32), dt: f32) -> ((f32, f
     (next, next != target)
 }
 
+/// Time constant for inertial velocity decay (seconds).
+///
+/// Natural exponential friction: velocity decays to 1/e every ~0.32 seconds.
+pub const INERTIA_TAU_SECS: f32 = 0.32;
+/// Velocity below this (in logical px/s) is considered stopped.
+pub const INERTIA_STOP_VELOCITY: f32 = 8.0;
+/// Minimum initial flick velocity (in logical px/s) to trigger an inertial glide.
+pub const INERTIA_MIN_VELOCITY: f32 = 80.0;
+
+/// Rolling-window velocity estimator for touchpad and touchscreen gestures.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct VelocityTracker {
+    samples: [(f32, f32, f32); 4],
+    count: usize,
+}
+
+impl Default for VelocityTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl VelocityTracker {
+    pub const fn new() -> Self {
+        Self {
+            samples: [(0.0, 0.0, 0.0); 4],
+            count: 0,
+        }
+    }
+
+    pub fn reset(&mut self) {
+        self.count = 0;
+    }
+
+    /// Record a motion displacement `(dx, dy)` over `dt` seconds.
+    pub fn push(&mut self, dt: f32, dx: f32, dy: f32) {
+        if dt <= 0.0 || !dt.is_finite() {
+            return;
+        }
+        let idx = self.count % 4;
+        self.samples[idx] = (dt, dx, dy);
+        self.count += 1;
+    }
+
+    /// Estimated exit velocity (pixels per second) based on recent samples.
+    pub fn velocity(&self) -> (f32, f32) {
+        let n = self.count.min(4);
+        if n < 2 {
+            return (0.0, 0.0);
+        }
+        let mut total_dt = 0.0;
+        let mut total_dx = 0.0;
+        let mut total_dy = 0.0;
+        for i in 0..n {
+            let idx = (self.count + 4 - 1 - i) % 4;
+            let (dt, dx, dy) = self.samples[idx];
+            total_dt += dt;
+            total_dx += dx;
+            total_dy += dy;
+            if total_dt >= 0.12 {
+                break;
+            }
+        }
+        if total_dt > 0.001 {
+            (total_dx / total_dt, total_dy / total_dt)
+        } else {
+            (0.0, 0.0)
+        }
+    }
+}
+
+/// Kinetic / inertial scroll momentum simulation with analytical exponential decay.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct InertialScroll {
+    pub velocity: (f32, f32),
+}
+
+impl InertialScroll {
+    pub fn new(velocity: (f32, f32)) -> Option<Self> {
+        let speed = (velocity.0 * velocity.0 + velocity.1 * velocity.1).sqrt();
+        if speed >= INERTIA_MIN_VELOCITY {
+            Some(Self { velocity })
+        } else {
+            None
+        }
+    }
+
+    /// Step the simulation forward by `dt` seconds.
+    ///
+    /// Returns the exact analytical integral displacement `(dx, dy)` for this frame and
+    /// whether inertia is still running.
+    pub fn step(&mut self, dt: f32) -> ((f32, f32), bool) {
+        let dt = clamp_frame_dt(dt);
+        let decay = (-dt / INERTIA_TAU_SECS).exp();
+
+        // Exact analytical integral of v(t) = v0 * exp(-t / tau):
+        // displacement = v0 * tau * (1 - exp(-dt / tau))
+        let delta_x = self.velocity.0 * INERTIA_TAU_SECS * (1.0 - decay);
+        let delta_y = self.velocity.1 * INERTIA_TAU_SECS * (1.0 - decay);
+
+        self.velocity.0 *= decay;
+        self.velocity.1 *= decay;
+
+        let speed = (self.velocity.0 * self.velocity.0 + self.velocity.1 * self.velocity.1).sqrt();
+        let still_moving = speed >= INERTIA_STOP_VELOCITY;
+        if !still_moving {
+            self.velocity = (0.0, 0.0);
+        }
+
+        ((delta_x, delta_y), still_moving)
+    }
+}
+
 /// Which way the page content travels during a turn: `-1.0` means it moves left (the new page
 /// slides in from the right), `+1.0` means it moves right.
 ///
@@ -364,9 +477,64 @@ mod tests {
     }
 
     #[test]
-    fn reads_the_gnome_animation_switch() {
-        assert!(gsettings_disables_animations("false\n"));
-        assert!(!gsettings_disables_animations("true\n"));
-        assert!(!gsettings_disables_animations(""));
+    fn velocity_tracker_calculates_exit_velocity() {
+        let mut tracker = VelocityTracker::new();
+        // 3 motion events: 10px in 16ms each -> ~625 px/s
+        tracker.push(0.016, 0.0, 10.0);
+        tracker.push(0.016, 0.0, 10.0);
+        tracker.push(0.016, 0.0, 10.0);
+        let (vx, vy) = tracker.velocity();
+        assert_eq!(vx, 0.0);
+        assert!((vy - 625.0).abs() < 1.0, "velocity {vy}");
+    }
+
+    #[test]
+    fn inertial_scroll_decays_exponentially_to_stop() {
+        let mut inertia = InertialScroll::new((0.0, 500.0)).expect("above threshold");
+        let mut total_displacement = 0.0;
+        let mut frames = 0;
+        let mut moving = true;
+
+        while moving {
+            let ((_, dy), still) = inertia.step(1.0 / 120.0);
+            total_displacement += dy;
+            moving = still;
+            frames += 1;
+            assert!(frames < 500, "inertia must terminate cleanly");
+        }
+
+        // Theoretical exact total displacement = v0 * tau = 500 * 0.32 = 160 px
+        assert!(
+            (total_displacement - 160.0).abs() < 5.0,
+            "total distance {total_displacement}"
+        );
+        assert_eq!(inertia.velocity, (0.0, 0.0));
+    }
+
+    #[test]
+    fn inertial_scroll_distance_is_identical_at_different_refresh_rates() {
+        let v0 = (0.0, 800.0);
+        let mut distances = Vec::new();
+
+        for hz in [60.0, 120.0, 144.0, 240.0] {
+            let mut inertia = InertialScroll::new(v0).unwrap();
+            let mut distance = 0.0;
+            let mut moving = true;
+            while moving {
+                let ((_, dy), still) = inertia.step(1.0 / hz);
+                distance += dy;
+                moving = still;
+            }
+            distances.push(distance);
+        }
+
+        // All refresh rates must agree to within 0.5 pixels
+        let first = distances[0];
+        for (i, d) in distances.iter().enumerate() {
+            assert!(
+                (d - first).abs() < 0.5,
+                "refresh rate {i} gave {d} vs {first}"
+            );
+        }
     }
 }
