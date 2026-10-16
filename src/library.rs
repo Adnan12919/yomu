@@ -274,28 +274,28 @@ impl ThumbnailSize {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum BorderSize {
-    None,
     #[default]
     Thin,
     Medium,
+    Thick,
 }
 
 impl BorderSize {
-    pub const ALL: [BorderSize; 3] = [BorderSize::None, BorderSize::Thin, BorderSize::Medium];
+    pub const ALL: [BorderSize; 3] = [BorderSize::Thin, BorderSize::Medium, BorderSize::Thick];
 
     pub fn label(&self) -> &'static str {
         match self {
-            BorderSize::None => "None (0px)",
             BorderSize::Thin => "Thin (1px)",
             BorderSize::Medium => "Medium (2px)",
+            BorderSize::Thick => "Thick (3px)",
         }
     }
 
     pub fn pixels(&self) -> f32 {
         match self {
-            BorderSize::None => 0.0,
             BorderSize::Thin => 1.0,
             BorderSize::Medium => 2.0,
+            BorderSize::Thick => 3.0,
         }
     }
 }
@@ -1123,16 +1123,16 @@ mod tests {
         let tmp = temp_dir("border-rounding");
         let dirs = DataDirs::at(tmp.join("data")).unwrap();
         let mut lib = Library::default();
-        lib.settings_mut().border_size = BorderSize::Medium;
+        lib.settings_mut().border_size = BorderSize::Thick;
         lib.settings_mut().corner_rounding = CornerRounding::Soft;
         lib.save(&dirs).unwrap();
 
         let loaded = Library::load(&dirs).unwrap();
-        assert_eq!(loaded.settings().border_size, BorderSize::Medium);
+        assert_eq!(loaded.settings().border_size, BorderSize::Thick);
         assert_eq!(loaded.settings().corner_rounding, CornerRounding::Soft);
 
-        // Lenient loading with missing fields defaults to Thin / Medium
-        let json = r#"{"books":[],"settings":{}}"#;
+        // Lenient loading with missing or deprecated fields defaults to Thin / Medium
+        let json = r#"{"books":[],"settings":{"border_size":"none"}}"#;
         fs::write(dirs.library_file(), json).unwrap();
         let loaded = Library::load(&dirs).unwrap();
         assert_eq!(loaded.settings().border_size, BorderSize::Thin);

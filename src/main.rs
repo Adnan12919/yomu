@@ -3108,9 +3108,9 @@ impl Yomu {
                 );
 
                 const BORDER_OPTIONS: &[(BorderSize, &str)] = &[
-                    (BorderSize::None, "None (0px)"),
                     (BorderSize::Thin, "Thin (1px)"),
                     (BorderSize::Medium, "Medium (2px)"),
+                    (BorderSize::Thick, "Thick (3px)"),
                 ];
                 let border_dropdown = Button::new("settings-border-size")
                     .label(border_size.label())
@@ -3629,15 +3629,12 @@ impl Yomu {
         let selected = self.selection.len();
 
         let search_field: AnyElement = if let Some(input) = &self.search_input {
-            let mut field = Input::new(input)
+            Input::new(input)
                 .id("library-search")
                 .cleanable(true)
                 .prefix(Icon::new(IconName::Search).size(px(16.)))
-                .w(px(360.));
-            if self.library.settings().border_size == BorderSize::None {
-                field = field.bordered(false);
-            }
-            field.into_any_element()
+                .w(px(360.))
+                .into_any_element()
         } else {
             div().id("library-search").w(px(360.)).into_any_element()
         };
@@ -5413,12 +5410,12 @@ mod tests {
         {
             let (view, cx) = launch(&fx, cx);
             view.update(cx, |this, cx| {
-                this.set_border_size(BorderSize::Medium, cx);
+                this.set_border_size(BorderSize::Thick, cx);
                 this.set_corner_rounding(CornerRounding::Soft, cx);
             });
             assert_eq!(
                 view.read_with(cx, |this, _| this.library.settings().border_size),
-                BorderSize::Medium
+                BorderSize::Thick
             );
             assert_eq!(
                 view.read_with(cx, |this, _| this.library.settings().corner_rounding),
@@ -5430,13 +5427,13 @@ mod tests {
         let (view, cx) = launch(&fx, cx);
         assert_eq!(
             view.read_with(cx, |this, _| this.library.settings().border_size),
-            BorderSize::Medium
+            BorderSize::Thick
         );
         assert_eq!(
             view.read_with(cx, |this, _| this.library.settings().corner_rounding),
             CornerRounding::Soft
         );
-        assert_eq!(view.read_with(cx, |this, _| this.border_px()), 2.0);
+        assert_eq!(view.read_with(cx, |this, _| this.border_px()), 3.0);
         assert_eq!(view.read_with(cx, |this, _| this.radius_px()), 12.0);
         assert_eq!(view.read_with(cx, |this, _| this.radius_lg_px()), 14.0);
 
