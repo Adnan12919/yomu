@@ -321,10 +321,10 @@ impl Settings {
         let Some(object) = value.as_object() else {
             return settings;
         };
-        if let Some(theme_name) = object.get("theme_name").and_then(|v| v.as_str()) {
-            if !theme_name.trim().is_empty() {
-                settings.theme_name = theme_name.to_string();
-            }
+        if let Some(theme_name) = object.get("theme_name").and_then(|v| v.as_str())
+            && !theme_name.trim().is_empty()
+        {
+            settings.theme_name = theme_name.to_string();
         }
         if let Some(animate) = object.get("animate").and_then(|v| v.as_bool()) {
             settings.animate = animate;
@@ -504,13 +504,12 @@ impl Library {
             }
             if let Ok(pages) = archive::list_pages(&book.path, book.kind) {
                 for name in pages.iter().take(3) {
-                    if let Ok(bytes) = archive::read_page(&book.path, book.kind, name) {
-                        if let Ok(jpeg) = imaging::make_cover_jpeg(&bytes, max_w, max_h) {
-                            if fs::write(&cover_path, jpeg).is_ok() {
-                                built += 1;
-                                break;
-                            }
-                        }
+                    if let Ok(bytes) = archive::read_page(&book.path, book.kind, name)
+                        && let Ok(jpeg) = imaging::make_cover_jpeg(&bytes, max_w, max_h)
+                        && fs::write(&cover_path, jpeg).is_ok()
+                    {
+                        built += 1;
+                        break;
                     }
                 }
             }

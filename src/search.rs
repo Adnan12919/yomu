@@ -15,11 +15,9 @@ pub fn contains_ignore_case(haystack: &str, needle: &str) -> bool {
     if haystack.is_ascii() && needle.is_ascii() {
         let n = needle.as_bytes();
         let h = haystack.as_bytes();
-        return h.windows(n.len()).any(|w| {
-            w.iter()
-                .zip(n)
-                .all(|(a, b)| a.to_ascii_lowercase() == b.to_ascii_lowercase())
-        });
+        return h
+            .windows(n.len())
+            .any(|w| w.iter().zip(n).all(|(a, b)| a.eq_ignore_ascii_case(b)));
     }
 
     // General Unicode case-folded comparison.
@@ -50,10 +48,10 @@ pub fn matches(title: &str, path: &Path, series: Option<&str>, query: &str) -> b
         return true;
     }
 
-    if let Some(s) = series {
-        if contains_ignore_case(s, query) {
-            return true;
-        }
+    if let Some(s) = series
+        && contains_ignore_case(s, query)
+    {
+        return true;
     }
 
     if let Some(p) = path.to_str() {

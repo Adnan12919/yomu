@@ -1,19 +1,20 @@
 //! yomu: a minimal, GPU-accelerated, Wayland-native manga reader.
 
+#![forbid(unsafe_code)]
+
 use std::{
     collections::{HashMap, HashSet},
     fs,
-    hash::{Hash, Hasher},
     path::{Path, PathBuf},
     rc::Rc,
-    sync::{Arc, mpsc},
+    sync::{Arc, Mutex, mpsc},
     time::{Duration, Instant},
 };
 
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use gpui_kit::assets::IconName;
-use gpui_kit::component::ColorTokens;
 use gpui_kit::component::Icon;
+use gpui_kit::component::Sizable;
 use gpui_kit::component::button::{Button, ButtonRounded, ButtonVariants};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
@@ -22,7 +23,6 @@ use gpui_kit::component::switch::Switch;
 use gpui_kit::component::tab::{Tab, TabBar};
 use gpui_kit::component::table::{Table, TableBody, TableCell, TableHead, TableHeader, TableRow};
 use gpui_kit::component::tag::Tag;
-use gpui_kit::component::{Disableable, Sizable};
 use gpui_kit::component::{Theme as KitTheme, ThemeConfig, ThemeRegistry};
 #[allow(unused_imports)]
 use gpui_kit::popup::{PopupAnchor, PopupConstraintAdjustment, PopupGravity, PopupOptions};
@@ -37,18 +37,16 @@ use gpui_kit::{
     ease_out_quint, img, point, prelude::*, px, relative, size,
 };
 use image::Frame;
-use serde::Deserialize;
 use yomu::{
-    archive::{self, SourceKind},
-    imaging,
+    archive, imaging,
     layout::{self, Arrive, FitMode, Viewport},
     library::{self, Book, DataDirs, Library, Settings, ThumbnailSize},
     menu::{self, BookAction, Entry, Item},
-    motion::{self, InertialScroll, PageTransition, VelocityTracker},
+    motion::{self, InertialScroll},
     pagecache, search,
     selection::Selection,
     util::{format_size, now_secs},
-    vim::{self, Action, Amount, Dir, Vim},
+    vim::{self, Action, Amount, Dir},
 };
 
 actions!(
@@ -62,265 +60,22 @@ actions!(
     ]
 );
 
-/// The small set of semantic Kit tokens used by yomu's custom reader/library composition.
-#[derive(Clone, Copy)]
-struct UiColors {
-    background: gpui_kit::Hsla,
-    surface: gpui_kit::Hsla,
-    surface_hover: gpui_kit::Hsla,
-    border: gpui_kit::Hsla,
-    foreground: gpui_kit::Hsla,
-    muted: gpui_kit::Hsla,
-    accent: gpui_kit::Hsla,
-    accent_foreground: gpui_kit::Hsla,
-    danger: gpui_kit::Hsla,
-    danger_hover: gpui_kit::Hsla,
-    widget_opacity: f32,
-}
+mod ui;
 
-impl UiColors {
-    fn from_tokens(tokens: ColorTokens) -> Self {
-        Self {
-            background: tokens.background,
-            surface: tokens.surface,
-            surface_hover: tokens.secondary,
-            border: tokens.border,
-            foreground: tokens.foreground,
-            muted: tokens.muted_foreground,
-            accent: tokens.primary,
-            accent_foreground: tokens.primary_foreground,
-            danger: tokens.destructive,
-            danger_hover: tokens.destructive,
-            widget_opacity: 1.0,
-        }
-    }
-
-    fn from_app(cx: &App) -> Self {
-        cx.try_global::<KitTheme>()
-            .map(|theme| {
-                let mut colors = Self::from_tokens(theme.semantic_tokens().colors);
-                colors.danger = theme.danger;
-                colors.danger_hover = theme.danger_hover;
-                colors
-            })
-            .unwrap_or_else(|| Self::from_tokens(ColorTokens::dark()))
-    }
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(default)]
-struct CustomThemeFile {
-    name: String,
-    themes: Vec<CustomThemeDefinition>,
-}
-
-impl Default for CustomThemeFile {
-    fn default() -> Self {
-        Self {
-            name: "yomu custom themes".to_string(),
-            themes: Vec::new(),
-        }
-    }
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(default)]
-struct CustomThemeDefinition {
-    name: String,
-    mode: String,
-    colors: std::collections::BTreeMap<String, String>,
-    font_size: Option<f32>,
-    font_family: Option<String>,
-    mono_font_size: Option<f32>,
-    mono_font_family: Option<String>,
-    radius: Option<usize>,
-    radius_lg: Option<usize>,
-    shadow: Option<bool>,
-}
-
-impl Default for CustomThemeDefinition {
-    fn default() -> Self {
-        Self {
-            name: String::new(),
-            mode: "dark".to_string(),
-            colors: std::collections::BTreeMap::new(),
-            font_size: None,
-            font_family: None,
-            mono_font_size: None,
-            mono_font_family: None,
-            radius: None,
-            radius_lg: None,
-            shadow: None,
-        }
-    }
-}
-
-const CUSTOM_THEME_COLOR_KEYS: &[&str] = &[
-    "accent.background",
-    "accent.foreground",
-    "background",
-    "border",
-    "button.background",
-    "button.foreground",
-    "button.hover.background",
-    "button.primary.background",
-    "button.primary.foreground",
-    "button.primary.hover.background",
-    "danger.background",
-    "danger.foreground",
-    "foreground",
-    "input.border",
-    "link",
-    "muted.background",
-    "muted.foreground",
-    "popover.background",
-    "popover.foreground",
-    "primary.background",
-    "primary.foreground",
-    "primary.hover.background",
-    "ring",
-    "scrollbar.background",
-    "secondary.background",
-    "secondary.foreground",
-    "secondary.hover.background",
-    "tab.active.background",
-    "tab.active.foreground",
-    "tab.background",
-    "tab.foreground",
-    "tab_bar.background",
-    "tab_bar.segmented.background",
-];
-
-fn parse_custom_themes(
-    contents: &str,
-    built_in_names: &HashSet<String>,
-) -> Result<HashMap<String, Rc<ThemeConfig>>> {
-    let file: CustomThemeFile =
-        toml::from_str(contents).map_err(|error| anyhow!("parsing themes.toml: {error}"))?;
-    let mut names = HashSet::new();
-    let mut themes = HashMap::new();
-
-    for definition in file.themes {
-        let name = definition.name.trim();
-        if name.is_empty() {
-            return Err(anyhow!("each custom theme needs a non-empty name"));
-        }
-        if built_in_names.contains(name) {
-            return Err(anyhow!(
-                "custom theme name “{name}” conflicts with a built-in theme"
-            ));
-        }
-        if !names.insert(name.to_string()) {
-            return Err(anyhow!("duplicate custom theme name “{name}”"));
-        }
-        if definition.mode != "dark" && definition.mode != "light" {
-            return Err(anyhow!("theme “{name}” mode must be `dark` or `light`"));
-        }
-        if definition.colors.is_empty() {
-            return Err(anyhow!("theme “{name}” needs at least one color override"));
-        }
-        for (key, value) in &definition.colors {
-            if !CUSTOM_THEME_COLOR_KEYS.contains(&key.as_str()) {
-                return Err(anyhow!("unsupported color token `{key}` in theme “{name}”"));
-            }
-            let digits = value.strip_prefix('#').unwrap_or("");
-            if !matches!(digits.len(), 6 | 8)
-                || !digits.bytes().all(|byte| byte.is_ascii_hexdigit())
-            {
-                return Err(anyhow!(
-                    "color `{key}` in theme “{name}” must use #RRGGBB or #RRGGBBAA"
-                ));
-            }
-        }
-
-        let config_value = serde_json::json!({
-            "name": name,
-            "mode": definition.mode,
-            "colors": definition.colors,
-            "font.size": definition.font_size,
-            "font.family": definition.font_family,
-            "mono_font.size": definition.mono_font_size,
-            "mono_font.family": definition.mono_font_family,
-            "radius": definition.radius,
-            "radius.lg": definition.radius_lg,
-            "shadow": definition.shadow,
-        });
-        let config: ThemeConfig = serde_json::from_value(config_value)
-            .map_err(|error| anyhow!("invalid theme “{name}”: {error}"))?;
-        themes.insert(name.to_string(), Rc::new(config));
-    }
-
-    if themes.is_empty() {
-        let set_name = file.name.trim();
-        let set_name = if set_name.is_empty() {
-            "custom theme set"
-        } else {
-            set_name
-        };
-        return Err(anyhow!(
-            "{set_name} must define at least one [[themes]] entry"
-        ));
-    }
-    Ok(themes)
-}
-
-fn custom_theme_path(_data_dirs: &DataDirs) -> Result<PathBuf> {
-    #[cfg(test)]
-    {
-        Ok(_data_dirs
-            .library_file()
-            .parent()
-            .unwrap_or(Path::new("."))
-            .join("themes.toml"))
-    }
-    #[cfg(not(test))]
-    {
-        let config_dir = dirs::config_dir()
-            .ok_or_else(|| anyhow!("could not determine the user's configuration directory"))?;
-        Ok(config_dir.join("yomu").join("themes.toml"))
-    }
-}
-
-#[allow(dead_code)]
-fn custom_theme_fingerprint(path: &Path) -> Option<u64> {
-    let contents = fs::read(path).ok()?;
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    contents.hash(&mut hasher);
-    Some(hasher.finish())
-}
-
-fn ensure_custom_theme_file(path: &Path) -> Result<()> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow!("custom theme path has no parent directory"))?;
-    fs::create_dir_all(parent)?;
-    match fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-    {
-        Ok(mut file) => {
-            use std::io::Write as _;
-            file.write_all(include_bytes!("../themes.example.toml"))?;
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-        Err(error) => return Err(error.into()),
-    }
-    Ok(())
-}
-
-fn built_in_theme_names(cx: &App) -> HashSet<String> {
-    cx.try_global::<ThemeRegistry>()
-        .map(|registry| registry.themes().keys().map(ToString::to_string).collect())
-        .unwrap_or_default()
-}
-
-fn load_custom_themes(path: &Path, cx: &App) -> Result<HashMap<String, Rc<ThemeConfig>>> {
-    let contents =
-        fs::read_to_string(path).map_err(|error| anyhow!("reading {}: {error}", path.display()))?;
-    let built_in_names = built_in_theme_names(cx);
-    parse_custom_themes(&contents, &built_in_names)
-}
+use ui::components::{
+    ButtonKind, centered, overlay_shade, page_layer, panel_button, pill, with_alpha,
+};
+use ui::overlays::{
+    BookMenu, ConfirmAction, ConfirmDialog, LibraryMenu, Overlay, PropertiesDialog, SeriesDialog,
+    SettingsTab,
+};
+use ui::reader::{Drag, Page, Reader, ReaderSyncOutcome, WheelParams, viewport_of};
+#[allow(unused_imports)]
+use ui::theme::custom_theme_fingerprint;
+use ui::theme::{
+    UiColors, built_in_theme_names, custom_theme_path, ensure_custom_theme_file,
+    load_custom_themes, parse_custom_themes,
+};
 
 /// How far `j`/`k`/`h`/`l` scroll, in logical pixels.
 const LINE_STEP: f32 = 64.0;
@@ -331,6 +86,8 @@ const EDGE_EPS: f32 = 1.0;
 /// Mouse travel before a press counts as a drag instead of a click.
 const DRAG_THRESHOLD: f32 = 4.0;
 const HUD_SECS: u64 = 2;
+const AUTOSAVE_DEBOUNCE: Duration = Duration::from_millis(500);
+const AUTOSAVE_MAX_DELAY: Duration = Duration::from_millis(2000);
 
 /// Clicks this soon after a menu or dialog closes are ignored, so double-clicking a menu item
 /// cannot also click the book underneath it.
@@ -340,465 +97,6 @@ const CLICK_GUARD: Duration = Duration::from_millis(300);
 enum Side {
     Left,
     Right,
-}
-
-fn viewport_of(window: &Window) -> Viewport {
-    let size = window.viewport_size();
-    Viewport {
-        width: f32::from(size.width),
-        height: f32::from(size.height),
-        scale: window.scale_factor(),
-    }
-}
-
-/// A decoded page, drawn at a size we compute ourselves (see `layout`).
-struct Page {
-    image: Arc<RenderImage>,
-    /// Dimensions of the original image, which is what fit modes are computed from.
-    orig: (u32, u32),
-    /// Decode tier (longest side in pixels) this image was made at.
-    tier: u32,
-    /// Memory the decoded pixels take (BGRA), for the cache budget.
-    bytes: u64,
-}
-
-/// The page that is sliding out during a page turn, frozen as it was when the turn began.
-struct Outgoing {
-    image: Arc<RenderImage>,
-    display: (f32, f32),
-    origin: (f32, f32),
-}
-
-#[derive(Clone, Copy)]
-struct Drag {
-    start: (f32, f32),
-    off0: (f32, f32),
-    moved: bool,
-    last_at: (f32, f32),
-    last_time: Instant,
-}
-
-/// State of the book that is currently open.
-struct Reader {
-    book_id: String,
-    path: PathBuf,
-    kind: SourceKind,
-    /// `None` while the page list is still being read from disk.
-    pages: Option<Arc<Vec<String>>>,
-    /// Original dimensions are retained separately from decoded textures so continuous layout
-    /// can keep stable geometry while pages are evicted from the image cache.
-    orig_sizes: Vec<Option<(u32, u32)>>,
-    page: usize,
-    total: usize,
-
-    fit: FitMode,
-    /// Multiplier on top of the fit size; `1.0` is exactly the fit.
-    zoom: f32,
-    /// How far the page is scrolled from its top-left corner (what is drawn this frame).
-    off: (f32, f32),
-    /// Where `off` is gliding to. Equal to `off` when nothing is moving. Key and wheel-notch
-    /// scrolling move this; edge checks and repeated presses accumulate on it, not on `off`.
-    scroll_target: (f32, f32),
-    /// Scroll position to apply once the new page's size is known.
-    arrive: Option<Arrive>,
-    viewport: Viewport,
-
-    /// The slide between pages, if one is running. At most one exists (no queue); a page turn
-    /// that arrives mid-slide replaces it. Purely visual: `page` and the saved progress already
-    /// point at the new page the moment you turn.
-    transition: Option<PageTransition>,
-    outgoing: Option<Outgoing>,
-    /// The viewport the slide started in; resizing the window cancels it.
-    transition_viewport: Viewport,
-    /// Whether page turns and scrolling animate (the setting, unless the desktop asks for
-    /// reduced motion).
-    animate: bool,
-    continuous: bool,
-    webcomics: bool,
-    /// Textures no longer shown, to be freed by the window on its next frame.
-    released: Vec<Arc<RenderImage>>,
-
-    images: HashMap<usize, Page>,
-    pending: HashSet<usize>,
-    failed: HashMap<usize, String>,
-    error: Option<String>,
-
-    vim: Vim,
-    drag: Option<Drag>,
-    inertia: Option<InertialScroll>,
-    velocity_tracker: VelocityTracker,
-    last_motion_time: Option<Instant>,
-    /// Where `''` jumps back to.
-    back_page: Option<usize>,
-    show_info: bool,
-    show_help: bool,
-}
-
-impl Reader {
-    fn new(book: &Book, settings: &Settings) -> Self {
-        Self {
-            book_id: book.id.clone(),
-            path: book.path.clone(),
-            kind: book.kind,
-            pages: None,
-            orig_sizes: Vec::new(),
-            page: book.current_page.min(book.page_count.saturating_sub(1)),
-            total: book.page_count,
-            fit: settings.fit,
-            zoom: 1.0,
-            off: (0.0, 0.0),
-            scroll_target: (0.0, 0.0),
-            arrive: Some(Arrive::Start),
-            viewport: Viewport::EMPTY,
-            transition: None,
-            outgoing: None,
-            transition_viewport: Viewport::EMPTY,
-            animate: settings.animate,
-            continuous: settings.continuous || settings.webcomics,
-            webcomics: settings.webcomics,
-            released: Vec::new(),
-            images: HashMap::new(),
-            pending: HashSet::new(),
-            failed: HashMap::new(),
-            error: None,
-            vim: Vim::new(),
-            drag: None,
-            inertia: None,
-            velocity_tracker: VelocityTracker::new(),
-            last_motion_time: None,
-            back_page: None,
-            show_info: false,
-            show_help: false,
-        }
-    }
-
-    fn current(&self) -> Option<&Page> {
-        self.images.get(&self.page)
-    }
-
-    fn continuous_layout(&self, vp: &Viewport) -> (Vec<f32>, Vec<f32>) {
-        let width = (vp.width * self.zoom).max(1.0);
-        let gap = if self.webcomics {
-            0.0
-        } else {
-            12.0 * self.zoom
-        };
-        let mut tops = Vec::with_capacity(self.total);
-        let mut heights = Vec::with_capacity(self.total);
-        let mut top = 0.0;
-        for ix in 0..self.total {
-            tops.push(top);
-            // Unknown pages use a typical portrait ratio until their metadata is read.
-            let (w, h) = self.orig_sizes.get(ix).and_then(|v| *v).unwrap_or((2, 3));
-            let height = width * h as f32 / w.max(1) as f32;
-            heights.push(height);
-            top += height + gap;
-        }
-        (tops, heights)
-    }
-
-    fn continuous_page_at(&self, y: f32, vp: &Viewport) -> usize {
-        let (tops, heights) = self.continuous_layout(vp);
-        tops.iter()
-            .zip(heights)
-            .position(|(top, height)| y < *top + height)
-            .unwrap_or_else(|| self.total.saturating_sub(1))
-    }
-
-    fn orig_of(page: &Page) -> (f32, f32) {
-        (page.orig.0 as f32, page.orig.1 as f32)
-    }
-
-    /// Apply a pending page-turn arrival and clamp the scroll offset. Returns the display size
-    /// of the current page, or `None` while it is still being decoded.
-    fn settle(&mut self, vp: &Viewport) -> Option<(f32, f32)> {
-        if self.continuous {
-            if self.total == 0 {
-                return None;
-            }
-            let (tops, heights) = self.continuous_layout(vp);
-            let doc_height =
-                tops.last().copied().unwrap_or(0.0) + heights.last().copied().unwrap_or(0.0);
-            let page = self.page.min(self.total - 1);
-            if let Some(arrive) = self.arrive.take() {
-                self.scroll_target.1 = match arrive {
-                    Arrive::Start => tops[page],
-                    Arrive::End => (tops[page] + heights[page] - vp.height).max(0.0),
-                };
-                self.off = self.scroll_target;
-            }
-            let width = vp.width * self.zoom;
-            let max_x = (width - vp.width).max(0.0);
-            let max_y = (doc_height - vp.height).max(0.0);
-            self.off.0 = self.off.0.clamp(0.0, max_x);
-            self.off.1 = self.off.1.clamp(0.0, max_y);
-            self.scroll_target.0 = self.scroll_target.0.clamp(0.0, max_x);
-            self.scroll_target.1 = self.scroll_target.1.clamp(0.0, max_y);
-            self.page = self.continuous_page_at(self.off.1 + vp.height * 0.5, vp);
-            return Some((width, heights[self.page]));
-        }
-        let orig = Self::orig_of(self.current()?);
-        let display = layout::display_size(self.fit, self.zoom, orig, vp);
-        let max = layout::max_offset(display, vp);
-        if let Some(arrive) = self.arrive.take() {
-            self.set_scroll(layout::arrival_offset(arrive, max));
-        }
-        self.off = layout::clamp_offset(self.off, display, vp);
-        self.scroll_target = layout::clamp_offset(self.scroll_target, display, vp);
-        Some(display)
-    }
-
-    /// Jump the scroll position (no glide).
-    fn set_scroll(&mut self, off: (f32, f32)) {
-        self.off = off;
-        self.scroll_target = off;
-    }
-
-    /// Hand a texture that is no longer drawn to the window to free, unless the page cache
-    /// still holds it.
-    fn release(&mut self, image: Arc<RenderImage>) {
-        if !self
-            .images
-            .values()
-            .any(|page| Arc::ptr_eq(&page.image, &image))
-        {
-            self.released.push(image);
-        }
-    }
-
-    fn cancel_transition(&mut self) {
-        self.transition = None;
-        if let Some(outgoing) = self.outgoing.take() {
-            self.release(outgoing.image);
-        }
-    }
-
-    /// Start the slide for a page turn. Call *before* `page` changes: the page on screen right
-    /// now is what slides out.
-    ///
-    /// No slide is started (and any running one is dropped) when animations are off, when the
-    /// page on screen is not decoded yet, or when the window has no size. If a slide is already
-    /// running it is replaced, never queued: the page that was sliding in takes over as the
-    /// outgoing page from exactly where it is, so rapid turns stay smooth and cannot fall behind.
-    fn begin_transition(&mut self, forward: bool, enabled: bool) {
-        let vp = self.viewport;
-        let on_screen = self
-            .current()
-            .map(|page| (page.image.clone(), Self::orig_of(page)));
-        let Some((image, orig)) =
-            on_screen.filter(|_| enabled && vp.width >= 1.0 && vp.height >= 1.0)
-        else {
-            self.cancel_transition();
-            return;
-        };
-
-        let travel = motion::travel(forward);
-        let display = layout::display_size(self.fit, self.zoom, orig, &vp);
-        let origin = layout::origin(self.off, display, &vp);
-        let next = match self.transition {
-            Some(running) => running.interrupted_by(travel),
-            None => PageTransition::starting(travel),
-        };
-        if let Some(previous) = self.outgoing.take() {
-            self.release(previous.image);
-        }
-        self.outgoing = Some(Outgoing {
-            image,
-            display,
-            origin,
-        });
-        self.transition = Some(next);
-        self.transition_viewport = vp;
-    }
-
-    /// Advance the slide and the scroll glide by `dt` seconds of real time. Returns whether
-    /// another frame is needed; when it returns `false` nothing is moving and the window can
-    /// stay idle.
-    fn advance_animations(&mut self, dt: f32, vp: &Viewport) -> bool {
-        let dt = motion::clamp_frame_dt(dt);
-
-        let resized = vp.width != self.transition_viewport.width
-            || vp.height != self.transition_viewport.height;
-        if self.transition.is_some() && (resized || self.failed.contains_key(&self.page)) {
-            self.cancel_transition();
-        }
-        if !self.animate {
-            self.cancel_transition();
-            self.inertia = None;
-            self.off = self.scroll_target;
-            return false;
-        }
-
-        let mut animating = false;
-        if let Some(mut transition) = self.transition {
-            // The clock only runs once the new page can be shown, so a slow decode keeps the old
-            // page on screen instead of showing a blank.
-            if self.current().is_some() {
-                transition.advance(dt);
-                if transition.is_done() {
-                    self.transition = None;
-                    if let Some(outgoing) = self.outgoing.take() {
-                        self.release(outgoing.image);
-                    }
-                } else {
-                    self.transition = Some(transition);
-                    animating = true;
-                }
-            }
-        }
-
-        let mut motion_active = false;
-        if self.inertia.is_none() {
-            if let Some(last_time) = self.last_motion_time {
-                let elapsed = Instant::now().duration_since(last_time);
-                if elapsed >= Duration::from_millis(35) {
-                    self.last_motion_time = None;
-                    if self.animate {
-                        let velocity = self.velocity_tracker.velocity();
-                        self.inertia = InertialScroll::new(velocity);
-                    }
-                } else {
-                    motion_active = true;
-                }
-            }
-        }
-
-        let mut moving = false;
-        if let Some(mut inertia) = self.inertia.take() {
-            let ((dx, dy), still) = inertia.step(dt);
-            let (max_w, max_h) = if self.continuous {
-                let (tops, heights) = self.continuous_layout(vp);
-                let w = (self.viewport.width * self.zoom - vp.width).max(0.0);
-                let h = (tops.last().copied().unwrap_or(0.0)
-                    + heights.last().copied().unwrap_or(0.0)
-                    - vp.height)
-                    .max(0.0);
-                (w, h)
-            } else if let Some(display) = self.settle(vp) {
-                layout::max_offset(display, vp)
-            } else {
-                (0.0, 0.0)
-            };
-
-            let next_x = (self.off.0 + dx).clamp(0.0, max_w);
-            let next_y = (self.off.1 + dy).clamp(0.0, max_h);
-
-            if next_x == 0.0 || next_x == max_w {
-                inertia.velocity.0 = 0.0;
-            }
-            if next_y == 0.0 || next_y == max_h {
-                inertia.velocity.1 = 0.0;
-            }
-
-            self.off = (next_x, next_y);
-            self.scroll_target = self.off;
-
-            let speed = (inertia.velocity.0 * inertia.velocity.0
-                + inertia.velocity.1 * inertia.velocity.1)
-                .sqrt();
-            if still && speed >= motion::INERTIA_STOP_VELOCITY {
-                self.inertia = Some(inertia);
-                moving = true;
-            } else {
-                self.inertia = None;
-            }
-        } else {
-            let (off, is_moving) = motion::step_scroll(self.off, self.scroll_target, dt);
-            self.off = off;
-            moving = is_moving;
-        }
-
-        animating || moving || motion_active
-    }
-
-    /// Every texture this reader still owns, for freeing when the book closes.
-    fn into_images(self) -> Vec<Arc<RenderImage>> {
-        let mut images: Vec<_> = self.images.into_values().map(|page| page.image).collect();
-        images.extend(self.outgoing.map(|outgoing| outgoing.image));
-        images.extend(self.released);
-        images
-    }
-}
-
-#[derive(Clone)]
-struct BookMenu {
-    book_id: String,
-    entries: Vec<Entry>,
-    position: Point<Pixels>,
-    selected: Option<usize>,
-}
-
-enum ConfirmAction {
-    Book(BookAction, String),
-    RemoveSelected,
-    ResetSettings,
-    ClearThumbnailCache,
-    ClearAllData,
-}
-
-struct ConfirmDialog {
-    title: SharedString,
-    message: SharedString,
-    confirm_label: &'static str,
-    action: ConfirmAction,
-}
-
-struct PropertiesDialog {
-    title: SharedString,
-    rows: Vec<(String, String)>,
-}
-
-struct SeriesDialog {
-    book_ids: Vec<String>,
-    input: Entity<InputState>,
-}
-
-#[derive(Default)]
-struct LibraryMenu {
-    selected: usize,
-}
-
-/// At most one menu or dialog is open at a time; it sits on top of whatever view is showing.
-enum Overlay {
-    Menu(BookMenu),
-    LibraryMenu(LibraryMenu),
-    Confirm(ConfirmDialog),
-    Properties(PropertiesDialog),
-    Series(SeriesDialog),
-    Settings,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Default)]
-enum SettingsTab {
-    #[default]
-    Appearance,
-    Library,
-    Reader,
-    Storage,
-    Keyboard,
-}
-
-impl SettingsTab {
-    fn from_index(idx: usize) -> Self {
-        match idx {
-            0 => Self::Appearance,
-            1 => Self::Library,
-            2 => Self::Reader,
-            3 => Self::Storage,
-            4 => Self::Keyboard,
-            _ => Self::Appearance,
-        }
-    }
-
-    fn to_index(self) -> usize {
-        match self {
-            Self::Appearance => 0,
-            Self::Library => 1,
-            Self::Reader => 2,
-            Self::Storage => 3,
-            Self::Keyboard => 4,
-        }
-    }
 }
 
 struct LibraryGroup<'a> {
@@ -811,12 +109,6 @@ struct LibraryGroup<'a> {
 enum ImportEvent {
     Book(Book),
     Finished(library::ImportReport),
-}
-
-fn with_alpha(color: gpui_kit::Hsla, alpha: f32) -> Rgba {
-    let mut color: Rgba = color.into();
-    color.a = alpha;
-    color
 }
 
 fn directory_groups(books: &[Book]) -> Vec<LibraryGroup<'_>> {
@@ -865,14 +157,6 @@ fn directory_groups(books: &[Book]) -> Vec<LibraryGroup<'_>> {
     groups
 }
 
-fn overlay_shade(colors: UiColors) -> gpui_kit::Hsla {
-    if colors.background.l > 0.5 {
-        colors.foreground
-    } else {
-        colors.background
-    }
-}
-
 struct Yomu {
     focus_handle: FocusHandle,
     dirs: Arc<DataDirs>,
@@ -912,6 +196,10 @@ struct Yomu {
     open_group: Option<String>,
     /// Which background appearance the window currently has (`None` before the first frame).
     applied_opaque: Option<bool>,
+    save_seq: u64,
+    last_saved_seq: Arc<Mutex<u64>>,
+    save_pending: bool,
+    save_pending_since: Option<Instant>,
 }
 
 impl Yomu {
@@ -953,16 +241,15 @@ impl Yomu {
         });
         if let Some(config) = selected_config {
             KitTheme::update(cx, |theme| theme.apply_config(&config));
-        } else if selected_theme != "Default Dark" {
-            if let Some(config) = cx
+        } else if selected_theme != "Default Dark"
+            && let Some(config) = cx
                 .try_global::<ThemeRegistry>()
                 .and_then(|registry| registry.themes().get("Default Dark").cloned())
-            {
-                KitTheme::update(cx, |theme| theme.apply_config(&config));
-                theme_status.get_or_insert_with(|| {
-                    format!("Theme “{selected_theme}” was unavailable; using Default Dark")
-                });
-            }
+        {
+            KitTheme::update(cx, |theme| theme.apply_config(&config));
+            theme_status.get_or_insert_with(|| {
+                format!("Theme “{selected_theme}” was unavailable; using Default Dark")
+            });
         }
         let mut colors = UiColors::from_app(cx);
         colors.widget_opacity = library.settings().opacity;
@@ -997,6 +284,10 @@ impl Yomu {
             search_input: None,
             open_group: None,
             applied_opaque: None,
+            save_seq: 0,
+            last_saved_seq: Arc::new(Mutex::new(0)),
+            save_pending: false,
+            save_pending_since: None,
         };
 
         #[cfg(not(test))]
@@ -1104,9 +395,65 @@ impl Yomu {
     // ------------------------------------------------------------------------------------
 
     fn save_library(&mut self) {
+        self.save_seq += 1;
+        let seq = self.save_seq;
+        self.save_pending = false;
+        self.save_pending_since = None;
+        let mut guard = self.last_saved_seq.lock().unwrap();
         if let Err(err) = self.library.save(&self.dirs) {
             eprintln!("yomu: failed to save library: {err:#}");
+        } else {
+            *guard = seq;
         }
+    }
+
+    fn save_library_debounced(&mut self, cx: &mut Context<Self>) {
+        self.save_seq += 1;
+        let now = Instant::now();
+        let pending_since = *self.save_pending_since.get_or_insert(now);
+
+        if now.duration_since(pending_since) >= AUTOSAVE_MAX_DELAY {
+            self.save_pending = false;
+            self.save_pending_since = None;
+            self.flush_save_background(cx);
+            return;
+        }
+
+        if !self.save_pending {
+            self.save_pending = true;
+            cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(AUTOSAVE_DEBOUNCE).await;
+                this.update(cx, |this, cx| {
+                    if this.save_pending {
+                        this.save_pending = false;
+                        this.save_pending_since = None;
+                        this.flush_save_background(cx);
+                    }
+                })
+                .ok();
+            })
+            .detach();
+        }
+    }
+
+    fn flush_save_background(&mut self, cx: &mut Context<Self>) {
+        let seq = self.save_seq;
+        let library = self.library.clone();
+        let dirs = Arc::clone(&self.dirs);
+        let last_saved = Arc::clone(&self.last_saved_seq);
+
+        cx.background_executor()
+            .spawn(async move {
+                let mut guard = last_saved.lock().unwrap();
+                if seq > *guard {
+                    if let Err(err) = library.save(&dirs) {
+                        eprintln!("yomu: failed to save library: {err:#}");
+                    } else {
+                        *guard = seq;
+                    }
+                }
+            })
+            .detach();
     }
 
     fn show_toast(&mut self, message: impl Into<SharedString>, cx: &mut Context<Self>) {
@@ -1683,7 +1030,10 @@ impl Yomu {
                 self.save_library();
                 cx.notify();
             }
-            4 => cx.quit(),
+            4 => {
+                self.save_library();
+                cx.quit();
+            }
             _ => {}
         }
     }
@@ -2373,16 +1723,15 @@ impl Yomu {
         );
     }
 
-    fn on_wheel(
-        &mut self,
-        delta: (f32, f32),
-        zoom: bool,
-        at: (f32, f32),
-        discrete: bool,
-        touch_phase: TouchPhase,
-        vp: Viewport,
-        cx: &mut Context<Self>,
-    ) {
+    fn on_wheel(&mut self, params: WheelParams, cx: &mut Context<Self>) {
+        let WheelParams {
+            delta,
+            zoom,
+            at,
+            discrete,
+            touch_phase,
+            vp,
+        } = params;
         let (dx, dy) = delta;
         let Some(reader) = self.reader.as_mut() else {
             return;
@@ -2391,7 +1740,7 @@ impl Yomu {
         let now = Instant::now();
         let is_new_gesture = reader
             .last_motion_time
-            .map_or(true, |t| now.duration_since(t) > Duration::from_millis(80));
+            .is_none_or(|t| now.duration_since(t) > Duration::from_millis(80));
 
         if is_new_gesture || touch_phase == TouchPhase::Started {
             reader.inertia = None;
@@ -2753,7 +2102,10 @@ impl Yomu {
             Action::ToggleFullscreen => window.toggle_fullscreen(),
             Action::OpenSettings => self.open_settings_window(window, cx),
             Action::CloseBook => self.close_book(window, cx),
-            Action::QuitApp => cx.quit(),
+            Action::QuitApp => {
+                self.save_library();
+                cx.quit();
+            }
             Action::Message(text) => self.show_hud(text, cx),
         }
     }
@@ -2768,11 +2120,11 @@ impl Yomu {
         let vp = viewport_of(window);
         let animate = self.animations_enabled();
 
-        let (wanted, animating, progress_changed): (
-            Vec<(usize, u32)>,
-            bool,
-            Option<(String, usize)>,
-        ) = {
+        let ReaderSyncOutcome {
+            wanted,
+            animating,
+            progress_changed,
+        } = {
             let Some(reader) = self.reader.as_mut() else {
                 return false;
             };
@@ -2890,11 +2242,15 @@ impl Yomu {
                     (ix, tier)
                 })
                 .collect();
-            (wanted, animating, progress_changed)
+            ReaderSyncOutcome {
+                wanted,
+                animating,
+                progress_changed,
+            }
         };
 
         if progress_changed.is_some() {
-            self.save_library();
+            self.save_library_debounced(cx);
         }
 
         // Textures released by finished slides are freed on the next frame.
@@ -4810,12 +4166,14 @@ impl Yomu {
                 let delta = event.delta.pixel_delta(px(WHEEL_LINE));
                 let discrete = matches!(event.delta, ScrollDelta::Lines(_));
                 this.on_wheel(
-                    (f32::from(delta.x), f32::from(delta.y)),
-                    event.modifiers.control,
-                    (f32::from(event.position.x), f32::from(event.position.y)),
-                    discrete,
-                    event.touch_phase,
-                    viewport_of(window),
+                    WheelParams::new(
+                        (f32::from(delta.x), f32::from(delta.y)),
+                        event.modifiers.control,
+                        (f32::from(event.position.x), f32::from(event.position.y)),
+                        discrete,
+                        event.touch_phase,
+                        viewport_of(window),
+                    ),
                     cx,
                 );
             }))
@@ -4915,48 +4273,25 @@ impl Render for Yomu {
     }
 }
 
+impl Drop for Yomu {
+    fn drop(&mut self) {
+        if self.save_pending {
+            self.save_pending = false;
+            let mut guard = self.last_saved_seq.lock().unwrap();
+            if self.save_seq > *guard {
+                if let Err(err) = self.library.save(&self.dirs) {
+                    eprintln!("yomu: failed to save library on exit: {err:#}");
+                } else {
+                    *guard = self.save_seq;
+                }
+            }
+        }
+    }
+}
+
 // ----------------------------------------------------------------------------------------
 // Small helpers
 // ----------------------------------------------------------------------------------------
-
-/// One page image at an exact position and size (see `render_reader`).
-fn page_layer(image: &Arc<RenderImage>, left: f32, top: f32, display: (f32, f32)) -> AnyElement {
-    img(image.clone())
-        .absolute()
-        .left(px(left))
-        .top(px(top))
-        .w(px(display.0))
-        .h(px(display.1))
-        .object_fit(ObjectFit::Fill)
-        .into_any_element()
-}
-
-fn centered(text: impl Into<SharedString>, colors: UiColors) -> AnyElement {
-    div()
-        .size_full()
-        .flex()
-        .items_center()
-        .justify_center()
-        .text_color(colors.muted)
-        .child(text.into())
-        .into_any_element()
-}
-
-fn pill(row: gpui_kit::Div, text: impl Into<SharedString>, colors: UiColors) -> gpui_kit::Div {
-    row.flex().justify_center().child(
-        div()
-            .px_3()
-            .py_1()
-            .rounded_full()
-            .bg(colors.surface)
-            .border_1()
-            .border_color(colors.border)
-            .shadow_md()
-            .text_sm()
-            .text_color(colors.foreground)
-            .child(text.into()),
-    )
-}
 
 const HELP: &[(&str, &[(&str, &str)])] = &[
     (
@@ -5153,46 +4488,6 @@ fn help_overlay(colors: UiColors) -> AnyElement {
         .into_any_element()
 }
 
-#[derive(Clone, Copy)]
-enum ButtonKind {
-    Normal,
-    Primary,
-    Danger,
-}
-
-/// A button for dialogs: same shape as the header buttons, on the dialog's raised surface.
-fn panel_button(
-    id: &'static str,
-    label: impl Into<SharedString>,
-    kind: ButtonKind,
-    colors: UiColors,
-    enabled: bool,
-    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
-) -> AnyElement {
-    let button = Button::new(id)
-        .label(label)
-        .rounded(ButtonRounded::Medium)
-        .small()
-        .disabled(!enabled)
-        .on_click(on_click);
-    let button = match kind {
-        ButtonKind::Normal => button.secondary().outline().bg(colors.surface),
-        ButtonKind::Primary => button.primary().bg(colors.accent),
-        ButtonKind::Danger => button.danger().outline(),
-    };
-    #[cfg(test)]
-    {
-        div()
-            .debug_selector(|| id.into())
-            .child(button)
-            .into_any_element()
-    }
-    #[cfg(not(test))]
-    {
-        button.into_any_element()
-    }
-}
-
 fn icon_button(
     id: &'static str,
     label: &'static str,
@@ -5288,6 +4583,8 @@ mod tests {
         fs,
         io::{Cursor, Write},
     };
+    use yomu::archive::SourceKind;
+    use yomu::motion::PageTransition;
 
     fn png_bytes() -> Vec<u8> {
         let image = image::RgbaImage::from_pixel(60, 90, image::Rgba([90, 40, 160, 255]));
@@ -6631,24 +5928,28 @@ mod tests {
         // a wheel notch on a page that fits turns the page
         view.update_in(cx, |this, window, cx| {
             this.on_wheel(
-                (0.0, -96.0),
-                false,
-                (0.0, 0.0),
-                true,
-                TouchPhase::Moved,
-                viewport_of(window),
+                WheelParams::new(
+                    (0.0, -96.0),
+                    false,
+                    (0.0, 0.0),
+                    true,
+                    TouchPhase::Moved,
+                    viewport_of(window),
+                ),
                 cx,
             )
         });
         assert_eq!(page(&view, cx), 1);
         view.update_in(cx, |this, window, cx| {
             this.on_wheel(
-                (0.0, 96.0),
-                false,
-                (0.0, 0.0),
-                true,
-                TouchPhase::Moved,
-                viewport_of(window),
+                WheelParams::new(
+                    (0.0, 96.0),
+                    false,
+                    (0.0, 0.0),
+                    true,
+                    TouchPhase::Moved,
+                    viewport_of(window),
+                ),
                 cx,
             )
         });
@@ -6927,12 +6228,14 @@ mod tests {
             let vp = viewport_of(window);
             // a touchpad: small pixel deltas, not discrete
             this.on_wheel(
-                (0.0, -30.0),
-                false,
-                (0.0, 0.0),
-                false,
-                TouchPhase::Moved,
-                vp,
+                WheelParams::new(
+                    (0.0, -30.0),
+                    false,
+                    (0.0, 0.0),
+                    false,
+                    TouchPhase::Moved,
+                    vp,
+                ),
                 cx,
             );
             let reader = this.reader.as_ref().unwrap();
@@ -6943,12 +6246,14 @@ mod tests {
             );
             // a wheel notch: glides
             this.on_wheel(
-                (0.0, -WHEEL_LINE),
-                false,
-                (0.0, 0.0),
-                true,
-                TouchPhase::Moved,
-                vp,
+                WheelParams::new(
+                    (0.0, -WHEEL_LINE),
+                    false,
+                    (0.0, 0.0),
+                    true,
+                    TouchPhase::Moved,
+                    vp,
+                ),
                 cx,
             );
             let reader = this.reader.as_ref().unwrap();
@@ -6978,39 +6283,40 @@ mod tests {
             let vp = viewport_of(window);
             // Simulate a fast touchpad flick:
             this.on_wheel(
-                (0.0, -20.0),
-                false,
-                (0.0, 0.0),
-                false,
-                TouchPhase::Started,
-                vp,
+                WheelParams::new(
+                    (0.0, -20.0),
+                    false,
+                    (0.0, 0.0),
+                    false,
+                    TouchPhase::Started,
+                    vp,
+                ),
                 cx,
             );
             this.on_wheel(
-                (0.0, -40.0),
-                false,
-                (0.0, 0.0),
-                false,
-                TouchPhase::Moved,
-                vp,
+                WheelParams::new(
+                    (0.0, -40.0),
+                    false,
+                    (0.0, 0.0),
+                    false,
+                    TouchPhase::Moved,
+                    vp,
+                ),
                 cx,
             );
             this.on_wheel(
-                (0.0, -60.0),
-                false,
-                (0.0, 0.0),
-                false,
-                TouchPhase::Moved,
-                vp,
+                WheelParams::new(
+                    (0.0, -60.0),
+                    false,
+                    (0.0, 0.0),
+                    false,
+                    TouchPhase::Moved,
+                    vp,
+                ),
                 cx,
             );
             this.on_wheel(
-                (0.0, 0.0),
-                false,
-                (0.0, 0.0),
-                false,
-                TouchPhase::Ended,
-                vp,
+                WheelParams::new((0.0, 0.0), false, (0.0, 0.0), false, TouchPhase::Ended, vp),
                 cx,
             );
 
@@ -7050,21 +6356,25 @@ mod tests {
             let vp = viewport_of(window);
             // On Linux, Wayland only ever dispatches TouchPhase::Moved:
             this.on_wheel(
-                (0.0, -40.0),
-                false,
-                (0.0, 0.0),
-                false,
-                TouchPhase::Moved,
-                vp,
+                WheelParams::new(
+                    (0.0, -40.0),
+                    false,
+                    (0.0, 0.0),
+                    false,
+                    TouchPhase::Moved,
+                    vp,
+                ),
                 cx,
             );
             this.on_wheel(
-                (0.0, -60.0),
-                false,
-                (0.0, 0.0),
-                false,
-                TouchPhase::Moved,
-                vp,
+                WheelParams::new(
+                    (0.0, -60.0),
+                    false,
+                    (0.0, 0.0),
+                    false,
+                    TouchPhase::Moved,
+                    vp,
+                ),
                 cx,
             );
             // Simulate 40ms passing without new events (fingers lifted off pad)
@@ -7100,33 +6410,39 @@ mod tests {
         view.update_in(cx, |this, window, cx| {
             let vp = viewport_of(window);
             this.on_wheel(
-                (0.0, -40.0),
-                false,
-                (0.0, 0.0),
-                false,
-                TouchPhase::Moved,
-                vp,
+                WheelParams::new(
+                    (0.0, -40.0),
+                    false,
+                    (0.0, 0.0),
+                    false,
+                    TouchPhase::Moved,
+                    vp,
+                ),
                 cx,
             );
             this.on_wheel(
-                (0.0, -40.0),
-                false,
-                (0.0, 0.0),
-                false,
-                TouchPhase::Ended,
-                vp,
+                WheelParams::new(
+                    (0.0, -40.0),
+                    false,
+                    (0.0, 0.0),
+                    false,
+                    TouchPhase::Ended,
+                    vp,
+                ),
                 cx,
             );
             assert!(this.reader.as_ref().unwrap().inertia.is_some());
 
             // User touches the touchpad again:
             this.on_wheel(
-                (0.0, 0.0),
-                false,
-                (0.0, 0.0),
-                false,
-                TouchPhase::Started,
-                vp,
+                WheelParams::new(
+                    (0.0, 0.0),
+                    false,
+                    (0.0, 0.0),
+                    false,
+                    TouchPhase::Started,
+                    vp,
+                ),
                 cx,
             );
             assert!(
@@ -7255,6 +6571,29 @@ mod tests {
                 bytes as f64 / 1e6
             );
         }
+    }
+
+    #[gpui_kit::test]
+    fn continuous_reading_debounced_autosave_persists_on_flush(cx: &mut TestAppContext) {
+        let fx = fixture("debounced_autosave");
+        let (view, cx) = launch(&fx, cx);
+        let id = fx.ids[0].clone();
+        open_book_by_index(&fx, &view, cx, 0);
+
+        view.update(cx, |this, cx| this.set_continuous(Some(true), cx));
+
+        view.update(cx, |this, cx| {
+            if let Some(book) = this.library.get_mut(&id) {
+                book.current_page = 3;
+            }
+            this.save_library_debounced(cx);
+        });
+
+        view.update(cx, |this, _| {
+            this.save_library();
+        });
+
+        assert_eq!(saved(&fx, &id).unwrap().current_page, 3);
     }
 
     #[test]

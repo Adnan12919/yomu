@@ -53,7 +53,7 @@ pub fn decode_fit_bgra(bytes: &[u8], max_w: u32, max_h: u32) -> Result<Decoded> 
         let nh = ((h as f32 * scale).round() as u32).max(1);
         rgba = resize_rgba(rgba, nw, nh, ResizeFilter::CatmullRom, alpha)?;
     }
-    for px in rgba.chunks_exact_mut(4) {
+    for px in rgba.as_chunks_mut::<4>().0 {
         px.swap(0, 2);
     }
     Ok(Decoded {
