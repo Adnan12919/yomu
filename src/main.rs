@@ -15,6 +15,8 @@ use gpui_kit::assets::IconName;
 use gpui_kit::component::ColorTokens;
 use gpui_kit::component::Icon;
 use gpui_kit::component::button::{Button, ButtonRounded, ButtonVariants};
+use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
+use gpui_kit::component::switch::Switch;
 use gpui_kit::component::{Disableable, Sizable};
 use gpui_kit::component::{Theme as KitTheme, ThemeConfig, ThemeRegistry};
 #[allow(unused_imports)]
@@ -696,12 +698,6 @@ enum SettingsTab {
     Keyboard,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum SettingsDropdown {
-    ThumbnailSize,
-    PageFit,
-}
-
 struct LibraryGroup<'a> {
     key: String,
     name: String,
@@ -802,7 +798,6 @@ struct Yomu {
     frame_dt: Option<f32>,
     overlay: Option<Overlay>,
     settings_tab: SettingsTab,
-    settings_dropdown: Option<SettingsDropdown>,
     command_selection: usize,
     overlay_closed_at: Option<Instant>,
     /// Books picked for bulk actions in the library.
@@ -892,7 +887,6 @@ impl Yomu {
             frame_dt: None,
             overlay: None,
             settings_tab: SettingsTab::Appearance,
-            settings_dropdown: None,
             command_selection: 0,
             overlay_closed_at: None,
             selection: Selection::new(),
@@ -1059,7 +1053,6 @@ impl Yomu {
 
     /// Close the current overlay without touching anything else.
     fn dismiss(&mut self) {
-        self.settings_dropdown = None;
         if self.overlay.take().is_some() {
             self.overlay_closed_at = Some(Instant::now());
         }
@@ -3037,11 +3030,7 @@ impl Yomu {
                     .py_2()
                     .rounded_lg()
                     .cursor_pointer()
-                    .when(selected, |row| {
-                        row.bg(with_alpha(self.colors.accent, 0.20))
-                            .border_1()
-                            .border_color(with_alpha(self.colors.accent, 0.70))
-                    })
+                    .when(selected, |row| row.bg(with_alpha(self.colors.accent, 0.20)))
                     .hover(|style| style.bg(with_alpha(self.colors.accent, 0.15)))
                     .child(Icon::new(icon).size_4().text_color(self.colors.foreground))
                     .child(
@@ -3167,8 +3156,6 @@ impl Yomu {
         .cursor_pointer()
         .when(menu.selected == Some(ix), |row| {
             row.bg(with_alpha(self.colors.accent, 0.20))
-                .border_1()
-                .border_color(with_alpha(self.colors.accent, 0.70))
         })
         .hover(|style| style.bg(with_alpha(self.colors.accent, 0.15)))
         .on_mouse_move(cx.listener(move |this, _: &MouseMoveEvent, _, cx| this.menu_hover(ix, cx)))
@@ -3256,7 +3243,11 @@ impl Yomu {
                             .child(panel_button(
                                 "confirm-accept",
                                 dialog.confirm_label,
-                                ButtonKind::Primary,
+                                if matches!(dialog.action, ConfirmAction::ClearAllData) {
+                                    ButtonKind::Danger
+                                } else {
+                                    ButtonKind::Primary
+                                },
                                 self.colors,
                                 true,
                                 cx.listener(|this, _: &ClickEvent, window, cx| {
@@ -3442,7 +3433,6 @@ impl Yomu {
                 .child(label)
                 .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                     this.settings_tab = tab;
-                    this.settings_dropdown = None;
                     cx.notify();
                 }))
         };
@@ -3531,6 +3521,7 @@ impl Yomu {
             .into_any_element()
         };
 
+        let yomu = cx.entity();
         let body = match self.settings_tab {
             SettingsTab::Appearance => {
                 let theme_row = adw_row(
@@ -3603,51 +3594,59 @@ impl Yomu {
                     (ThumbnailSize::Large, "Large (240px)"),
                     (ThumbnailSize::ExtraLarge, "Extra Large (280px)"),
                 ];
+                let thumb_dropdown = Button::new("settings-thumbnail-size")
+                    .label(thumb_size.label())
+                    .dropdown_caret(true)
+                    .rounded(ButtonRounded::Medium)
+                    .small()
+                    .secondary()
+                    .outline()
+                    .bg(self.colors.surface)
+                    .dropdown_menu_with_anchor(Anchor::TopRight, {
+                        let yomu = yomu.clone();
+                        move |mut menu, _window, _cx| {
+                            for &(val, opt_label) in THUMB_OPTIONS {
+                                let yomu = yomu.clone();
+                                let is_current = val == thumb_size;
+                                menu = menu.item(
+                                    PopupMenuItem::new(opt_label).checked(is_current).on_click(
+                                        move |_, _window, cx| {
+                                            yomu.update(cx, |this, cx| {
+                                                this.set_thumbnail_size(val, cx);
+                                            });
+                                        },
+                                    ),
+                                );
+                            }
+                            menu
+                        }
+                    });
                 let thumb_row = adw_row(
                     IconName::Layers,
                     "Thumbnail Card Size",
                     Some("Size of cover art cards displayed in the library grid".into()),
-                    adw_dropdown(
-                        "settings-thumbnail-size",
-                        thumb_size.label(),
-                        self.settings_dropdown == Some(SettingsDropdown::ThumbnailSize),
-                        THUMB_OPTIONS,
-                        thumb_size,
-                        self.colors,
-                        cx,
-                        |this, _, _, cx| {
-                            this.settings_dropdown = if this.settings_dropdown
-                                == Some(SettingsDropdown::ThumbnailSize)
-                            {
-                                None
-                            } else {
-                                Some(SettingsDropdown::ThumbnailSize)
-                            };
-                            cx.notify();
-                        },
-                        |this, size, cx| {
-                            this.set_thumbnail_size(size, cx);
-                            this.settings_dropdown = None;
-                        },
-                    ),
+                    thumb_dropdown.into_any_element(),
                     false,
                 );
+                let group_switch = Switch::new("settings-group-series")
+                    .checked(grouped)
+                    .small()
+                    .on_click({
+                        let yomu = yomu.clone();
+                        move |&checked, _window, cx| {
+                            yomu.update(cx, |this, cx| {
+                                this.library.settings_mut().group_series = checked;
+                                this.open_group = None;
+                                this.save_library();
+                                cx.notify();
+                            });
+                        }
+                    });
                 let group_row = adw_row(
                     IconName::FolderArchive,
                     "Folder Grouping",
                     Some("Group volumes from the same directory into folder cards".into()),
-                    adw_switch(
-                        "settings-group-series",
-                        grouped,
-                        self.colors,
-                        cx.listener(|this, _: &ClickEvent, _, cx| {
-                            this.library.settings_mut().group_series =
-                                !this.library.settings().group_series;
-                            this.open_group = None;
-                            this.save_library();
-                            cx.notify();
-                        }),
-                    ),
+                    group_switch.into_any_element(),
                     true,
                 );
                 adw_group("LIBRARY DISPLAY & LAYOUT", vec![thumb_row, group_row]).into_any_element()
@@ -3659,70 +3658,94 @@ impl Yomu {
                     (FitMode::Height, "Fit Height"),
                     (FitMode::Original, "Original Size"),
                 ];
+                let fit_dropdown = Button::new("settings-fit")
+                    .label(fit.label())
+                    .dropdown_caret(true)
+                    .rounded(ButtonRounded::Medium)
+                    .small()
+                    .secondary()
+                    .outline()
+                    .bg(self.colors.surface)
+                    .dropdown_menu_with_anchor(Anchor::TopRight, {
+                        let yomu = yomu.clone();
+                        move |mut menu, _window, _cx| {
+                            for &(mode, opt_label) in FIT_OPTIONS {
+                                let yomu = yomu.clone();
+                                let is_current = mode == fit;
+                                menu = menu.item(
+                                    PopupMenuItem::new(opt_label).checked(is_current).on_click(
+                                        move |_, _window, cx| {
+                                            yomu.update(cx, |this, cx| {
+                                                this.set_fit(mode, cx);
+                                            });
+                                        },
+                                    ),
+                                );
+                            }
+                            menu
+                        }
+                    });
                 let fit_row = adw_row(
                     IconName::Maximize2,
                     "Default Page Fit",
                     Some("How pages scale to fit the window viewport".into()),
-                    adw_dropdown(
-                        "settings-fit",
-                        fit.label(),
-                        self.settings_dropdown == Some(SettingsDropdown::PageFit),
-                        FIT_OPTIONS,
-                        fit,
-                        self.colors,
-                        cx,
-                        |this, _, _, cx| {
-                            this.settings_dropdown =
-                                if this.settings_dropdown == Some(SettingsDropdown::PageFit) {
-                                    None
-                                } else {
-                                    Some(SettingsDropdown::PageFit)
-                                };
-                            cx.notify();
-                        },
-                        |this, mode, cx| {
-                            this.set_fit(mode, cx);
-                            this.settings_dropdown = None;
-                        },
-                    ),
+                    fit_dropdown.into_any_element(),
                     false,
                 );
+                let anim_switch = Switch::new("settings-animations")
+                    .checked(animate)
+                    .small()
+                    .on_click({
+                        let yomu = yomu.clone();
+                        move |&checked, _window, cx| {
+                            yomu.update(cx, |this, cx| {
+                                this.set_animations(Some(checked), cx);
+                            });
+                        }
+                    });
                 let anim_row = adw_row(
                     IconName::Sparkles,
                     "Page Animations",
                     Some("Slide transitions between page turns and smooth scroll gliding".into()),
-                    adw_switch(
-                        "settings-animations",
-                        animate,
-                        self.colors,
-                        cx.listener(|this, _: &ClickEvent, _, cx| this.set_animations(None, cx)),
-                    ),
+                    anim_switch.into_any_element(),
                     false,
                 );
+                let cont_switch = Switch::new("settings-continuous")
+                    .checked(continuous)
+                    .small()
+                    .on_click({
+                        let yomu = yomu.clone();
+                        move |&checked, _window, cx| {
+                            yomu.update(cx, |this, cx| {
+                                this.set_continuous(Some(checked), cx);
+                            });
+                        }
+                    });
                 let cont_row = adw_row(
                     IconName::AlignVerticalSpaceBetween,
                     "Continuous Vertical Mode",
                     Some("Stack pages vertically and scroll through the whole book".into()),
-                    adw_switch(
-                        "settings-continuous",
-                        continuous,
-                        self.colors,
-                        cx.listener(|this, _: &ClickEvent, _, cx| this.set_continuous(None, cx)),
-                    ),
+                    cont_switch.into_any_element(),
                     false,
                 );
+                let webc_switch = Switch::new("settings-webcomics")
+                    .checked(webcomics)
+                    .small()
+                    .on_click({
+                        let yomu = yomu.clone();
+                        move |&checked, _window, cx| {
+                            yomu.update(cx, |this, cx| {
+                                this.set_webcomics(Some(checked), cx);
+                            });
+                        }
+                    });
                 let webc_row = adw_row(
                     IconName::Film,
                     "Webcomics Mode",
                     Some(
                         "Forces a connected, gapless vertical strip for continuous reading".into(),
                     ),
-                    adw_switch(
-                        "settings-webcomics",
-                        webcomics,
-                        self.colors,
-                        cx.listener(|this, _: &ClickEvent, _, cx| this.set_webcomics(None, cx)),
-                    ),
+                    webc_switch.into_any_element(),
                     true,
                 );
                 adw_group(
@@ -3758,10 +3781,12 @@ impl Yomu {
                         "{} comics registered · permanently wipes library and progress",
                         book_count
                     )),
-                    adw_destructive_button(
+                    panel_button(
                         "settings-clear-all",
                         "Reset All Data",
+                        ButtonKind::Danger,
                         self.colors,
+                        true,
                         cx.listener(|this, _: &ClickEvent, _, cx| this.request_clear_all_data(cx)),
                     ),
                     true,
@@ -5003,6 +5028,7 @@ fn help_overlay(colors: UiColors) -> AnyElement {
 enum ButtonKind {
     Normal,
     Primary,
+    Danger,
 }
 
 /// A button for dialogs: same shape as the header buttons, on the dialog's raised surface.
@@ -5027,166 +5053,8 @@ fn panel_button(
             .bg(colors.surface)
             .into_any_element(),
         ButtonKind::Primary => button.primary().bg(colors.accent).into_any_element(),
+        ButtonKind::Danger => button.danger().outline().into_any_element(),
     }
-}
-
-fn adw_switch(
-    id: &'static str,
-    active: bool,
-    colors: UiColors,
-    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
-) -> AnyElement {
-    div()
-        .id(id)
-        .w(px(46.))
-        .h(px(26.))
-        .rounded_full()
-        .relative()
-        .cursor_pointer()
-        .bg(if active {
-            colors.accent
-        } else {
-            colors.surface_hover
-        })
-        .border_1()
-        .border_color(if active { colors.accent } else { colors.border })
-        .child(
-            div()
-                .absolute()
-                .top(px(1.))
-                .left(px(if active { 21. } else { 1. }))
-                .size(px(22.))
-                .rounded_full()
-                .bg(colors.foreground)
-                .shadow_sm(),
-        )
-        .on_click(on_click)
-        .into_any_element()
-}
-
-fn adw_dropdown<T: Copy + PartialEq + 'static>(
-    id: &'static str,
-    label: impl Into<SharedString>,
-    is_open: bool,
-    options: &'static [(T, &'static str)],
-    current: T,
-    colors: UiColors,
-    cx: &mut Context<Yomu>,
-    on_toggle: impl Fn(&mut Yomu, &ClickEvent, &mut Window, &mut Context<Yomu>) + 'static,
-    on_select: impl Fn(&mut Yomu, T, &mut Context<Yomu>) + 'static + Copy,
-) -> AnyElement {
-    let mut container = div().relative();
-
-    let trigger = Button::new(id)
-        .label(label)
-        .dropdown_caret(true)
-        .rounded(ButtonRounded::Medium)
-        .small()
-        .secondary()
-        .outline()
-        .bg(colors.surface)
-        .on_click(cx.listener(move |this, e: &ClickEvent, window, cx| {
-            on_toggle(this, e, window, cx);
-        }));
-
-    container = container.child(trigger);
-
-    if is_open {
-        let mut menu = div()
-            .id(SharedString::from(format!("{id}-menu")))
-            .occlude()
-            .absolute()
-            .top(px(32.))
-            .right_0()
-            .min_w(px(170.))
-            .flex()
-            .flex_col()
-            .gap_0p5()
-            .p_1()
-            .rounded_xl()
-            .bg(colors.surface)
-            .border_1()
-            .border_color(colors.border)
-            .shadow_lg()
-            .on_mouse_down(MouseButton::Left, |_: &MouseDownEvent, _, cx| {
-                cx.stop_propagation();
-            })
-            .on_mouse_down(MouseButton::Right, |_: &MouseDownEvent, _, cx| {
-                cx.stop_propagation();
-            });
-
-        for (idx, (val, opt_label)) in options.iter().enumerate() {
-            let is_current = *val == current;
-            let val_copy = *val;
-            menu = menu.child(
-                div()
-                    .id(SharedString::from(format!("{id}-opt-{idx}")))
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .justify_between()
-                    .gap_3()
-                    .px_3()
-                    .py_1p5()
-                    .rounded_lg()
-                    .cursor_pointer()
-                    .when(is_current, |s| s.bg(with_alpha(colors.accent, 0.2)))
-                    .hover(|s| s.bg(colors.surface_hover))
-                    .child(
-                        div()
-                            .text_sm()
-                            .font_weight(if is_current {
-                                FontWeight::SEMIBOLD
-                            } else {
-                                FontWeight::MEDIUM
-                            })
-                            .text_color(if is_current {
-                                colors.accent
-                            } else {
-                                colors.foreground
-                            })
-                            .child(*opt_label),
-                    )
-                    .when(is_current, |s| {
-                        s.child(
-                            Icon::new(IconName::Check)
-                                .size(px(14.))
-                                .text_color(colors.accent),
-                        )
-                    })
-                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                        on_select(this, val_copy, cx);
-                    })),
-            );
-        }
-        container = container.child(deferred(menu).with_priority(3));
-    }
-
-    container.into_any_element()
-}
-
-fn adw_destructive_button(
-    id: &'static str,
-    label: impl Into<SharedString>,
-    colors: UiColors,
-    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
-) -> AnyElement {
-    div()
-        .id(id)
-        .px_3()
-        .py_1p5()
-        .rounded_lg()
-        .bg(with_alpha(colors.danger, 0.15))
-        .border_1()
-        .border_color(colors.danger)
-        .cursor_pointer()
-        .hover(|s| s.bg(with_alpha(colors.danger, 0.28)))
-        .text_sm()
-        .font_weight(FontWeight::MEDIUM)
-        .text_color(colors.danger)
-        .child(label.into())
-        .on_click(on_click)
-        .into_any_element()
 }
 
 fn button(
