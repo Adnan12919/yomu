@@ -15,8 +15,13 @@ use gpui_kit::assets::IconName;
 use gpui_kit::component::ColorTokens;
 use gpui_kit::component::Icon;
 use gpui_kit::component::button::{Button, ButtonRounded, ButtonVariants};
+use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
+use gpui_kit::component::progress::Progress;
 use gpui_kit::component::switch::Switch;
+use gpui_kit::component::tab::{Tab, TabBar};
+use gpui_kit::component::table::{Table, TableBody, TableCell, TableHead, TableHeader, TableRow};
+use gpui_kit::component::tag::Tag;
 use gpui_kit::component::{Disableable, Sizable};
 use gpui_kit::component::{Theme as KitTheme, ThemeConfig, ThemeRegistry};
 #[allow(unused_imports)]
@@ -24,12 +29,12 @@ use gpui_kit::popup::{PopupAnchor, PopupConstraintAdjustment, PopupGravity, Popu
 #[allow(unused_imports)]
 use gpui_kit::{
     Anchor, Animation, AnimationExt, AnyElement, AnyWindowHandle, App, Bounds, ClickEvent, Context,
-    Entity, ExternalPaths, FocusHandle, FontWeight, KeyBinding, KeyDownEvent, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit, PathPromptOptions, Pixels, Point,
-    RenderImage, Rgba, ScrollDelta, ScrollWheelEvent, SharedString, Styled, Subscription,
-    TitlebarOptions, Window, WindowBackgroundAppearance, WindowBounds, WindowKind, WindowOptions,
-    actions, anchored, application, canvas, deferred, div, ease_out_quint, img, point, prelude::*,
-    px, relative, size,
+    Entity, ExternalPaths, FocusHandle, Focusable, FontWeight, KeyBinding, KeyDownEvent,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit, PathPromptOptions,
+    Pixels, Point, RenderImage, Rgba, ScrollDelta, ScrollWheelEvent, SharedString, Styled,
+    Subscription, TitlebarOptions, Window, WindowBackgroundAppearance, WindowBounds, WindowKind,
+    WindowOptions, actions, anchored, application, canvas, deferred, div, ease_out_quint, img,
+    point, prelude::*, px, relative, size,
 };
 use image::Frame;
 use serde::Deserialize;
@@ -67,6 +72,7 @@ struct UiColors {
     foreground: gpui_kit::Hsla,
     muted: gpui_kit::Hsla,
     accent: gpui_kit::Hsla,
+    accent_foreground: gpui_kit::Hsla,
     danger: gpui_kit::Hsla,
     danger_hover: gpui_kit::Hsla,
     widget_opacity: f32,
@@ -82,6 +88,7 @@ impl UiColors {
             foreground: tokens.foreground,
             muted: tokens.muted_foreground,
             accent: tokens.primary,
+            accent_foreground: tokens.primary_foreground,
             danger: tokens.destructive,
             danger_hover: tokens.destructive,
             widget_opacity: 1.0,
@@ -176,6 +183,12 @@ const CUSTOM_THEME_COLOR_KEYS: &[&str] = &[
     "secondary.background",
     "secondary.foreground",
     "secondary.hover.background",
+    "tab.active.background",
+    "tab.active.foreground",
+    "tab.background",
+    "tab.foreground",
+    "tab_bar.background",
+    "tab_bar.segmented.background",
 ];
 
 fn parse_custom_themes(
@@ -319,7 +332,6 @@ const EDGE_EPS: f32 = 1.0;
 const DRAG_THRESHOLD: f32 = 4.0;
 const HUD_SECS: u64 = 2;
 
-const MENU_W: f32 = 224.0;
 /// Clicks this soon after a menu or dialog closes are ignored, so double-clicking a menu item
 /// cannot also click the book underneath it.
 const CLICK_GUARD: Duration = Duration::from_millis(300);
@@ -670,7 +682,7 @@ struct PropertiesDialog {
 
 struct SeriesDialog {
     book_ids: Vec<String>,
-    value: String,
+    input: Entity<InputState>,
 }
 
 #[derive(Default)]
@@ -696,6 +708,29 @@ enum SettingsTab {
     Reader,
     Storage,
     Keyboard,
+}
+
+impl SettingsTab {
+    fn from_index(idx: usize) -> Self {
+        match idx {
+            0 => Self::Appearance,
+            1 => Self::Library,
+            2 => Self::Reader,
+            3 => Self::Storage,
+            4 => Self::Keyboard,
+            _ => Self::Appearance,
+        }
+    }
+
+    fn to_index(self) -> usize {
+        match self {
+            Self::Appearance => 0,
+            Self::Library => 1,
+            Self::Reader => 2,
+            Self::Storage => 3,
+            Self::Keyboard => 4,
+        }
+    }
 }
 
 struct LibraryGroup<'a> {
@@ -805,8 +840,7 @@ struct Yomu {
     /// Transient library filter; it is not part of persisted reader settings.
     search_query: String,
     search_active: bool,
-    search_caret_visible: bool,
-    search_blink_seq: u64,
+    search_input: Option<Entity<InputState>>,
     open_group: Option<String>,
     /// Which background appearance the window currently has (`None` before the first frame).
     applied_opaque: Option<bool>,
@@ -892,8 +926,7 @@ impl Yomu {
             selection: Selection::new(),
             search_query: String::new(),
             search_active: false,
-            search_caret_visible: false,
-            search_blink_seq: 0,
+            search_input: None,
             open_group: None,
             applied_opaque: None,
         };
@@ -1091,7 +1124,12 @@ impl Yomu {
         cx.notify();
     }
 
-    fn open_series_dialog(&mut self, book_ids: Vec<String>, cx: &mut Context<Self>) {
+    fn open_series_dialog(
+        &mut self,
+        book_ids: Vec<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if book_ids.is_empty() {
             return;
         }
@@ -1124,7 +1162,20 @@ impl Yomu {
             });
         let value = existing.or(common_parent).unwrap_or_default();
         self.dismiss();
-        self.overlay = Some(Overlay::Series(SeriesDialog { book_ids, value }));
+        let input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .default_value(value)
+                .placeholder("Type a series name…")
+        });
+        let focus_handle = input.read(cx).focus_handle(cx);
+        window.focus(&focus_handle, cx);
+        cx.subscribe(&input, |this, _, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::PressEnter { .. }) {
+                this.save_series_dialog(cx);
+            }
+        })
+        .detach();
+        self.overlay = Some(Overlay::Series(SeriesDialog { book_ids, input }));
         cx.notify();
     }
 
@@ -1134,7 +1185,8 @@ impl Yomu {
         };
         self.overlay_closed_at = Some(Instant::now());
         let count = dialog.book_ids.len();
-        let series = (!dialog.value.trim().is_empty()).then_some(dialog.value);
+        let value = dialog.input.read(cx).value().to_string();
+        let series = (!value.trim().is_empty()).then_some(value);
         self.library.set_series(&dialog.book_ids, series.clone());
         self.save_library();
         let message = match (series, count) {
@@ -1171,7 +1223,7 @@ impl Yomu {
                 } else {
                     vec![id.to_string()]
                 };
-                self.open_series_dialog(ids, cx);
+                self.open_series_dialog(ids, window, cx);
                 return;
             }
             BookAction::RemoveSelected => {
@@ -1568,43 +1620,6 @@ impl Yomu {
         }
     }
 
-    fn on_series_key(
-        &mut self,
-        token: &str,
-        key_char: Option<&str>,
-        control: bool,
-        alt: bool,
-        cx: &mut Context<Self>,
-    ) {
-        match token {
-            "escape" => self.close_overlay(cx),
-            "enter" => self.save_series_dialog(cx),
-            "backspace" => {
-                if let Some(Overlay::Series(dialog)) = self.overlay.as_mut() {
-                    dialog.value.pop();
-                }
-                cx.notify();
-            }
-            "C-a" => {
-                if let Some(Overlay::Series(dialog)) = self.overlay.as_mut() {
-                    dialog.value.clear();
-                }
-                cx.notify();
-            }
-            _ if !control && !alt => {
-                if let Some(text) =
-                    key_char.filter(|text| !text.is_empty() && !text.chars().any(char::is_control))
-                {
-                    if let Some(Overlay::Series(dialog)) = self.overlay.as_mut() {
-                        dialog.value.push_str(text);
-                    }
-                    cx.notify();
-                }
-            }
-            _ => {}
-        }
-    }
-
     // ------------------------------------------------------------------------------------
     // Import
     // ------------------------------------------------------------------------------------
@@ -1829,13 +1844,14 @@ impl Yomu {
     fn on_library_key(
         &mut self,
         token: &str,
-        key_char: Option<&str>,
-        control: bool,
-        alt: bool,
+        _key_char: Option<&str>,
+        _control: bool,
+        _alt: bool,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if matches!(token, "C-f" | "/" | "slash") {
-            self.activate_search(cx);
+            self.activate_search(window, cx);
             return;
         }
         if self.search_active {
@@ -1845,28 +1861,16 @@ impl Yomu {
                         self.deactivate_search(cx);
                     } else {
                         self.search_query.clear();
-                        self.search_caret_visible = true;
+                        if let Some(input) = &self.search_input {
+                            input.update(cx, |state, cx| {
+                                state.set_value("", window, cx);
+                            });
+                        }
                         cx.notify();
                     }
                 }
                 "enter" => {
                     self.deactivate_search(cx);
-                }
-                "backspace" => {
-                    self.search_query.pop();
-                    cx.notify();
-                }
-                "C-a" => {
-                    self.search_query.clear();
-                    cx.notify();
-                }
-                _ if !control && !alt => {
-                    if let Some(text) = key_char
-                        .filter(|text| !text.is_empty() && !text.chars().any(char::is_control))
-                    {
-                        self.search_query.push_str(text);
-                        cx.notify();
-                    }
                 }
                 _ => {}
             }
@@ -1892,39 +1896,17 @@ impl Yomu {
         }
     }
 
-    fn activate_search(&mut self, cx: &mut Context<Self>) {
+    fn activate_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.search_active = true;
-        self.search_caret_visible = true;
-        self.search_blink_seq = self.search_blink_seq.wrapping_add(1);
-        let sequence = self.search_blink_seq;
+        if let Some(input) = &self.search_input {
+            let focus_handle = input.read(cx).focus_handle(cx);
+            window.focus(&focus_handle, cx);
+        }
         cx.notify();
-        cx.spawn(async move |this, cx| {
-            loop {
-                cx.background_executor()
-                    .timer(Duration::from_millis(530))
-                    .await;
-                let active = this
-                    .update(cx, |this, cx| {
-                        if this.search_blink_seq != sequence || !this.search_active {
-                            return false;
-                        }
-                        this.search_caret_visible = !this.search_caret_visible;
-                        cx.notify();
-                        true
-                    })
-                    .unwrap_or(false);
-                if !active {
-                    break;
-                }
-            }
-        })
-        .detach();
     }
 
     fn deactivate_search(&mut self, cx: &mut Context<Self>) {
         self.search_active = false;
-        self.search_caret_visible = false;
-        self.search_blink_seq = self.search_blink_seq.wrapping_add(1);
         cx.notify();
     }
 
@@ -1943,6 +1925,12 @@ impl Yomu {
 
         self.selection.clear();
         self.search_active = false;
+        self.search_query.clear();
+        if let Some(input) = &self.search_input {
+            input.update(cx, |state, cx| {
+                state.set_value("", window, cx);
+            });
+        }
         window.set_window_title(&book.title);
         window.focus(&self.focus_handle, cx);
 
@@ -2478,13 +2466,9 @@ impl Yomu {
         // An open menu or dialog gets every key; nothing leaks through to the reader.
         if self.overlay.is_some() {
             if matches!(self.overlay, Some(Overlay::Series(_))) {
-                self.on_series_key(
-                    &token,
-                    keystroke.key_char.as_deref(),
-                    mods.control,
-                    mods.alt,
-                    cx,
-                );
+                if token == "escape" {
+                    self.close_overlay(cx);
+                }
                 return;
             }
             self.on_overlay_key(&token, window, cx);
@@ -2496,6 +2480,7 @@ impl Yomu {
                 keystroke.key_char.as_deref(),
                 mods.control,
                 mods.alt,
+                window,
                 cx,
             );
             return;
@@ -2914,7 +2899,9 @@ impl Yomu {
 
     fn render_menu(&self, menu: &BookMenu, cx: &mut Context<Self>) -> AnyElement {
         let mut list = div()
-            .w(px(MENU_W))
+            .min_w(px(200.))
+            .max_w(px(320.))
+            .w_auto()
             .flex()
             .flex_col()
             .p_1()
@@ -3001,7 +2988,9 @@ impl Yomu {
             (IconName::LogOut, "Quit", "Close yomu"),
         ];
         let mut list = div()
-            .w(px(280.))
+            .min_w(px(240.))
+            .max_w(px(360.))
+            .w_auto()
             .flex()
             .flex_col()
             .gap_1()
@@ -3030,9 +3019,15 @@ impl Yomu {
                     .py_2()
                     .rounded_lg()
                     .cursor_pointer()
-                    .when(selected, |row| row.bg(with_alpha(self.colors.accent, 0.20)))
-                    .hover(|style| style.bg(with_alpha(self.colors.accent, 0.15)))
-                    .child(Icon::new(icon).size_4().text_color(self.colors.foreground))
+                    .when(selected, |row| row.bg(self.colors.accent))
+                    .when(!selected, |row| {
+                        row.hover(|style| style.bg(self.colors.surface_hover))
+                    })
+                    .child(Icon::new(icon).size_4().text_color(if selected {
+                        self.colors.accent_foreground
+                    } else {
+                        self.colors.foreground
+                    }))
                     .child(
                         div()
                             .flex_1()
@@ -3043,13 +3038,21 @@ impl Yomu {
                             .child(
                                 div()
                                     .text_sm()
-                                    .text_color(self.colors.foreground)
+                                    .text_color(if selected {
+                                        self.colors.accent_foreground
+                                    } else {
+                                        self.colors.foreground
+                                    })
                                     .child(label),
                             )
                             .child(
                                 div()
                                     .text_xs()
-                                    .text_color(self.colors.muted)
+                                    .text_color(if selected {
+                                        self.colors.accent_foreground
+                                    } else {
+                                        self.colors.muted
+                                    })
                                     .truncate()
                                     .child(description),
                             ),
@@ -3112,8 +3115,11 @@ impl Yomu {
             BookAction::Remove | BookAction::RemoveSelected => IconName::Trash,
             BookAction::ClearSelection => IconName::X,
         };
+        let is_selected = menu.selected == Some(ix);
         let item_color = if !item.enabled {
             self.colors.muted
+        } else if is_selected {
+            self.colors.accent_foreground
         } else if item.danger {
             self.colors.danger
         } else {
@@ -3148,16 +3154,18 @@ impl Yomu {
 
         let action = item.action;
         let book_id = menu.book_id.clone();
-        base.text_color(if item.danger {
+        base.text_color(if is_selected {
+            self.colors.accent_foreground
+        } else if item.danger {
             self.colors.danger
         } else {
             self.colors.foreground
         })
         .cursor_pointer()
-        .when(menu.selected == Some(ix), |row| {
-            row.bg(with_alpha(self.colors.accent, 0.20))
+        .when(is_selected, |row| row.bg(self.colors.accent))
+        .when(!is_selected, |row| {
+            row.hover(|style| style.bg(self.colors.surface_hover))
         })
-        .hover(|style| style.bg(with_alpha(self.colors.accent, 0.15)))
         .on_mouse_move(cx.listener(move |this, _: &MouseMoveEvent, _, cx| this.menu_hover(ix, cx)))
         .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
             this.run_book_action(action, &book_id, window, cx);
@@ -3316,22 +3324,10 @@ impl Yomu {
                         "A folder name is suggested when the books share a parent folder. Edit it, or clear the field to leave them ungrouped.",
                     ))
                     .child(
-                        div()
+                        Input::new(&dialog.input)
                             .id("series-name-input")
-                            .w_full()
-                            .min_h(px(36.))
-                            .px_3()
-                            .py_2()
-                            .rounded_lg()
-                            .border_1()
-                            .border_color(self.colors.accent)
-                            .bg(self.widget_surface(self.colors.background))
-                            .text_color(self.colors.foreground)
-                            .child(if dialog.value.is_empty() {
-                                "Type a series name…".to_string()
-                            } else {
-                                dialog.value.clone()
-                            }),
+                            .cleanable(true)
+                            .w_full(),
                     )
                     .child(
                         div()
@@ -3340,7 +3336,7 @@ impl Yomu {
                             .justify_between()
                             .items_center()
                             .child(div().text_xs().text_color(self.colors.muted).child(
-                                "Type · Enter to save · Esc to cancel · Ctrl+A clears",
+                                "Type · Enter to save · Esc to cancel",
                             ))
                             .child(
                                 div()
@@ -3388,59 +3384,44 @@ impl Yomu {
         let cache_bytes = self.dirs.cache_size_bytes();
         let book_count = self.library.books().len();
 
-        let tab_button = |tab, label, icon: IconName| {
-            let selected = self.settings_tab == tab;
-            let id = match tab {
-                SettingsTab::Appearance => "settings-tab-appearance",
-                SettingsTab::Library => "settings-tab-library",
-                SettingsTab::Reader => "settings-tab-reader",
-                SettingsTab::Storage => "settings-tab-storage",
-                SettingsTab::Keyboard => "settings-tab-keyboard",
-            };
-            div()
-                .id(id)
-                .flex_1()
-                .flex()
-                .flex_row()
-                .items_center()
-                .justify_center()
-                .gap_1p5()
-                .px_2()
-                .py_2()
-                .rounded_lg()
-                .cursor_pointer()
-                .text_sm()
-                .font_weight(if selected {
-                    FontWeight::SEMIBOLD
-                } else {
-                    FontWeight::MEDIUM
-                })
-                .when(selected, |s| s.bg(self.colors.accent))
-                .text_color(if selected {
-                    self.colors.foreground
-                } else {
-                    self.colors.muted
-                })
-                .hover(|s| {
-                    if !selected {
-                        s.bg(self.colors.surface_hover)
-                            .text_color(self.colors.foreground)
-                    } else {
-                        s
-                    }
-                })
-                .child(Icon::new(icon).size(px(15.)))
-                .child(label)
-                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                    this.settings_tab = tab;
-                    cx.notify();
-                }))
-        };
-        let appearance_tab = tab_button(SettingsTab::Appearance, "Appearance", IconName::Palette);
-        let library_tab = tab_button(SettingsTab::Library, "Library", IconName::Library);
-        let reader_tab = tab_button(SettingsTab::Reader, "Reader", IconName::BookOpen);
-        let storage_tab = tab_button(SettingsTab::Storage, "Storage", IconName::HardDrive);
-        let keyboard_tab = tab_button(SettingsTab::Keyboard, "Shortcuts", IconName::Keyboard);
+        let yomu = cx.entity();
+        let tab_bar = TabBar::new("settings-tab-bar")
+            .underline()
+            .selected_index(self.settings_tab.to_index())
+            .on_click({
+                let yomu = yomu.clone();
+                move |&idx, _window, cx| {
+                    yomu.update(cx, |this, cx| {
+                        this.settings_tab = SettingsTab::from_index(idx);
+                        cx.notify();
+                    });
+                }
+            })
+            .child(
+                Tab::new()
+                    .label("Appearance")
+                    .prefix(Icon::new(IconName::Palette)),
+            )
+            .child(
+                Tab::new()
+                    .label("Library")
+                    .prefix(Icon::new(IconName::Library)),
+            )
+            .child(
+                Tab::new()
+                    .label("Reader")
+                    .prefix(Icon::new(IconName::BookOpen)),
+            )
+            .child(
+                Tab::new()
+                    .label("Storage")
+                    .prefix(Icon::new(IconName::HardDrive)),
+            )
+            .child(
+                Tab::new()
+                    .label("Shortcuts")
+                    .prefix(Icon::new(IconName::Keyboard)),
+            );
 
         let adw_group = |title: &'static str, rows: Vec<AnyElement>| {
             div()
@@ -3794,51 +3775,76 @@ impl Yomu {
                 adw_group("STORAGE & DATA MANAGEMENT", vec![cache_row, data_row]).into_any_element()
             }
             SettingsTab::Keyboard => {
-                let mut shortcut_rows = Vec::new();
-                for (section, rows) in HELP {
-                    let mut group = div()
-                        .flex()
-                        .flex_col()
-                        .gap_1()
-                        .p_3()
-                        .border_b_1()
-                        .border_color(self.colors.border)
-                        .child(
+                let mut body = TableBody::new();
+
+                for (section_idx, (section, rows)) in HELP.iter().enumerate() {
+                    let section_cell = TableCell::new().col_span(2).child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .justify_between()
+                            .w_full()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_color(self.colors.accent)
+                                    .child(section.to_uppercase()),
+                            )
+                            .child(
+                                Tag::secondary()
+                                    .small()
+                                    .child(format!("{} shortcuts", rows.len())),
+                            ),
+                    );
+
+                    body = body.child(
+                        TableRow::new()
+                            .bg(self.colors.surface_hover)
+                            .when(section_idx > 0, |row| {
+                                row.border_t_1().border_color(self.colors.border)
+                            })
+                            .child(section_cell),
+                    );
+
+                    for (keys, description) in rows.iter() {
+                        let desc_cell = TableCell::new().child(
                             div()
                                 .text_xs()
-                                .font_weight(FontWeight::BOLD)
-                                .text_color(self.colors.muted)
-                                .child(*section),
+                                .text_color(self.colors.foreground)
+                                .child(*description),
                         );
-                    for (keys, description) in *rows {
-                        group = group.child(
+
+                        let key_cell = TableCell::new().text_right().child(
                             div()
-                                .flex()
-                                .justify_between()
-                                .items_center()
-                                .gap_4()
-                                .child(
-                                    div()
-                                        .px_2()
-                                        .py_0p5()
-                                        .rounded_md()
-                                        .bg(self.colors.surface_hover)
-                                        .text_xs()
-                                        .font_weight(FontWeight::MEDIUM)
-                                        .text_color(self.colors.accent)
-                                        .child(*keys),
-                                )
-                                .child(
-                                    div()
-                                        .flex_1()
-                                        .text_xs()
-                                        .text_color(self.colors.foreground)
-                                        .child(*description),
-                                ),
+                                .px_2()
+                                .py_0p5()
+                                .rounded_md()
+                                .border_1()
+                                .border_color(with_alpha(self.colors.border, 0.7))
+                                .bg(self.colors.surface)
+                                .text_xs()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(self.colors.accent)
+                                .child(*keys),
                         );
+
+                        body = body.child(TableRow::new().child(desc_cell).child(key_cell));
                     }
-                    shortcut_rows.push(group.into_any_element());
                 }
+
+                let table = Table::new()
+                    .small()
+                    .child(
+                        TableHeader::new().child(
+                            TableRow::new()
+                                .child(TableHead::new().child("ACTION"))
+                                .child(TableHead::new().text_right().child("SHORTCUT")),
+                        ),
+                    )
+                    .child(body);
+
                 div()
                     .flex()
                     .flex_col()
@@ -3853,16 +3859,19 @@ impl Yomu {
                     )
                     .child(
                         div()
-                            .id("settings-shortcuts-scroll")
                             .flex()
                             .flex_col()
-                            .max_h(px(320.))
-                            .overflow_y_scroll()
                             .rounded_xl()
                             .border_1()
                             .border_color(self.colors.border)
                             .bg(self.widget_surface(self.colors.surface))
-                            .children(shortcut_rows),
+                            .child(
+                                div()
+                                    .id("settings-shortcuts-scroll")
+                                    .h(px(320.))
+                                    .overflow_y_scroll()
+                                    .child(table),
+                            ),
                     )
                     .into_any_element()
             }
@@ -3885,23 +3894,7 @@ impl Yomu {
                                     .child("Settings"),
                             ),
                     )
-                    .child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap_1()
-                            .p_1()
-                            .rounded_xl()
-                            .bg(self.widget_surface(self.colors.background))
-                            .border_1()
-                            .border_color(self.colors.border)
-                            .child(appearance_tab)
-                            .child(library_tab)
-                            .child(reader_tab)
-                            .child(storage_tab)
-                            .child(keyboard_tab),
-                    )
+                    .child(tab_bar)
                     .child(div().min_h(px(280.)).child(body))
                     .child(
                         div()
@@ -3984,67 +3977,26 @@ impl Yomu {
 
         let selected = self.selection.len();
 
-        let search_value = div()
-            .flex_1()
-            .flex()
-            .items_center()
-            .child(self.search_query.clone())
-            .children((self.search_active && self.search_caret_visible).then(|| {
-                div()
-                    .ml(px(1.))
-                    .w(px(1.5))
-                    .h(px(18.))
-                    .rounded_full()
-                    .bg(self.colors.accent)
-            }));
-        let search_field = div()
-            .id("library-search")
-            .w(px(360.))
-            .max_w(px(520.))
-            .h(px(38.))
-            .px_3()
-            .flex()
-            .items_center()
-            .gap_2()
-            .rounded_lg()
-            .border_1()
-            .border_color(if self.search_active {
-                self.colors.accent
-            } else {
-                self.colors.border
-            })
-            .bg(self.widget_surface(self.colors.surface))
-            .text_sm()
-            .text_color(if self.search_query.is_empty() {
-                self.colors.muted
-            } else {
-                self.colors.foreground
-            })
-            .child(div().text_lg().child("⌕"))
-            .child(search_value)
-            .on_mouse_down(MouseButton::Left, |_: &MouseDownEvent, _, cx| {
-                cx.stop_propagation()
-            })
-            .on_mouse_down(MouseButton::Right, |_: &MouseDownEvent, _, cx| {
-                cx.stop_propagation()
-            })
-            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                this.activate_search(cx);
-            }));
-        let search_field: AnyElement = if self.search_active {
-            self.animate_popup("library-search-focus", search_field)
+        let search_field: AnyElement = if let Some(input) = &self.search_input {
+            Input::new(input)
+                .id("library-search")
+                .cleanable(true)
+                .prefix(Icon::new(IconName::Search).size(px(16.)))
+                .w(px(360.))
                 .into_any_element()
         } else {
-            search_field.into_any_element()
+            div().id("library-search").w(px(360.)).into_any_element()
         };
 
         let selection_controls = if selected > 0 {
             let controls = div().flex().flex_row().items_center().gap_2();
             let controls = if selected < count {
-                controls.child(button(
+                controls.child(panel_button(
                     "select-all",
                     "Select all",
+                    ButtonKind::Normal,
                     self.colors,
+                    true,
                     cx.listener(|this, _: &ClickEvent, _, cx| {
                         let order = this.library_order();
                         this.selection.select_all(&order);
@@ -4056,16 +4008,20 @@ impl Yomu {
             };
             Some(
                 controls
-                    .child(button_colored(
+                    .child(panel_button(
                         "select-remove",
                         "Remove",
+                        ButtonKind::Danger,
                         self.colors,
+                        true,
                         cx.listener(|this, _: &ClickEvent, _, cx| this.request_remove_selected(cx)),
                     ))
-                    .child(button(
+                    .child(panel_button(
                         "select-cancel",
                         "Cancel",
+                        ButtonKind::Normal,
                         self.colors,
+                        true,
                         cx.listener(|this, _: &ClickEvent, _, cx| {
                             this.selection.clear();
                             cx.notify();
@@ -4318,17 +4274,11 @@ impl Yomu {
                             .object_fit(ObjectFit::Cover),
                     )
                     .child(
-                        div()
-                            .absolute()
-                            .top_2()
-                            .right_2()
-                            .px_2()
-                            .py_1()
-                            .rounded_lg()
-                            .bg(self.widget_surface(self.colors.background))
-                            .text_xs()
-                            .text_color(self.colors.foreground)
-                            .child(format!("{} volumes", books.len())),
+                        div().absolute().top_2().right_2().child(
+                            Tag::secondary()
+                                .small()
+                                .child(format!("{} volumes", books.len())),
+                        ),
                     ),
             )
             .child(
@@ -4395,18 +4345,10 @@ impl Yomu {
                     .bg(with_alpha(self.colors.accent, 0.22))
             }));
 
-        let progress_bar = div()
-            .h(px(3.))
-            .w_full()
-            .rounded_full()
-            .bg(self.colors.surface_hover)
-            .child(
-                div()
-                    .h_full()
-                    .w(relative(progress))
-                    .rounded_full()
-                    .bg(self.colors.accent),
-            );
+        let progress_bar = Progress::new(SharedString::from(format!("progress-{}", book.id)))
+            .value(progress * 100.0)
+            .color(self.colors.accent)
+            .xsmall();
 
         div()
             .id(SharedString::from(format!("book-{}", book.id)))
@@ -4762,6 +4704,26 @@ impl Render for Yomu {
         }
         self.sync_appearance(window, cx);
 
+        if self.search_input.is_none() {
+            let input = cx.new(|cx| {
+                InputState::new(window, cx)
+                    .default_value(self.search_query.clone())
+                    .placeholder("Search title, path, or series…")
+            });
+            cx.subscribe(&input, |this, input, event: &InputEvent, cx| match event {
+                InputEvent::Change => {
+                    this.search_query = input.read(cx).value().to_string();
+                    cx.notify();
+                }
+                InputEvent::PressEnter { .. } => {
+                    this.deactivate_search(cx);
+                }
+                _ => {}
+            })
+            .detach();
+            self.search_input = Some(input);
+        }
+
         let reading = self.reader.is_some();
         let content = match self.reader.as_ref() {
             Some(reader) => self.render_reader(reader, cx),
@@ -4851,40 +4813,64 @@ fn pill(row: gpui_kit::Div, text: impl Into<SharedString>, colors: UiColors) -> 
 
 const HELP: &[(&str, &[(&str, &str)])] = &[
     (
-        "Move",
+        "Navigation",
         &[
-            ("j k h l  / arrows", "scroll; turns the page at the edge"),
-            ("space  S-space", "scroll a screen down / up"),
-            ("C-d  C-u", "scroll half a screen"),
-            ("J  K  / PgDn  PgUp", "next / previous page"),
-            ("gg  G  12G  :12", "first page, last page, page 12"),
-            ("ma  'a  ''", "set a mark, jump to it, jump back"),
+            (
+                "j, k, h, l / Arrows",
+                "Scroll view by step; turns page at boundary.",
+            ),
+            ("Space / Shift+Space", "Scroll one viewport down or up."),
+            ("Ctrl+D / Ctrl+U", "Scroll half a viewport down or up."),
+            ("J, K / PgDn, PgUp", "Navigate to next or previous page."),
+            ("gg / G / [N]G", "Jump to first, last, or page N."),
+            ("m[a] / '[a] / ''", "Set mark, jump to mark, or jump back."),
         ],
     ),
     (
-        "View",
+        "Display & Zoom",
         &[
-            ("a  s  zh  z1", "fit page / width / height / original size"),
-            ("tab", "cycle the fit mode"),
-            ("+  -  0  / zi  zo", "zoom in / out / reset"),
-            ("ctrl+wheel   drag", "zoom at the pointer   pan the page"),
-            ("zt  zz  zb", "scroll to top / middle / bottom"),
             (
-                "v  w  i  f",
-                "continuous mode, webcomics, page info, fullscreen",
+                "a / s / zh / z1",
+                "Fit to page, width, height, or original size.",
+            ),
+            ("Tab", "Cycle through available fit modes."),
+            ("+ / - / 0 / zi / zo", "Zoom in, zoom out, or reset zoom."),
+            (
+                "Ctrl+Wheel / Drag",
+                "Zoom at cursor position, or drag to pan.",
+            ),
+            ("zt / zz / zb", "Align view to top, center, or bottom."),
+            (
+                "v / w / i / f",
+                "Toggle continuous, webcomics, info, or fullscreen.",
             ),
         ],
     ),
     (
         "Commands (:)",
         &[
-            (":fit width", "page, width, height or original"),
-            (":zoom 150", "150% of the fit size"),
-            (":q  :qa", "back to library, quit"),
-            (":settings  Ctrl+,", "open the settings"),
-            (":animate [on|off]", "page-turn slide and scroll glide"),
-            (":continuous [on|off]", "toggle stacked continuous reading"),
-            (":webcomics [on|off]", "force gapless webcomics strip mode"),
+            (
+                ":fit [mode]",
+                "Set fit mode (page, width, height, original).",
+            ),
+            (":zoom [pct]", "Set zoom percentage, or reset to fit."),
+            (":q / :qa", "Close current comic, or quit application."),
+            (
+                ":settings / Ctrl+,",
+                "Open settings and preferences dialog.",
+            ),
+            (
+                ":animate [on|off]",
+                "Enable or disable smooth page animations.",
+            ),
+            (
+                ":continuous [on|off]",
+                "Toggle stacked continuous reading mode.",
+            ),
+            (
+                ":webcomics [on|off]",
+                "Toggle gapless webcomics strip mode.",
+            ),
         ],
     ),
 ];
@@ -4989,15 +4975,11 @@ fn help_overlay(colors: UiColors) -> AnyElement {
                     div()
                         .flex()
                         .flex_row()
+                        .justify_between()
+                        .items_center()
                         .gap_4()
-                        .child(
-                            div()
-                                .w(px(190.))
-                                .flex_none()
-                                .text_color(colors.accent)
-                                .child(*keys),
-                        )
                         .child(div().text_color(colors.foreground).child(*what))
+                        .child(div().flex_none().text_color(colors.accent).child(*keys))
                 })),
         );
     }
@@ -5046,24 +5028,22 @@ fn panel_button(
         .small()
         .disabled(!enabled)
         .on_click(on_click);
-    match kind {
-        ButtonKind::Normal => button
-            .secondary()
-            .outline()
-            .bg(colors.surface)
-            .into_any_element(),
-        ButtonKind::Primary => button.primary().bg(colors.accent).into_any_element(),
-        ButtonKind::Danger => button.danger().outline().into_any_element(),
+    let button = match kind {
+        ButtonKind::Normal => button.secondary().outline().bg(colors.surface),
+        ButtonKind::Primary => button.primary().bg(colors.accent),
+        ButtonKind::Danger => button.danger().outline(),
+    };
+    #[cfg(test)]
+    {
+        div()
+            .debug_selector(|| id.into())
+            .child(button)
+            .into_any_element()
     }
-}
-
-fn button(
-    id: &'static str,
-    label: &'static str,
-    colors: UiColors,
-    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
-) -> impl IntoElement {
-    button_colored(id, label, colors, on_click)
+    #[cfg(not(test))]
+    {
+        button.into_any_element()
+    }
 }
 
 fn icon_button(
@@ -5075,6 +5055,7 @@ fn icon_button(
 ) -> AnyElement {
     let button = Button::new(id)
         .accessibility_label(label)
+        .tooltip(label)
         .rounded(ButtonRounded::Medium)
         .small()
         .ghost()
@@ -5095,38 +5076,6 @@ fn icon_button(
     #[cfg(not(test))]
     {
         button.into_any_element()
-    }
-}
-
-/// A header button with a theme-aware destructive variant when requested.
-fn button_colored(
-    id: &'static str,
-    label: &'static str,
-    colors: UiColors,
-    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
-) -> impl IntoElement {
-    let button = Button::new(id)
-        .label(label)
-        .rounded(ButtonRounded::Medium)
-        .small()
-        .on_click(on_click);
-    let button = if label == "Remove" {
-        button.danger()
-    } else {
-        button.secondary()
-    };
-    let button = button.bg(if label == "Remove" {
-        colors.danger
-    } else {
-        colors.surface
-    });
-    #[cfg(test)]
-    {
-        div().debug_selector(|| id.into()).child(button)
-    }
-    #[cfg(not(test))]
-    {
-        button
     }
 }
 

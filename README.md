@@ -8,7 +8,7 @@ rendering is GPU-accelerated, and it talks to Wayland directly (no webview, no T
 - Chrome-free reader: one page, a 2 px progress line at the bottom edge, nothing else until you ask
 - Right-click menu on books (resume, mark read/unread, reset progress, open file location, properties, remove)
 - Multiple selection (Ctrl/Shift-click, Ctrl+A) for removing many books at once
-- Settings panel with a live background-opacity slider (`Ctrl+,`)
+- Settings panel with theme selection, library/reader preferences, and keyboard shortcuts table (`Ctrl+,`)
 - Fit page / width / height / original size, zoom in and out, pan by dragging
 - Continuous vertical reading mode and gapless webcomics strip mode; single-page mode remains available
 - Vim motions (counts, `gg`, `G`, marks, `:` commands) next to the normal keys
@@ -206,9 +206,6 @@ Right-click a book. Only the actions that make sense for its state are shown:
 
 `Ctrl+,` (or `:settings` in the reader, or **Settings** in the library hamburger menu) opens a tabbed panel:
 
-- **Window background opacity**, 30% to 100%, default 100%. Drag the slider or use `Left`/`Right` (5% steps),
-  `Home`/`End`. It applies immediately and is saved when you let go. **Reset to Defaults** asks first and also
-  restores all preferences; it is greyed out when everything is already at the defaults.
 - **Theme**, cycle through the built-in GPUI Kit themes with the arrows. The app applies the theme immediately,
   uses its semantic colors throughout the library, reader and dialogs, and remembers it between launches.
 - **Custom themes**, edit `$XDG_CONFIG_HOME/yomu/themes.toml` (usually `~/.config/yomu/themes.toml`) and choose
@@ -226,8 +223,9 @@ Right-click a book. Only the actions that make sense for its state are shown:
   with `w`, the Settings panel, or `:webcomics [on|off]`. It forces continuous scrolling while active, then restores
   the saved single-page or continuous reading mode when turned off.
 - **Library** switches between automatic folder grouping and individual volumes.
-- **Reader** controls reading direction, page fit, animations, single-page or continuous scrolling, and webcomics mode.
-- **Keyboard & Commands** lists the reader shortcuts and `:` commands.
+- **Reader** controls page fit, animations, single-page or continuous scrolling, and webcomics mode.
+- **Keyboard & Commands** displays a structured, scrollable table of all reader shortcuts and `:` commands with key badges and concise action descriptions.
+- **Reset to Defaults** asks first and restores all preferences; it is greyed out when everything is already at the defaults.
 
 Stored preferences are read leniently: a missing or invalid value falls back to its default (out-of-range numbers
 are clamped) instead of affecting your library.
