@@ -1552,12 +1552,10 @@ impl Yomu {
             return;
         };
         let max = if reader.continuous {
-            let (tops, heights) = reader.continuous_layout(&vp);
+            let doc_height = reader.continuous_total_height(&vp);
             (
                 (display.0 - vp.width).max(0.0),
-                (tops.last().copied().unwrap_or(0.0) + heights.last().copied().unwrap_or(0.0)
-                    - vp.height)
-                    .max(0.0),
+                (doc_height - vp.height).max(0.0),
             )
         } else {
             layout::max_offset(display, &vp)
@@ -1621,10 +1619,7 @@ impl Yomu {
             return;
         };
         let max = if reader.continuous {
-            let (tops, heights) = reader.continuous_layout(&vp);
-            (tops.last().copied().unwrap_or(0.0) + heights.last().copied().unwrap_or(0.0)
-                - vp.height)
-                .max(0.0)
+            (reader.continuous_total_height(&vp) - vp.height).max(0.0)
         } else {
             layout::max_offset(display, &vp).1
         };
@@ -1642,15 +1637,11 @@ impl Yomu {
                 return;
             };
             if reader.continuous {
-                let (old_tops, old_heights) = reader.continuous_layout(&vp);
-                let old_doc = old_tops.last().copied().unwrap_or(0.0)
-                    + old_heights.last().copied().unwrap_or(0.0);
+                let old_doc = reader.continuous_total_height(&vp);
                 let old_y = reader.scroll_target.1;
                 let zoom = layout::clamp_zoom(zoom);
                 reader.zoom = zoom;
-                let (new_tops, new_heights) = reader.continuous_layout(&vp);
-                let new_doc = new_tops.last().copied().unwrap_or(0.0)
-                    + new_heights.last().copied().unwrap_or(0.0);
+                let new_doc = reader.continuous_total_height(&vp);
                 reader.scroll_target.1 = if old_doc > vp.height {
                     old_y / (old_doc - vp.height) * (new_doc - vp.height).max(0.0)
                 } else {
@@ -1812,12 +1803,10 @@ impl Yomu {
         }
 
         let max = if reader.continuous {
-            let (tops, heights) = reader.continuous_layout(&vp);
+            let doc_height = reader.continuous_total_height(&vp);
             (
                 (display.0 - vp.width).max(0.0),
-                (tops.last().copied().unwrap_or(0.0) + heights.last().copied().unwrap_or(0.0)
-                    - vp.height)
-                    .max(0.0),
+                (doc_height - vp.height).max(0.0),
             )
         } else {
             layout::max_offset(display, &vp)
@@ -1945,12 +1934,10 @@ impl Yomu {
         });
         let target = (drag.off0.0 - dx, drag.off0.1 - dy);
         if reader.continuous {
-            let (tops, heights) = reader.continuous_layout(&vp);
+            let doc_height = reader.continuous_total_height(&vp);
             let max = (
                 (display.0 - vp.width).max(0.0),
-                (tops.last().copied().unwrap_or(0.0) + heights.last().copied().unwrap_or(0.0)
-                    - vp.height)
-                    .max(0.0),
+                (doc_height - vp.height).max(0.0),
             );
             reader.set_scroll((target.0.clamp(0.0, max.0), target.1.clamp(0.0, max.1)));
         } else {
@@ -2208,19 +2195,9 @@ impl Yomu {
                 })
                 .collect();
             let keep: HashSet<usize> = if reader.continuous {
-                let (tops, heights) = reader.continuous_layout(&vp);
                 let low = reader.off.1;
                 let high = low + vp.height;
-                let visible: Vec<usize> = tops
-                    .iter()
-                    .zip(&heights)
-                    .enumerate()
-                    .filter_map(|(ix, (top, height))| {
-                        (*top < high && *top + *height > low).then_some(ix)
-                    })
-                    .collect();
-                let first = visible.first().copied().unwrap_or(reader.page);
-                let last = visible.last().copied().unwrap_or(reader.page);
+                let (first, last) = reader.continuous_visible_range(low, high, &vp);
                 (first.saturating_sub(1)..=(last + 2).min(pages.len().saturating_sub(1))).collect()
             } else {
                 (reader.page.saturating_sub(pagecache::KEEP_BEHIND)
@@ -2366,20 +2343,18 @@ impl Yomu {
         reader.pending.remove(&ix);
         match result {
             Ok((image, orig, bytes)) => {
-                let old_top = if reader.continuous && ix < reader.page {
-                    let (tops, _) = reader.continuous_layout(&reader.viewport);
-                    tops.get(reader.page).copied()
-                } else {
-                    None
-                };
-                if let Some(size) = reader.orig_sizes.get_mut(ix) {
-                    *size = Some(orig);
-                }
-                if let Some(old_top) = old_top {
-                    let (tops, _) = reader.continuous_layout(&reader.viewport);
-                    let shift = tops.get(reader.page).copied().unwrap_or(old_top) - old_top;
+                if reader.continuous && ix < reader.page {
+                    let width = (reader.viewport.width * reader.zoom).max(1.0);
+                    let (old_w, old_h) =
+                        reader.orig_sizes.get(ix).and_then(|v| *v).unwrap_or((2, 3));
+                    let old_height = width * old_h as f32 / old_w.max(1) as f32;
+                    let new_height = width * orig.1 as f32 / orig.0.max(1) as f32;
+                    let shift = new_height - old_height;
                     reader.off.1 = (reader.off.1 + shift).max(0.0);
                     reader.scroll_target.1 = (reader.scroll_target.1 + shift).max(0.0);
+                }
+                if let Some(size) = reader.orig_sizes.get_mut(ix) {
+                    *size = Some(orig);
                 }
                 if let Some(old) = reader.images.insert(
                     ix,
@@ -4111,33 +4086,44 @@ impl Yomu {
                 self.colors,
             ));
         } else if reader.continuous {
-            let (tops, heights) = reader.continuous_layout(&vp);
             let width = vp.width * reader.zoom;
+            let page_w = width.max(1.0);
+            let gap = if reader.webcomics {
+                0.0
+            } else {
+                12.0 * reader.zoom
+            };
             let left = (vp.width - width) / 2.0 - reader.off.0;
             let visible_top = reader.off.1;
             let visible_bottom = visible_top + vp.height;
-            for (ix, (top, height)) in tops.iter().zip(&heights).enumerate() {
+            let mut top = 0.0;
+            for ix in 0..reader.total {
+                let (w, h) = reader.orig_sizes.get(ix).and_then(|v| *v).unwrap_or((2, 3));
+                let height = page_w * h as f32 / w.max(1) as f32;
                 let overlap = if reader.webcomics && ix + 1 < reader.total {
                     1.0
                 } else {
                     0.0
                 };
-                if *top + *height + overlap < visible_top || *top > visible_bottom {
-                    continue;
+                if top > visible_bottom {
+                    break;
                 }
-                if let Some(page) = reader.images.get(&ix) {
-                    content.push(page_layer(
-                        &page.image,
-                        left,
-                        *top - reader.off.1,
-                        (width, *height + overlap),
-                    ));
-                } else if let Some(error) = reader.failed.get(&ix) {
-                    content.push(centered(
-                        format!("Couldn't decode page {}: {error}", ix + 1),
-                        self.colors,
-                    ));
+                if top + height + overlap >= visible_top {
+                    if let Some(page) = reader.images.get(&ix) {
+                        content.push(page_layer(
+                            &page.image,
+                            left,
+                            top - reader.off.1,
+                            (width, height + overlap),
+                        ));
+                    } else if let Some(error) = reader.failed.get(&ix) {
+                        content.push(centered(
+                            format!("Couldn't decode page {}: {error}", ix + 1),
+                            self.colors,
+                        ));
+                    }
                 }
+                top += height + gap;
             }
         } else {
             let (shift_out, shift_in) = match &reader.transition {

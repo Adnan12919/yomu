@@ -1,11 +1,12 @@
 use std::cell::RefCell;
+use std::io::Cursor;
 
 use anyhow::{Context, Result, bail};
 use fast_image_resize::{
     FilterType as ResizeFilter, PixelType, ResizeAlg, ResizeOptions, Resizer,
     images::Image as FirImage,
 };
-use image::{DynamicImage, ExtendedColorType, RgbaImage};
+use image::{DynamicImage, ExtendedColorType, RgbImage, RgbaImage};
 
 thread_local! {
     /// Reusable thread-local resizer to avoid reallocating internal SIMD scratch buffers.
@@ -20,6 +21,12 @@ pub const COVER_MAX_H: u32 = 600;
 const MAX_PIXELS: u64 = 120_000_000;
 
 fn decode(bytes: &[u8]) -> Result<DynamicImage> {
+    if let Ok(reader) = image::ImageReader::new(Cursor::new(bytes)).with_guessed_format()
+        && let Ok((w, h)) = reader.into_dimensions()
+        && u64::from(w) * u64::from(h) > MAX_PIXELS
+    {
+        bail!("image is too large ({w}x{h})");
+    }
     let img = image::load_from_memory(bytes)?;
     if u64::from(img.width()) * u64::from(img.height()) > MAX_PIXELS {
         bail!("image is too large ({}x{})", img.width(), img.height());
@@ -35,6 +42,23 @@ pub struct Decoded {
     pub orig: (u32, u32),
 }
 
+fn rgb_to_bgra(rgb: &[u8], nw: u32, nh: u32) -> Result<RgbaImage> {
+    let total = nw as usize * nh as usize;
+    let mut bgra = vec![0u8; total * 4];
+    for (src, dst) in rgb
+        .as_chunks::<3>()
+        .0
+        .iter()
+        .zip(bgra.as_chunks_mut::<4>().0)
+    {
+        dst[0] = src[2];
+        dst[1] = src[1];
+        dst[2] = src[0];
+        dst[3] = 255;
+    }
+    RgbaImage::from_raw(nw, nh, bgra).context("failed to create bgra buffer from raw bytes")
+}
+
 /// Decode a page and scale it down (never up) so it fits inside `max_w` x `max_h`.
 ///
 /// Pre-scaling on the CPU with a good filter looks much sharper than letting the GPU
@@ -47,17 +71,31 @@ pub fn decode_fit_bgra(bytes: &[u8], max_w: u32, max_h: u32) -> Result<Decoded> 
     let alpha = img.color().has_alpha();
     let scale = (max_w as f32 / w as f32).min(max_h as f32 / h as f32);
 
-    let mut rgba = img.into_rgba8();
-    if scale < 1.0 {
-        let nw = ((w as f32 * scale).round() as u32).max(1);
-        let nh = ((h as f32 * scale).round() as u32).max(1);
-        rgba = resize_rgba(rgba, nw, nh, ResizeFilter::CatmullRom, alpha)?;
-    }
-    for px in rgba.as_chunks_mut::<4>().0 {
-        px.swap(0, 2);
-    }
+    let bgra = if alpha {
+        let mut rgba = img.into_rgba8();
+        if scale < 1.0 {
+            let nw = ((w as f32 * scale).round() as u32).max(1);
+            let nh = ((h as f32 * scale).round() as u32).max(1);
+            rgba = resize_rgba(rgba, nw, nh, ResizeFilter::CatmullRom, true)?;
+        }
+        for px in rgba.as_chunks_mut::<4>().0 {
+            px.swap(0, 2);
+        }
+        rgba
+    } else {
+        let rgb = img.into_rgb8();
+        if scale < 1.0 {
+            let nw = ((w as f32 * scale).round() as u32).max(1);
+            let nh = ((h as f32 * scale).round() as u32).max(1);
+            let resized = resize_rgb(rgb, nw, nh, ResizeFilter::CatmullRom)?;
+            rgb_to_bgra(resized.as_raw(), nw, nh)?
+        } else {
+            rgb_to_bgra(rgb.as_raw(), w, h)?
+        }
+    };
+
     Ok(Decoded {
-        image: rgba,
+        image: bgra,
         orig: (w, h),
     })
 }
@@ -83,6 +121,15 @@ fn resize_rgba(
     RgbaImage::from_raw(nw, nh, dst.into_vec()).context("resized buffer has the wrong size")
 }
 
+fn resize_rgb(rgb: RgbImage, nw: u32, nh: u32, filter: ResizeFilter) -> Result<RgbImage> {
+    let (w, h) = rgb.dimensions();
+    let src = FirImage::from_vec_u8(w, h, rgb.into_raw(), PixelType::U8x3)?;
+    let mut dst = FirImage::new(nw, nh, PixelType::U8x3);
+    let options = ResizeOptions::new().resize_alg(ResizeAlg::Convolution(filter));
+    RESIZER.with(|resizer| resizer.borrow_mut().resize(&src, &mut dst, &options))?;
+    RgbImage::from_raw(nw, nh, dst.into_vec()).context("resized rgb buffer has the wrong size")
+}
+
 /// Encode a JPEG thumbnail that fits inside `max_w` x `max_h`, keeping the aspect ratio.
 pub fn make_cover_jpeg(bytes: &[u8], max_w: u32, max_h: u32) -> Result<Vec<u8>> {
     let img = decode(bytes)?;
@@ -94,12 +141,22 @@ pub fn make_cover_jpeg(bytes: &[u8], max_w: u32, max_h: u32) -> Result<Vec<u8>> 
         .min(1.0);
     let nw = ((w as f32 * scale).round() as u32).max(1);
     let nh = ((h as f32 * scale).round() as u32).max(1);
-    let thumb = if (nw, nh) == (w, h) {
-        img.into_rgba8()
+
+    let rgb = if alpha {
+        let thumb = if (nw, nh) == (w, h) {
+            img.into_rgba8()
+        } else {
+            resize_rgba(img.into_rgba8(), nw, nh, ResizeFilter::Lanczos3, true)?
+        };
+        DynamicImage::ImageRgba8(thumb).into_rgb8()
     } else {
-        resize_rgba(img.into_rgba8(), nw, nh, ResizeFilter::Lanczos3, alpha)?
+        let rgb = img.into_rgb8();
+        if (nw, nh) == (w, h) {
+            rgb
+        } else {
+            resize_rgb(rgb, nw, nh, ResizeFilter::Lanczos3)?
+        }
     };
-    let rgb = DynamicImage::ImageRgba8(thumb).into_rgb8();
 
     let mut out = Vec::new();
     let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 88);
@@ -220,5 +277,25 @@ mod tests {
         assert_eq!(&jpg[..2], &[0xff, 0xd8]);
         let back = image::load_from_memory(&jpg).unwrap();
         assert!(back.width() <= COVER_MAX_W && back.height() <= COVER_MAX_H);
+    }
+
+    fn rgb_bytes(w: u32, h: u32, px: image::Rgb<u8>) -> Vec<u8> {
+        let img = image::RgbImage::from_pixel(w, h, px);
+        let mut out = Cursor::new(Vec::new());
+        img.write_to(&mut out, ImageFormat::Jpeg).unwrap();
+        out.into_inner()
+    }
+
+    #[test]
+    fn rgb_scales_down_and_converts_to_bgra() {
+        let bytes = rgb_bytes(400, 800, image::Rgb([10, 20, 30]));
+        let out = decode_fit_bgra(&bytes, 100, 100).unwrap();
+        assert_eq!(out.image.dimensions(), (50, 100));
+        assert_eq!(out.orig, (400, 800));
+        let px = out.image.get_pixel(0, 0).0;
+        assert_eq!(px[3], 255);
+        assert!((i32::from(px[0]) - 30).abs() <= 5, "B: {}", px[0]);
+        assert!((i32::from(px[1]) - 20).abs() <= 5, "G: {}", px[1]);
+        assert!((i32::from(px[2]) - 10).abs() <= 5, "R: {}", px[2]);
     }
 }

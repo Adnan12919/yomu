@@ -186,6 +186,7 @@ impl Reader {
         self.images.get(&self.page)
     }
 
+    #[cfg(test)]
     pub fn continuous_layout(&self, vp: &Viewport) -> (Vec<f32>, Vec<f32>) {
         let width = (vp.width * self.zoom).max(1.0);
         let gap = if self.webcomics {
@@ -207,12 +208,77 @@ impl Reader {
         (tops, heights)
     }
 
+    pub fn continuous_total_height(&self, vp: &Viewport) -> f32 {
+        if self.total == 0 {
+            return 0.0;
+        }
+        let width = (vp.width * self.zoom).max(1.0);
+        let gap = if self.webcomics {
+            0.0
+        } else {
+            12.0 * self.zoom
+        };
+        let mut total = 0.0;
+        for ix in 0..self.total {
+            let (w, h) = self.orig_sizes.get(ix).and_then(|v| *v).unwrap_or((2, 3));
+            let height = width * h as f32 / w.max(1) as f32;
+            total += height;
+            if ix + 1 < self.total {
+                total += gap;
+            }
+        }
+        total
+    }
+
     pub fn continuous_page_at(&self, y: f32, vp: &Viewport) -> usize {
-        let (tops, heights) = self.continuous_layout(vp);
-        tops.iter()
-            .zip(heights)
-            .position(|(top, height)| y < *top + height)
-            .unwrap_or_else(|| self.total.saturating_sub(1))
+        if self.total == 0 {
+            return 0;
+        }
+        let width = (vp.width * self.zoom).max(1.0);
+        let gap = if self.webcomics {
+            0.0
+        } else {
+            12.0 * self.zoom
+        };
+        let mut top = 0.0;
+        for ix in 0..self.total {
+            let (w, h) = self.orig_sizes.get(ix).and_then(|v| *v).unwrap_or((2, 3));
+            let height = width * h as f32 / w.max(1) as f32;
+            if y < top + height {
+                return ix;
+            }
+            top += height + gap;
+        }
+        self.total.saturating_sub(1)
+    }
+
+    pub fn continuous_visible_range(&self, low: f32, high: f32, vp: &Viewport) -> (usize, usize) {
+        if self.total == 0 {
+            return (0, 0);
+        }
+        let width = (vp.width * self.zoom).max(1.0);
+        let gap = if self.webcomics {
+            0.0
+        } else {
+            12.0 * self.zoom
+        };
+        let mut top = 0.0;
+        let mut first = None;
+        let mut last = None;
+        for ix in 0..self.total {
+            let (w, h) = self.orig_sizes.get(ix).and_then(|v| *v).unwrap_or((2, 3));
+            let height = width * h as f32 / w.max(1) as f32;
+            if top < high && top + height > low {
+                if first.is_none() {
+                    first = Some(ix);
+                }
+                last = Some(ix);
+            } else if top >= high && first.is_some() {
+                break;
+            }
+            top += height + gap;
+        }
+        (first.unwrap_or(self.page), last.unwrap_or(self.page))
     }
 
     pub fn orig_of(page: &Page) -> (f32, f32) {
@@ -226,26 +292,48 @@ impl Reader {
             if self.total == 0 {
                 return None;
             }
-            let (tops, heights) = self.continuous_layout(vp);
-            let doc_height =
-                tops.last().copied().unwrap_or(0.0) + heights.last().copied().unwrap_or(0.0);
+            let width = vp.width * self.zoom;
+            let page_w = width.max(1.0);
+            let gap = if self.webcomics {
+                0.0
+            } else {
+                12.0 * self.zoom
+            };
             let page = self.page.min(self.total - 1);
             if let Some(arrive) = self.arrive.take() {
+                let mut top = 0.0;
+                let mut page_h = 0.0;
+                for ix in 0..=page {
+                    let (w, h) = self.orig_sizes.get(ix).and_then(|v| *v).unwrap_or((2, 3));
+                    let h = page_w * h as f32 / w.max(1) as f32;
+                    if ix == page {
+                        page_h = h;
+                        break;
+                    }
+                    top += h + gap;
+                }
                 self.scroll_target.1 = match arrive {
-                    Arrive::Start => tops[page],
-                    Arrive::End => (tops[page] + heights[page] - vp.height).max(0.0),
+                    Arrive::Start => top,
+                    Arrive::End => (top + page_h - vp.height).max(0.0),
                 };
                 self.off = self.scroll_target;
             }
-            let width = vp.width * self.zoom;
+            let doc_height = self.continuous_total_height(vp);
             let max_x = (width - vp.width).max(0.0);
             let max_y = (doc_height - vp.height).max(0.0);
             self.off.0 = self.off.0.clamp(0.0, max_x);
             self.off.1 = self.off.1.clamp(0.0, max_y);
             self.scroll_target.0 = self.scroll_target.0.clamp(0.0, max_x);
             self.scroll_target.1 = self.scroll_target.1.clamp(0.0, max_y);
-            self.page = self.continuous_page_at(self.off.1 + vp.height * 0.5, vp);
-            return Some((width, heights[self.page]));
+            let mid_y = self.off.1 + vp.height * 0.5;
+            self.page = self.continuous_page_at(mid_y, vp);
+            let (w, h) = self
+                .orig_sizes
+                .get(self.page)
+                .and_then(|v| *v)
+                .unwrap_or((2, 3));
+            let current_h = page_w * h as f32 / w.max(1) as f32;
+            return Some((width, current_h));
         }
         let orig = Self::orig_of(self.current()?);
         let display = layout::display_size(self.fit, self.zoom, orig, vp);
@@ -377,12 +465,9 @@ impl Reader {
         if let Some(mut inertia) = self.inertia.take() {
             let ((dx, dy), still) = inertia.step(dt);
             let (max_w, max_h) = if self.continuous {
-                let (tops, heights) = self.continuous_layout(vp);
+                let doc_height = self.continuous_total_height(vp);
                 let w = (self.viewport.width * self.zoom - vp.width).max(0.0);
-                let h = (tops.last().copied().unwrap_or(0.0)
-                    + heights.last().copied().unwrap_or(0.0)
-                    - vp.height)
-                    .max(0.0);
+                let h = (doc_height - vp.height).max(0.0);
                 (w, h)
             } else if let Some(display) = self.settle(vp) {
                 layout::max_offset(display, vp)
@@ -427,5 +512,52 @@ impl Reader {
         images.extend(self.outgoing.map(|outgoing| outgoing.image));
         images.extend(self.released);
         images
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+    use yomu::library::{Book, Settings};
+
+    #[test]
+    fn test_continuous_calculations_agree() {
+        let book = Book {
+            id: "b".into(),
+            title: "Sample".into(),
+            series: None,
+            path: PathBuf::from("/tmp/sample.cbz"),
+            kind: SourceKind::Archive,
+            page_count: 10,
+            current_page: 0,
+            opened: false,
+            added_at: 1,
+            last_read: None,
+            marks: BTreeMap::new(),
+        };
+        let settings = Settings {
+            continuous: true,
+            ..Default::default()
+        };
+        let mut reader = Reader::new(&book, &settings);
+        reader.orig_sizes = vec![Some((1000, 1500)); 10];
+        let vp = Viewport {
+            width: 800.0,
+            height: 600.0,
+            scale: 1.0,
+        };
+
+        let (tops, heights) = reader.continuous_layout(&vp);
+        let expected_total: f32 = tops.last().copied().unwrap() + heights.last().copied().unwrap();
+        assert_eq!(reader.continuous_total_height(&vp), expected_total);
+
+        for (ix, &top) in tops.iter().enumerate() {
+            assert_eq!(reader.continuous_page_at(top + 1.0, &vp), ix);
+        }
+
+        let (first, last) = reader.continuous_visible_range(tops[2], tops[5] + 1.0, &vp);
+        assert_eq!(first, 2);
+        assert_eq!(last, 5);
     }
 }
