@@ -31,9 +31,9 @@ use gpui_kit::{
     Anchor, Animation, AnimationExt, AnyElement, AnyWindowHandle, App, Bounds, ClickEvent, Context,
     Entity, ExternalPaths, FocusHandle, Focusable, FontWeight, KeyBinding, KeyDownEvent,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit, PathPromptOptions,
-    Pixels, Point, RenderImage, Rgba, ScrollDelta, ScrollWheelEvent, SharedString, Styled,
-    Subscription, TitlebarOptions, TouchPhase, Window, WindowBackgroundAppearance, WindowBounds,
-    WindowKind, WindowOptions, actions, anchored, application, canvas, deferred, div,
+    Pixels, Point, RenderImage, Rgba, ScrollDelta, ScrollHandle, ScrollWheelEvent, SharedString,
+    Styled, Subscription, TitlebarOptions, TouchPhase, Window, WindowBackgroundAppearance,
+    WindowBounds, WindowKind, WindowOptions, actions, anchored, application, canvas, deferred, div,
     ease_out_quint, img, point, prelude::*, px, relative, size,
 };
 use image::Frame;
@@ -42,7 +42,7 @@ use yomu::{
     layout::{self, Arrive, FitMode, Viewport},
     library::{self, Book, BorderSize, CornerRounding, DataDirs, Library, Settings, ThumbnailSize},
     menu::{self, BookAction, Entry, Item},
-    motion::{self, InertialScroll},
+    motion::{self, KineticScroll},
     pagecache, search,
     selection::Selection,
     util::{format_size, now_secs},
@@ -92,6 +92,8 @@ const AUTOSAVE_MAX_DELAY: Duration = Duration::from_millis(2000);
 /// Clicks this soon after a menu or dialog closes are ignored, so double-clicking a menu item
 /// cannot also click the book underneath it.
 const CLICK_GUARD: Duration = Duration::from_millis(300);
+/// Clicks that caught / stopped an active inertial scroll glide are suppressed from opening cards.
+const SCROLL_CATCH_GUARD: Duration = Duration::from_millis(150);
 
 #[derive(Clone, Copy)]
 enum Side {
@@ -157,6 +159,101 @@ fn directory_groups(books: &[Book]) -> Vec<LibraryGroup<'_>> {
     groups
 }
 
+/// Native kinetic / inertial scroll controller for UI scrollable containers (e.g. library grid, settings).
+#[derive(Clone, Debug, Default)]
+pub struct UiScrollController {
+    pub handle: ScrollHandle,
+    pub kinetic: KineticScroll,
+}
+
+impl UiScrollController {
+    pub fn new() -> Self {
+        Self {
+            handle: ScrollHandle::new(),
+            kinetic: KineticScroll::new(),
+        }
+    }
+
+    pub fn reset(&mut self) {
+        self.kinetic.reset();
+    }
+
+    pub fn cancel_inertia(&mut self) {
+        self.kinetic.cancel_inertia();
+    }
+
+    pub fn has_active_inertia(&self) -> bool {
+        self.kinetic.has_active_inertia()
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.kinetic.is_active()
+    }
+
+    /// Process a scroll wheel event on this scrollable container.
+    pub fn handle_scroll_wheel(&mut self, event: &ScrollWheelEvent, reduce_motion: bool) {
+        let discrete = matches!(event.delta, ScrollDelta::Lines(_));
+        if discrete
+            || event.touch_phase == TouchPhase::Started
+            || event.touch_phase == TouchPhase::Cancelled
+        {
+            self.kinetic.reset();
+            return;
+        }
+
+        // Touch-catch: any new continuous scroll gesture cancels active inertia glide and resets momentum
+        if self.kinetic.has_active_inertia() {
+            self.kinetic.reset();
+        }
+
+        let now = Instant::now();
+        let delta = event.delta.pixel_delta(px(16.0));
+        let dy = f32::from(delta.y);
+        let dx = f32::from(delta.x);
+
+        if event.touch_phase == TouchPhase::Moved {
+            self.kinetic.push_motion(now, dx, dy);
+        } else if event.touch_phase == TouchPhase::Ended {
+            self.kinetic.end_touch(!reduce_motion);
+        }
+    }
+
+    /// Step kinetic momentum forward by `dt` seconds. Returns true if animation is still running.
+    pub fn step(&mut self, dt: f32, reduce_motion: bool) -> bool {
+        if reduce_motion {
+            self.kinetic.reset();
+            return false;
+        }
+
+        let now = Instant::now();
+        self.kinetic.check_stillness_timeout(now, !reduce_motion);
+
+        if let Some((_dx, dy)) = self.kinetic.step(dt) {
+            let current = self.handle.offset();
+            let max = self.handle.max_offset();
+
+            if max.y > px(0.) {
+                // In GPUI div: scrolling down makes offset.y negative, bounded in [-max.y, 0.0]
+                let target_y = current.y + px(dy);
+                let clamped_y = target_y.clamp(-max.y, px(0.));
+
+                self.handle.set_offset(Point {
+                    x: current.x,
+                    y: clamped_y,
+                });
+
+                let hit_boundary =
+                    (target_y >= px(0.) && dy > 0.0) || (target_y <= -max.y && dy < 0.0);
+                if hit_boundary {
+                    self.kinetic.cancel_inertia();
+                }
+            }
+        }
+
+        self.kinetic.is_active()
+    }
+}
+
 struct Yomu {
     focus_handle: FocusHandle,
     dirs: Arc<DataDirs>,
@@ -180,6 +277,8 @@ struct Yomu {
     reduce_motion: bool,
     /// When the previous animated frame was drawn; `None` while nothing is animating.
     last_frame: Option<Instant>,
+    /// Smoothed frame interval for display vsync scheduling jitter mitigation.
+    dt_smoothed: Option<f32>,
     /// Tests drive the animation clock by hand instead of using real time.
     #[cfg(test)]
     frame_dt: Option<f32>,
@@ -196,6 +295,10 @@ struct Yomu {
     open_group: Option<String>,
     /// Which background appearance the window currently has (`None` before the first frame).
     applied_opaque: Option<bool>,
+    library_scroll: UiScrollController,
+    group_scroll: UiScrollController,
+    shortcuts_scroll: UiScrollController,
+    scroll_caught_at: Option<Instant>,
     save_seq: u64,
     last_saved_seq: Arc<Mutex<u64>>,
     save_pending: bool,
@@ -273,6 +376,7 @@ impl Yomu {
             imported_count: 0,
             reduce_motion: false,
             last_frame: None,
+            dt_smoothed: None,
             #[cfg(test)]
             frame_dt: None,
             overlay: None,
@@ -285,6 +389,10 @@ impl Yomu {
             search_input: None,
             open_group: None,
             applied_opaque: None,
+            library_scroll: UiScrollController::new(),
+            group_scroll: UiScrollController::new(),
+            shortcuts_scroll: UiScrollController::new(),
+            scroll_caught_at: None,
             save_seq: 0,
             last_saved_seq: Arc::new(Mutex::new(0)),
             save_pending: false,
@@ -379,16 +487,42 @@ impl Yomu {
         }
     }
 
-    /// Seconds since the previous animated frame.
-    fn frame_delta(&self, now: Instant) -> f32 {
+    /// Seconds since the previous animated frame, with display VSync low-pass filtering.
+    fn frame_delta(&mut self, now: Instant) -> f32 {
         #[cfg(test)]
         {
             if let Some(dt) = self.frame_dt {
                 return dt;
             }
         }
-        self.last_frame
-            .map_or(0.0, |previous| now.duration_since(previous).as_secs_f32())
+        let Some(previous) = self.last_frame else {
+            return 0.0;
+        };
+        let raw_dt = now.duration_since(previous).as_secs_f32();
+        if raw_dt <= 0.0 || !raw_dt.is_finite() {
+            return 0.0;
+        }
+
+        // Display VSync frame-delta filter:
+        // Wayland compositor frame callbacks fluctuate by ±1-3ms due to process scheduling latency,
+        // even when scanout is locked to the physical display's fixed hardware refresh cycle.
+        // Feeding raw jittery CPU timestamps into inertial momentum causes visible micro-jitter.
+        // When consecutive frames arrive within normal scheduling variance (0.6x to 1.6x of the
+        // running frame interval), apply a low-pass filter to absorb timer noise.
+        // True frame drops (>1.6x) or rate changes immediately update the interval without lag.
+        let dt = match self.dt_smoothed {
+            Some(smoothed) if raw_dt >= smoothed * 0.6 && raw_dt <= smoothed * 1.6 => {
+                let filtered = smoothed * 0.8 + raw_dt * 0.2;
+                self.dt_smoothed = Some(filtered);
+                filtered
+            }
+            _ => {
+                self.dt_smoothed = Some(raw_dt);
+                raw_dt
+            }
+        };
+
+        motion::clamp_frame_dt(dt)
     }
 
     // ------------------------------------------------------------------------------------
@@ -860,6 +994,7 @@ impl Yomu {
         self.reader = None;
         self.selection.clear();
         self.open_group = None;
+        self.group_scroll.reset();
         let _ = self.library.clear_all_data(&self.dirs);
         self.overlay = Some(Overlay::Settings);
         cx.notify();
@@ -1072,6 +1207,7 @@ impl Yomu {
             3 => {
                 self.library.settings_mut().group_series = !self.library.settings().group_series;
                 self.open_group = None;
+                self.group_scroll.reset();
                 self.save_library();
                 cx.notify();
             }
@@ -1350,13 +1486,25 @@ impl Yomu {
                     self.selection.clear();
                     cx.notify();
                 } else if self.open_group.is_some() {
-                    self.open_group = None;
-                    cx.notify();
+                    self.exit_group(cx);
                 }
             }
             "delete" => self.request_remove_selected(cx),
             _ => {}
         }
+    }
+
+    fn enter_group(&mut self, key: String, cx: &mut Context<Self>) {
+        self.open_group = Some(key);
+        self.group_scroll.handle.set_offset(Point::default());
+        self.group_scroll.reset();
+        cx.notify();
+    }
+
+    fn exit_group(&mut self, cx: &mut Context<Self>) {
+        self.open_group = None;
+        self.group_scroll.reset();
+        cx.notify();
     }
 
     fn activate_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1777,21 +1925,10 @@ impl Yomu {
         };
 
         let now = Instant::now();
-        let is_new_gesture = reader
-            .last_motion_time
-            .is_none_or(|t| now.duration_since(t) > Duration::from_millis(80));
-
-        if is_new_gesture || touch_phase == TouchPhase::Started {
-            reader.inertia = None;
-            reader.velocity_tracker.reset();
-        } else if reader.inertia.is_some() {
-            reader.inertia = None;
-        }
-
-        if discrete {
-            reader.last_motion_time = None;
-            reader.velocity_tracker.reset();
-            reader.inertia = None;
+        if touch_phase == TouchPhase::Started || touch_phase == TouchPhase::Cancelled || discrete {
+            reader.kinetic.reset();
+        } else if reader.kinetic.has_active_inertia() {
+            reader.kinetic.reset();
         }
 
         let Some(display) = reader.settle(&vp) else {
@@ -1799,7 +1936,7 @@ impl Yomu {
         };
 
         if zoom {
-            reader.inertia = None;
+            reader.kinetic.cancel_inertia();
             // Wheel up (positive) zooms in, anchored at the pointer.
             self.zoom_by(1.2f32.powf(dy / WHEEL_LINE), at, vp, cx);
             return;
@@ -1819,34 +1956,19 @@ impl Yomu {
             && (dx.abs() > 0.001 || dy.abs() > 0.001)
             && touch_phase != TouchPhase::Cancelled
         {
-            let dt = if is_new_gesture {
-                0.016
-            } else {
-                reader.last_motion_time.map_or(0.016, |t| {
-                    now.duration_since(t).as_secs_f32().clamp(0.001, 0.1)
-                })
-            };
-            reader.last_motion_time = Some(now);
             // Delta displacement in offset space is (-dx, -dy)
-            reader.velocity_tracker.push(dt, -dx, -dy);
+            reader.kinetic.push_motion(now, -dx, -dy);
         }
 
         if touch_phase == TouchPhase::Ended {
-            reader.last_motion_time = None;
-            if reader.animate && !self.reduce_motion {
-                let velocity = reader.velocity_tracker.velocity();
-                reader.inertia = InertialScroll::new(velocity);
-                if reader.inertia.is_some() {
-                    self.wake();
-                    cx.notify();
-                    return;
-                }
+            if reader
+                .kinetic
+                .end_touch(reader.animate && !self.reduce_motion)
+            {
+                self.wake();
+                cx.notify();
+                return;
             }
-        } else if touch_phase == TouchPhase::Cancelled {
-            reader.inertia = None;
-            reader.velocity_tracker.reset();
-            reader.last_motion_time = None;
-            return;
         }
 
         if reader.continuous {
@@ -1890,15 +2012,13 @@ impl Yomu {
 
     fn drag_start(&mut self, at: (f32, f32)) {
         if let Some(reader) = self.reader.as_mut() {
-            reader.inertia = None;
-            reader.velocity_tracker.reset();
+            reader.kinetic.reset();
             let off0 = reader.off;
             reader.drag = Some(Drag {
                 start: at,
                 off0,
                 moved: false,
                 last_at: at,
-                last_time: Instant::now(),
             });
         }
     }
@@ -1922,17 +2042,12 @@ impl Yomu {
             return;
         };
         let now = Instant::now();
-        let dt = now
-            .duration_since(drag.last_time)
-            .as_secs_f32()
-            .clamp(0.001, 0.1);
         let (step_x, step_y) = (at.0 - drag.last_at.0, at.1 - drag.last_at.1);
-        reader.velocity_tracker.push(dt, -step_x, -step_y);
+        reader.kinetic.push_motion(now, -step_x, -step_y);
 
         reader.drag = Some(Drag {
             moved: true,
             last_at: at,
-            last_time: now,
             ..drag
         });
         let target = (drag.off0.0 - dx, drag.off0.1 - dy);
@@ -1958,13 +2073,12 @@ impl Yomu {
             return;
         };
         if drag.moved {
-            if reader.animate && !self.reduce_motion {
-                let velocity = reader.velocity_tracker.velocity();
-                reader.inertia = InertialScroll::new(velocity);
-                if reader.inertia.is_some() {
-                    self.wake();
-                    cx.notify();
-                }
+            if reader
+                .kinetic
+                .end_touch(reader.animate && !self.reduce_motion)
+            {
+                self.wake();
+                cx.notify();
             }
             return;
         }
@@ -2459,7 +2573,7 @@ impl Yomu {
             .rounded(px(rounding_lg))
             .bg(self.menu_surface())
             .when(border_px > 0.0, |this| {
-                this.border(px(border_px)).border_color(self.colors.border)
+                this.border(px(border_px)).border_color(self.colors.accent)
             })
             .shadow_lg()
             .text_sm()
@@ -2553,7 +2667,7 @@ impl Yomu {
             .rounded(px(rounding_lg))
             .bg(self.menu_surface())
             .when(border_px > 0.0, |this| {
-                this.border(px(border_px)).border_color(self.colors.border)
+                this.border(px(border_px)).border_color(self.colors.accent)
             })
             .shadow_lg()
             .on_mouse_down(MouseButton::Left, |_: &MouseDownEvent, _, cx| {
@@ -2745,7 +2859,7 @@ impl Yomu {
             .rounded(px(rounding_xl))
             .bg(self.widget_surface(self.colors.surface))
             .when(border_px > 0.0, |this| {
-                this.border(px(border_px)).border_color(self.colors.border)
+                this.border(px(border_px)).border_color(self.colors.accent)
             })
             .shadow_lg()
             .text_sm()
@@ -2884,10 +2998,19 @@ impl Yomu {
                         "A folder name is suggested when the books share a parent folder. Edit it, or clear the field to leave them ungrouped.",
                     ))
                     .child(
-                        Input::new(&dialog.input)
-                            .id("series-name-input")
-                            .cleanable(true)
-                            .w_full(),
+                        div()
+                            .w_full()
+                            .rounded(px(self.radius_px()))
+                            .border_1()
+                            .border_color(self.colors.accent)
+                            .child(
+                                Input::new(&dialog.input)
+                                    .id("series-name-input")
+                                    .cleanable(true)
+                                    .bordered(false)
+                                    .focus_bordered(false)
+                                    .w_full(),
+                            ),
                     )
                     .child(
                         div()
@@ -3009,6 +3132,13 @@ impl Yomu {
                         .when(border_px > 0.0, |this| {
                             this.border(px(border_px)).border_color(self.colors.border)
                         })
+                        .hover(move |style| {
+                            if border_px > 0.0 {
+                                style.border_color(self.colors.accent)
+                            } else {
+                                style
+                            }
+                        })
                         .bg(self.widget_surface(self.colors.surface))
                         .children(rows),
                 )
@@ -3122,6 +3252,7 @@ impl Yomu {
                     .secondary()
                     .outline()
                     .bg(self.colors.surface)
+                    .border_color(self.colors.border)
                     .dropdown_menu_with_anchor(Anchor::TopRight, {
                         let yomu = yomu.clone();
                         move |mut menu, _window, _cx| {
@@ -3162,6 +3293,7 @@ impl Yomu {
                     .secondary()
                     .outline()
                     .bg(self.colors.surface)
+                    .border_color(self.colors.border)
                     .dropdown_menu_with_anchor(Anchor::TopRight, {
                         let yomu = yomu.clone();
                         move |mut menu, _window, _cx| {
@@ -3233,6 +3365,7 @@ impl Yomu {
                     .secondary()
                     .outline()
                     .bg(self.colors.surface)
+                    .border_color(self.colors.border)
                     .dropdown_menu_with_anchor(Anchor::TopRight, {
                         let yomu = yomu.clone();
                         move |mut menu, _window, _cx| {
@@ -3268,6 +3401,7 @@ impl Yomu {
                             yomu.update(cx, |this, cx| {
                                 this.library.settings_mut().group_series = checked;
                                 this.open_group = None;
+                                this.group_scroll.reset();
                                 this.save_library();
                                 cx.notify();
                             });
@@ -3297,6 +3431,7 @@ impl Yomu {
                     .secondary()
                     .outline()
                     .bg(self.colors.surface)
+                    .border_color(self.colors.border)
                     .dropdown_menu_with_anchor(Anchor::TopRight, {
                         let yomu = yomu.clone();
                         move |mut menu, _window, _cx| {
@@ -3475,6 +3610,13 @@ impl Yomu {
                                     this.border(px(border_px))
                                         .border_color(with_alpha(self.colors.border, 0.7))
                                 })
+                                .hover(move |style| {
+                                    if border_px > 0.0 {
+                                        style.border_color(self.colors.accent)
+                                    } else {
+                                        style
+                                    }
+                                })
                                 .bg(self.colors.surface)
                                 .text_xs()
                                 .font_weight(FontWeight::SEMIBOLD)
@@ -3517,12 +3659,28 @@ impl Yomu {
                             .when(border_px > 0.0, |this| {
                                 this.border(px(border_px)).border_color(self.colors.border)
                             })
+                            .hover(move |style| {
+                                if border_px > 0.0 {
+                                    style.border_color(self.colors.accent)
+                                } else {
+                                    style
+                                }
+                            })
                             .bg(self.widget_surface(self.colors.surface))
                             .child(
                                 div()
                                     .id("settings-shortcuts-scroll")
+                                    .track_scroll(&self.shortcuts_scroll.handle)
                                     .h(px(320.))
                                     .overflow_y_scroll()
+                                    .on_scroll_wheel(cx.listener(
+                                        |this, event: &ScrollWheelEvent, _, cx| {
+                                            this.shortcuts_scroll
+                                                .handle_scroll_wheel(event, this.reduce_motion);
+                                            this.wake();
+                                            cx.notify();
+                                        },
+                                    ))
                                     .child(table),
                             ),
                     )
@@ -3629,13 +3787,35 @@ impl Yomu {
         };
 
         let selected = self.selection.len();
+        let rounding_md = self.radius_px();
+        let is_search_focused = self.search_active;
 
         let search_field: AnyElement = if let Some(input) = &self.search_input {
-            Input::new(input)
-                .id("library-search")
-                .cleanable(true)
-                .prefix(Icon::new(IconName::Search).size(px(16.)))
+            div()
                 .w(px(360.))
+                .rounded(px(rounding_md))
+                .border_1()
+                .border_color(if is_search_focused {
+                    self.colors.accent
+                } else {
+                    self.colors.border
+                })
+                .hover(|style| {
+                    if !is_search_focused {
+                        style.border_color(self.colors.accent)
+                    } else {
+                        style
+                    }
+                })
+                .child(
+                    Input::new(input)
+                        .id("library-search")
+                        .cleanable(true)
+                        .bordered(false)
+                        .focus_bordered(false)
+                        .prefix(Icon::new(IconName::Search).size(px(16.)))
+                        .w_full(),
+                )
                 .into_any_element()
         } else {
             div().id("library-search").w(px(360.)).into_any_element()
@@ -3685,16 +3865,64 @@ impl Yomu {
             None
         };
 
+        let back_button = (self.open_group.is_some()).then(|| {
+            icon_button(
+                "group-back",
+                "Back to library",
+                IconName::ArrowLeft,
+                self.colors,
+                false,
+                cx.listener(|this, _: &ClickEvent, _, cx| {
+                    this.exit_group(cx);
+                }),
+            )
+        });
+
+        let left_controls = match (back_button, selection_controls) {
+            (Some(back), Some(sel)) => Some(
+                div()
+                    .absolute()
+                    .left_6()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_3()
+                    .child(back)
+                    .child(sel),
+            ),
+            (Some(back), None) => Some(
+                div()
+                    .absolute()
+                    .left_6()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .child(back),
+            ),
+            (None, Some(sel)) => Some(
+                div()
+                    .absolute()
+                    .left_6()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .child(sel),
+            ),
+            (None, None) => None,
+        };
+
+        let menu_open = matches!(self.overlay, Some(Overlay::LibraryMenu(_)));
         let header = div()
             .relative()
+            .w_full()
             .flex()
             .flex_row()
             .flex_none()
             .items_center()
             .h(px(72.))
             .px_6()
-            .children(selection_controls.map(|controls| div().absolute().left_6().child(controls)))
-            .when(selected == 0, |h| {
+            .children(left_controls)
+            .when(selected == 0 && self.open_group.is_none(), |h| {
                 #[cfg(test)]
                 {
                     h.child(div().debug_selector(|| "add-files".into()).size_0())
@@ -3718,6 +3946,7 @@ impl Yomu {
                 "Open menu",
                 IconName::Menu,
                 self.colors,
+                menu_open,
                 cx.listener(|this, _: &ClickEvent, window, cx| {
                     if matches!(this.overlay, Some(Overlay::LibraryMenu(_))) {
                         this.close_overlay(cx);
@@ -3768,45 +3997,41 @@ impl Yomu {
                 .into_any_element()
         } else if self.library.settings().group_series {
             let groups = directory_groups(all_books);
-            let visible_groups: Vec<_> = groups
-                .iter()
-                .filter_map(|group| {
-                    let members: Vec<_> = group
-                        .books
-                        .iter()
-                        .copied()
-                        .filter(|book| books.iter().any(|visible| visible.id == book.id))
-                        .collect();
-                    (!members.is_empty()).then_some((group, members))
-                })
-                .collect();
+            let visible_groups: Vec<_> = if self.search_query.trim().is_empty() {
+                groups
+                    .iter()
+                    .filter_map(|group| {
+                        (!group.books.is_empty()).then_some((group, group.books.clone()))
+                    })
+                    .collect()
+            } else {
+                let visible_ids: HashSet<&str> = books.iter().map(|b| b.id.as_str()).collect();
+                groups
+                    .iter()
+                    .filter_map(|group| {
+                        let members: Vec<_> = group
+                            .books
+                            .iter()
+                            .copied()
+                            .filter(|book| visible_ids.contains(book.id.as_str()))
+                            .collect();
+                        (!members.is_empty()).then_some((group, members))
+                    })
+                    .collect()
+            };
             if let Some(open_key) = self.open_group.as_deref()
                 && let Some((group, members)) = visible_groups
                     .iter()
                     .find(|(group, _)| group.key == open_key)
             {
                 let mut content = div().flex().flex_col().gap_4().child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_3()
-                        .child(icon_button(
-                            "group-back",
-                            "Back to library",
-                            IconName::ArrowLeft,
-                            self.colors,
-                            cx.listener(|this, _: &ClickEvent, _, cx| {
-                                this.open_group = None;
-                                cx.notify();
-                            }),
-                        ))
-                        .child(
-                            div()
-                                .text_lg()
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(self.colors.foreground)
-                                .child(format!("{} · {}", group.name, members.len())),
-                        ),
+                    div().flex().items_center().gap_3().child(
+                        div()
+                            .text_lg()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(self.colors.foreground)
+                            .child(format!("{} · {}", group.name, members.len())),
+                    ),
                 );
                 content = content.child(make_grid(
                     members
@@ -3815,10 +4040,23 @@ impl Yomu {
                         .collect(),
                 ));
                 div()
-                    .id("grid")
+                    .id("group-grid")
+                    .track_scroll(&self.group_scroll.handle)
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()
+                    .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _, cx| {
+                        this.group_scroll
+                            .handle_scroll_wheel(event, this.reduce_motion);
+                        this.wake();
+                        cx.notify();
+                    }))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _: &MouseDownEvent, _, _| {
+                            this.catch_ui_inertia();
+                        }),
+                    )
                     .px_6()
                     .pb_6()
                     .child(content)
@@ -3840,9 +4078,22 @@ impl Yomu {
                 cards.extend(loose_books.iter().map(|book| self.book_card(book, cx)));
                 div()
                     .id("grid")
+                    .track_scroll(&self.library_scroll.handle)
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()
+                    .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _, cx| {
+                        this.library_scroll
+                            .handle_scroll_wheel(event, this.reduce_motion);
+                        this.wake();
+                        cx.notify();
+                    }))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _: &MouseDownEvent, _, _| {
+                            this.catch_ui_inertia();
+                        }),
+                    )
                     .px_6()
                     .pb_6()
                     .child(make_grid(cards))
@@ -3851,9 +4102,22 @@ impl Yomu {
         } else {
             div()
                 .id("grid")
+                .track_scroll(&self.library_scroll.handle)
                 .flex_1()
                 .min_h_0()
                 .overflow_y_scroll()
+                .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _, cx| {
+                    this.library_scroll
+                        .handle_scroll_wheel(event, this.reduce_motion);
+                    this.wake();
+                    cx.notify();
+                }))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _: &MouseDownEvent, _, _| {
+                        this.catch_ui_inertia();
+                    }),
+                )
                 .px_6()
                 .pb_6()
                 .child(make_grid(
@@ -3925,8 +4189,7 @@ impl Yomu {
                 })
             })
             .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                this.open_group = Some(group_key.clone());
-                cx.notify();
+                this.enter_group(group_key.clone(), cx);
             }))
             .child(
                 div()
@@ -4078,9 +4341,21 @@ impl Yomu {
                     style.shadow_md()
                 })
             })
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _: &MouseDownEvent, _, _| {
+                    this.catch_ui_inertia();
+                }),
+            )
             // `on_click` only ever fires for the left button, so right-clicking never opens a book.
             .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                 if this.overlay_recently_closed() {
+                    return;
+                }
+                if this
+                    .scroll_caught_at
+                    .is_some_and(|t| t.elapsed() < SCROLL_CATCH_GUARD)
+                {
                     return;
                 }
                 // Ctrl/Shift-click, or any click while books are selected, edits the selection;
@@ -4267,7 +4542,7 @@ impl Yomu {
                 .flex_col()
                 .rounded(px(rounding_lg))
                 .when(border_px > 0.0, |this| {
-                    this.border(px(border_px)).border_color(self.colors.border)
+                    this.border(px(border_px)).border_color(self.colors.accent)
                 })
                 .bg(self.colors.surface)
                 .shadow_lg()
@@ -4416,6 +4691,40 @@ impl Yomu {
             )
             .into_any_element()
     }
+
+    fn sync_ui_scroll(&mut self, dt: f32) -> bool {
+        let mut moving = false;
+        if self.library_scroll.step(dt, self.reduce_motion) {
+            moving = true;
+        }
+        if self.group_scroll.step(dt, self.reduce_motion) {
+            moving = true;
+        }
+        if self.shortcuts_scroll.step(dt, self.reduce_motion) {
+            moving = true;
+        }
+        moving
+    }
+
+    fn catch_ui_inertia(&mut self) -> bool {
+        let mut caught = false;
+        if self.library_scroll.has_active_inertia() {
+            self.library_scroll.reset();
+            caught = true;
+        }
+        if self.group_scroll.has_active_inertia() {
+            self.group_scroll.reset();
+            caught = true;
+        }
+        if self.shortcuts_scroll.has_active_inertia() {
+            self.shortcuts_scroll.reset();
+            caught = true;
+        }
+        if caught {
+            self.scroll_caught_at = Some(Instant::now());
+        }
+        caught
+    }
 }
 
 impl Render for Yomu {
@@ -4427,11 +4736,16 @@ impl Render for Yomu {
         // ask for another frame while something is actually moving.
         let now = Instant::now();
         let dt = self.frame_delta(now);
-        if self.sync_reader(window, cx, dt) {
+        let mut animating = self.sync_reader(window, cx, dt);
+        if self.sync_ui_scroll(dt) {
+            animating = true;
+        }
+        if animating {
             self.last_frame = Some(now);
             window.request_animation_frame();
         } else {
             self.last_frame = None;
+            self.dt_smoothed = None;
         }
         // Textures that a finished slide just let go of are not drawn this frame, so free them
         // now rather than waiting for a frame that an idle window might never draw.
@@ -4483,6 +4797,7 @@ impl Render for Yomu {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                    this.catch_ui_inertia();
                     if this.search_active {
                         this.deactivate_search(cx);
                     }
@@ -4725,6 +5040,7 @@ fn icon_button(
     label: &'static str,
     icon: IconName,
     colors: UiColors,
+    active: bool,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> AnyElement {
     let button = Button::new(id)
@@ -4733,12 +5049,22 @@ fn icon_button(
         .rounded(ButtonRounded::Medium)
         .small()
         .ghost()
-        .text_color(colors.foreground)
+        .outline()
+        .border_color(if active { colors.accent } else { colors.border })
+        .text_color(if active {
+            colors.accent
+        } else {
+            colors.foreground
+        })
         .bg(colors.surface)
         // Render the bundled SVG directly so its theme color is explicit. The
         // Button icon convenience path inherits a color from Kit's component
         // theme, which can be transparent against custom/translucent surfaces.
-        .child(Icon::new(icon).size_4().text_color(colors.foreground))
+        .child(Icon::new(icon).size_4().text_color(if active {
+            colors.accent
+        } else {
+            colors.foreground
+        }))
         .on_click(on_click);
     #[cfg(test)]
     {

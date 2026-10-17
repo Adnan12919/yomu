@@ -6,6 +6,8 @@
 //! or 240 Hz. No timers and no animation queue: callers advance the state once per rendered frame
 //! and stop asking for frames when nothing is moving.
 
+use std::time::{Duration, Instant};
+
 /// How long a page turn slides for.
 pub const PAGE_TURN_SECS: f32 = 0.16;
 /// Page turns that interrupt a running one (holding a key, mashing the wheel) are quicker so the
@@ -67,7 +69,7 @@ pub const INERTIA_MIN_VELOCITY: f32 = 80.0;
 /// Rolling-window velocity estimator for touchpad and touchscreen gestures.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct VelocityTracker {
-    samples: [(f32, f32, f32); 4],
+    samples: [(f32, f32, f32); 8],
     count: usize,
 }
 
@@ -80,7 +82,7 @@ impl Default for VelocityTracker {
 impl VelocityTracker {
     pub const fn new() -> Self {
         Self {
-            samples: [(0.0, 0.0, 0.0); 4],
+            samples: [(0.0, 0.0, 0.0); 8],
             count: 0,
         }
     }
@@ -94,32 +96,37 @@ impl VelocityTracker {
         if dt <= 0.0 || !dt.is_finite() {
             return;
         }
-        let idx = self.count % 4;
+        let idx = self.count % 8;
         self.samples[idx] = (dt, dx, dy);
         self.count += 1;
     }
 
     /// Estimated exit velocity (pixels per second) based on recent samples.
     pub fn velocity(&self) -> (f32, f32) {
-        let n = self.count.min(4);
+        let n = self.count.min(8);
         if n < 2 {
             return (0.0, 0.0);
         }
         let mut total_dt = 0.0;
-        let mut total_dx = 0.0;
-        let mut total_dy = 0.0;
+        let mut weighted_dt = 0.0;
+        let mut weighted_dx = 0.0;
+        let mut weighted_dy = 0.0;
         for i in 0..n {
-            let idx = (self.count + 4 - 1 - i) % 4;
+            let idx = (self.count + 8 - 1 - i) % 8;
             let (dt, dx, dy) = self.samples[idx];
+            // Exponential recency weighting: recent samples (i=0) have full weight (1.0),
+            // older samples decay smoothly so exit flick speed is preserved without drop cliff.
+            let weight = (-(i as f32) * 0.5).exp();
             total_dt += dt;
-            total_dx += dx;
-            total_dy += dy;
+            weighted_dt += dt * weight;
+            weighted_dx += dx * weight;
+            weighted_dy += dy * weight;
             if total_dt >= 0.12 {
                 break;
             }
         }
-        if total_dt > 0.001 {
-            (total_dx / total_dt, total_dy / total_dt)
+        if weighted_dt > 0.001 {
+            (weighted_dx / weighted_dt, weighted_dy / weighted_dt)
         } else {
             (0.0, 0.0)
         }
@@ -165,6 +172,160 @@ impl InertialScroll {
         }
 
         ((delta_x, delta_y), still_moving)
+    }
+}
+
+/// Stillness duration (fingers lifted off touchpad) before initiating inertia if no release event arrived.
+pub const INERTIA_STILLNESS_THRESHOLD: Duration = Duration::from_millis(18);
+/// Maximum interval after touch stillness where release momentum is still valid.
+/// If more than this time has passed, the fingers were brought to a stop before lifting.
+pub const INERTIA_MAX_RELEASE_GAP: Duration = Duration::from_millis(100);
+/// Maximum interval between touch moves before treating the next move as a new gesture.
+pub const INERTIA_GESTURE_TIMEOUT: Duration = Duration::from_millis(150);
+
+/// Unified touch and drag gesture tracker and kinetic inertia state machine.
+#[derive(Debug, Clone, PartialEq)]
+pub struct KineticScroll {
+    pub tracker: VelocityTracker,
+    pub last_motion_time: Option<Instant>,
+    pub inertia: Option<InertialScroll>,
+}
+
+impl Default for KineticScroll {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl KineticScroll {
+    pub const fn new() -> Self {
+        Self {
+            tracker: VelocityTracker::new(),
+            last_motion_time: None,
+            inertia: None,
+        }
+    }
+
+    /// Reset all momentum, samples, and gesture state.
+    pub fn reset(&mut self) {
+        self.tracker.reset();
+        self.last_motion_time = None;
+        self.inertia = None;
+    }
+
+    /// Cancel only the actively running inertial glide without resetting tracked velocity.
+    pub fn cancel_inertia(&mut self) {
+        self.inertia = None;
+    }
+
+    /// True if an inertial glide simulation is actively running.
+    pub fn has_active_inertia(&self) -> bool {
+        self.inertia.is_some()
+    }
+
+    /// True if a touch gesture was active and is awaiting a release event or stillness timeout.
+    pub fn is_awaiting_release(&self) -> bool {
+        self.last_motion_time.is_some()
+    }
+
+    /// True if either an inertial glide is running or a touch gesture is awaiting stillness timeout.
+    pub fn is_active(&self) -> bool {
+        self.inertia.is_some() || self.last_motion_time.is_some()
+    }
+
+    /// Record a motion displacement `(dx, dy)` at `now`.
+    pub fn push_motion(&mut self, now: Instant, dx: f32, dy: f32) {
+        let is_new_gesture = self
+            .last_motion_time
+            .is_none_or(|t| now.duration_since(t) > INERTIA_GESTURE_TIMEOUT);
+
+        if is_new_gesture {
+            self.tracker.reset();
+            self.inertia = None;
+        }
+
+        let dt = if is_new_gesture {
+            0.016
+        } else {
+            self.last_motion_time.map_or(0.016, |t| {
+                now.duration_since(t).as_secs_f32().clamp(0.001, 0.1)
+            })
+        };
+        self.last_motion_time = Some(now);
+        self.tracker.push(dt, dx, dy);
+    }
+
+    /// Handle gesture completion (touch lifted). Starts inertia if allowed by preferences.
+    /// Returns true if inertia was successfully initiated.
+    pub fn end_touch(&mut self, allow_inertia: bool) -> bool {
+        let now = Instant::now();
+        let was_recent = self
+            .last_motion_time
+            .is_some_and(|t| now.duration_since(t) <= INERTIA_MAX_RELEASE_GAP);
+        self.last_motion_time = None;
+        if allow_inertia && was_recent {
+            let velocity = self.tracker.velocity();
+            self.inertia = InertialScroll::new(velocity);
+            self.inertia.is_some()
+        } else {
+            self.tracker.reset();
+            self.inertia = None;
+            false
+        }
+    }
+
+    /// Check if stillness timeout has elapsed (e.g. on Linux where `Ended` was omitted).
+    /// If elapsed, initiates inertia from tracked velocity. Returns true if inertia was started.
+    pub fn check_stillness_timeout(&mut self, now: Instant, allow_inertia: bool) -> bool {
+        if self.inertia.is_none()
+            && let Some(last_time) = self.last_motion_time
+        {
+            let elapsed = now.duration_since(last_time);
+            if elapsed >= INERTIA_STILLNESS_THRESHOLD {
+                self.last_motion_time = None;
+                if allow_inertia && elapsed <= INERTIA_MAX_RELEASE_GAP {
+                    let velocity = self.tracker.velocity();
+                    self.inertia = InertialScroll::new(velocity);
+                    return self.inertia.is_some();
+                } else {
+                    self.tracker.reset();
+                }
+            }
+        }
+        false
+    }
+
+    /// Advance active inertia by `dt` seconds.
+    /// Returns `Some((dx, dy))` if inertia is active and stepped, or `None` if inactive.
+    pub fn step(&mut self, dt: f32) -> Option<(f32, f32)> {
+        if let Some(mut inertia) = self.inertia.take() {
+            let (disp, still) = inertia.step(dt);
+            if still {
+                self.inertia = Some(inertia);
+            }
+            Some(disp)
+        } else {
+            None
+        }
+    }
+
+    /// Update the remaining velocity vector (e.g. when clamping against boundaries).
+    /// If speed drops below the stopping threshold, inertia is automatically ended.
+    pub fn clamp_velocity(&mut self, clamp_x: bool, clamp_y: bool) {
+        if let Some(inertia) = self.inertia.as_mut() {
+            if clamp_x {
+                inertia.velocity.0 = 0.0;
+            }
+            if clamp_y {
+                inertia.velocity.1 = 0.0;
+            }
+            let speed = (inertia.velocity.0 * inertia.velocity.0
+                + inertia.velocity.1 * inertia.velocity.1)
+                .sqrt();
+            if speed < INERTIA_STOP_VELOCITY {
+                self.inertia = None;
+            }
+        }
     }
 }
 
@@ -486,6 +647,19 @@ mod tests {
         let (vx, vy) = tracker.velocity();
         assert_eq!(vx, 0.0);
         assert!((vy - 625.0).abs() < 1.0, "velocity {vy}");
+    }
+
+    #[test]
+    fn velocity_tracker_recency_weighting_favors_exit_speed() {
+        let mut tracker = VelocityTracker::new();
+        // Accelerating flick: 4px in 16ms (250px/s), then 8px in 16ms (500px/s), then 16px in 16ms (1000px/s)
+        tracker.push(0.016, 0.0, 4.0);
+        tracker.push(0.016, 0.0, 8.0);
+        tracker.push(0.016, 0.0, 16.0);
+        let (_, vy) = tracker.velocity();
+        // Unweighted average would be 28 / 0.048 = 583.3 px/s.
+        // Recency-weighted estimate is significantly closer to the 1000 px/s exit speed (> 680 px/s).
+        assert!(vy > 680.0, "weighted exit velocity {vy} should be > 680");
     }
 
     #[test]

@@ -93,7 +93,11 @@ pub fn panel_button(
         .disabled(!enabled)
         .on_click(on_click);
     let button = match kind {
-        ButtonKind::Normal => button.secondary().outline().bg(colors.surface),
+        ButtonKind::Normal => button
+            .secondary()
+            .outline()
+            .bg(colors.surface)
+            .border_color(colors.border),
         ButtonKind::Primary => button.primary().bg(colors.accent),
         ButtonKind::Danger => button.danger().outline(),
     };

@@ -816,6 +816,92 @@ fn escape_and_backspace_exit_open_group(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
+fn top_bar_back_button_exits_group_and_resets_scroll(cx: &mut TestAppContext) {
+    let fx = fixture("backbutton");
+    let (view, cx) = launch(&fx, cx);
+
+    // When no group is open, group-back button is not rendered
+    assert!(cx.debug_bounds("group-back").is_none());
+
+    // Enter a group in the library
+    view.update(cx, |this, cx| {
+        this.open_group = Some("series:test".into());
+        cx.notify();
+    });
+    cx.run_until_parked();
+
+    // The group-back button is now visible in the persistent top bar header
+    let back = cx
+        .debug_bounds("group-back")
+        .expect("group-back is in the top bar when group is open");
+    click(cx, back.center(), MouseButton::Left);
+    cx.run_until_parked();
+
+    assert_eq!(
+        view.read_with(cx, |this, _| this.open_group.clone()),
+        None,
+        "clicking group-back exits group"
+    );
+}
+
+#[gpui_kit::test]
+fn group_view_scroll_is_independent_from_library_grid_scroll(cx: &mut TestAppContext) {
+    let fx = fixture("groupscroll");
+    let (view, cx) = launch(&fx, cx);
+
+    view.update(cx, |this, _| {
+        this.library.settings_mut().group_series = true;
+    });
+
+    let group_key = view.read_with(cx, |this, _| {
+        directory_groups(this.library.books())[0].key.clone()
+    });
+
+    // Simulate user having scrolled down in the library grid
+    view.update(cx, |this, _| {
+        this.library_scroll
+            .handle
+            .set_offset(point(px(0.), px(-600.)));
+    });
+
+    // Enter a group
+    view.update(cx, |this, cx| {
+        this.enter_group(group_key, cx);
+    });
+    cx.run_until_parked();
+
+    // Group view MUST open at the top (offset 0), not inheriting the -600px library scroll
+    let group_offset = view.read_with(cx, |this, _| this.group_scroll.handle.offset());
+    assert_eq!(
+        group_offset.y,
+        px(0.),
+        "group view must open at row 0 (top)"
+    );
+
+    // Library grid's scroll position is preserved while group is open
+    let lib_offset = view.read_with(cx, |this, _| this.library_scroll.handle.offset());
+    assert_eq!(
+        lib_offset.y,
+        px(-600.),
+        "library scroll position must be preserved"
+    );
+
+    // Exit group
+    view.update(cx, |this, cx| {
+        this.exit_group(cx);
+    });
+
+    assert_eq!(view.read_with(cx, |this, _| this.open_group.clone()), None);
+    // Group scroll is reset on exit so reopening any group starts fresh at top
+    let group_offset_after = view.read_with(cx, |this, _| this.group_scroll.handle.offset());
+    assert_eq!(
+        group_offset_after.y,
+        px(0.),
+        "group scroll is reset on exit"
+    );
+}
+
+#[gpui_kit::test]
 fn delete_removes_the_selection_at_once_when_nothing_is_lost(cx: &mut TestAppContext) {
     let fx = fixture("bulkdelete");
     let (view, cx) = launch(&fx, cx);
@@ -1791,7 +1877,7 @@ fn touchpad_flick_triggers_inertial_scroll_glide(cx: &mut TestAppContext) {
 
         let reader = this.reader.as_ref().unwrap();
         assert!(
-            reader.inertia.is_some(),
+            reader.kinetic.has_active_inertia(),
             "inertia must be active after flick"
         );
     });
@@ -1804,7 +1890,7 @@ fn touchpad_flick_triggers_inertial_scroll_glide(cx: &mut TestAppContext) {
         "inertial glide carried past the physical touch release"
     );
     assert!(
-        with_reader(&view, cx, |r| r.inertia.is_none()),
+        with_reader(&view, cx, |r| r.kinetic.inertia.is_none()),
         "inertia halts cleanly when done"
     );
 }
@@ -1848,7 +1934,7 @@ fn touchpad_flick_without_ended_event_triggers_inertia_on_linux(cx: &mut TestApp
         );
         // Simulate 40ms passing without new events (fingers lifted off pad)
         if let Some(reader) = this.reader.as_mut() {
-            reader.last_motion_time = Some(Instant::now() - Duration::from_millis(40));
+            reader.kinetic.last_motion_time = Some(Instant::now() - Duration::from_millis(40));
         }
     });
 
@@ -1860,7 +1946,7 @@ fn touchpad_flick_without_ended_event_triggers_inertia_on_linux(cx: &mut TestApp
         "inertial glide carried past the physical touch release on Linux"
     );
     assert!(
-        with_reader(&view, cx, |r| r.inertia.is_none()),
+        with_reader(&view, cx, |r| r.kinetic.inertia.is_none()),
         "inertia halts cleanly when done"
     );
 }
@@ -1900,7 +1986,7 @@ fn touch_down_mid_inertia_cancels_immediately(cx: &mut TestAppContext) {
             ),
             cx,
         );
-        assert!(this.reader.as_ref().unwrap().inertia.is_some());
+        assert!(this.reader.as_ref().unwrap().kinetic.has_active_inertia());
 
         // User touches the touchpad again:
         this.on_wheel(
@@ -1915,10 +2001,149 @@ fn touch_down_mid_inertia_cancels_immediately(cx: &mut TestAppContext) {
             cx,
         );
         assert!(
-            this.reader.as_ref().unwrap().inertia.is_none(),
+            this.reader.as_ref().unwrap().kinetic.inertia.is_none(),
             "touch started cancels inertia"
         );
     });
+}
+
+#[test]
+fn ui_scroll_controller_flick_inertia_and_touch_catch() {
+    let mut controller = UiScrollController::new();
+
+    let event_start = ScrollWheelEvent {
+        position: point(px(0.), px(0.)),
+        delta: ScrollDelta::Pixels(point(px(0.), px(0.))),
+        modifiers: Modifiers::default(),
+        touch_phase: TouchPhase::Started,
+    };
+    controller.handle_scroll_wheel(&event_start, false);
+    assert!(controller.kinetic.inertia.is_none());
+    assert!(controller.kinetic.last_motion_time.is_none());
+
+    let event_move1 = ScrollWheelEvent {
+        position: point(px(0.), px(0.)),
+        delta: ScrollDelta::Pixels(point(px(0.), px(-40.))),
+        modifiers: Modifiers::default(),
+        touch_phase: TouchPhase::Moved,
+    };
+    controller.handle_scroll_wheel(&event_move1, false);
+    assert!(controller.kinetic.last_motion_time.is_some());
+
+    let event_move2 = ScrollWheelEvent {
+        position: point(px(0.), px(0.)),
+        delta: ScrollDelta::Pixels(point(px(0.), px(-60.))),
+        modifiers: Modifiers::default(),
+        touch_phase: TouchPhase::Moved,
+    };
+    controller.handle_scroll_wheel(&event_move2, false);
+
+    let event_end = ScrollWheelEvent {
+        position: point(px(0.), px(0.)),
+        delta: ScrollDelta::Pixels(point(px(0.), px(0.))),
+        modifiers: Modifiers::default(),
+        touch_phase: TouchPhase::Ended,
+    };
+    controller.handle_scroll_wheel(&event_end, false);
+    assert!(controller.has_active_inertia());
+    assert!(controller.kinetic.inertia.is_some());
+
+    let moving = controller.step(0.016, false);
+    assert!(moving, "inertia should be active");
+
+    // Touch down mid-inertia cancels immediately (touch catch)
+    controller.handle_scroll_wheel(&event_start, false);
+    assert!(!controller.has_active_inertia());
+    assert!(controller.kinetic.inertia.is_none());
+}
+
+#[test]
+fn ui_scroll_controller_reduced_motion() {
+    let mut controller = UiScrollController::new();
+
+    let event_start = ScrollWheelEvent {
+        position: point(px(0.), px(0.)),
+        delta: ScrollDelta::Pixels(point(px(0.), px(0.))),
+        modifiers: Modifiers::default(),
+        touch_phase: TouchPhase::Started,
+    };
+    controller.handle_scroll_wheel(&event_start, true);
+
+    let event_move = ScrollWheelEvent {
+        position: point(px(0.), px(0.)),
+        delta: ScrollDelta::Pixels(point(px(0.), px(-80.))),
+        modifiers: Modifiers::default(),
+        touch_phase: TouchPhase::Moved,
+    };
+    controller.handle_scroll_wheel(&event_move, true);
+
+    let event_end = ScrollWheelEvent {
+        position: point(px(0.), px(0.)),
+        delta: ScrollDelta::Pixels(point(px(0.), px(0.))),
+        modifiers: Modifiers::default(),
+        touch_phase: TouchPhase::Ended,
+    };
+    controller.handle_scroll_wheel(&event_end, true);
+
+    assert!(!controller.has_active_inertia());
+    assert!(controller.kinetic.inertia.is_none());
+    assert!(!controller.step(0.016, true));
+}
+
+#[test]
+fn ui_scroll_controller_linux_stillness_fallback() {
+    let mut controller = UiScrollController::new();
+
+    let event_move1 = ScrollWheelEvent {
+        position: point(px(0.), px(0.)),
+        delta: ScrollDelta::Pixels(point(px(0.), px(-40.))),
+        modifiers: Modifiers::default(),
+        touch_phase: TouchPhase::Moved,
+    };
+    controller.handle_scroll_wheel(&event_move1, false);
+
+    let event_move2 = ScrollWheelEvent {
+        position: point(px(0.), px(0.)),
+        delta: ScrollDelta::Pixels(point(px(0.), px(-60.))),
+        modifiers: Modifiers::default(),
+        touch_phase: TouchPhase::Moved,
+    };
+    controller.handle_scroll_wheel(&event_move2, false);
+
+    // Immediately after motion (<35ms), controller keeps frame loop alive while awaiting release
+    assert!(controller.step(0.016, false));
+    assert!(controller.kinetic.inertia.is_none());
+    assert!(controller.kinetic.is_awaiting_release());
+
+    // Simulate 40ms passing without Ended event (touchpad release without Ended)
+    controller.kinetic.last_motion_time = Some(Instant::now() - Duration::from_millis(40));
+
+    // Next step triggers inertia from stillness fallback
+    let running = controller.step(0.016, false);
+    assert!(running);
+    assert!(controller.kinetic.inertia.is_some());
+}
+
+#[test]
+fn ui_scroll_controller_stale_timeout_never_triggers_inertia() {
+    let mut controller = UiScrollController::new();
+
+    let event_move = ScrollWheelEvent {
+        position: point(px(0.), px(0.)),
+        delta: ScrollDelta::Pixels(point(px(0.), px(-50.))),
+        modifiers: Modifiers::default(),
+        touch_phase: TouchPhase::Moved,
+    };
+    controller.handle_scroll_wheel(&event_move, false);
+
+    // Simulate 200ms passing (stale motion, finger stopped on pad or long pause)
+    controller.kinetic.last_motion_time = Some(Instant::now() - Duration::from_millis(200));
+
+    // Must NOT trigger inertia when stale!
+    let running = controller.step(0.016, false);
+    assert!(!running);
+    assert!(controller.kinetic.inertia.is_none());
+    assert!(!controller.kinetic.is_active());
 }
 
 #[gpui_kit::test]

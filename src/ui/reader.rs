@@ -4,7 +4,7 @@ use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
     sync::Arc,
-    time::{Duration, Instant},
+    time::Instant,
 };
 
 use gpui_kit::{RenderImage, TouchPhase, Window};
@@ -12,7 +12,7 @@ use yomu::{
     archive::SourceKind,
     layout::{self, Arrive, FitMode, Viewport},
     library::{Book, Settings},
-    motion::{self, InertialScroll, PageTransition, VelocityTracker},
+    motion::{self, KineticScroll, PageTransition},
     vim::Vim,
 };
 
@@ -49,7 +49,6 @@ pub struct Drag {
     pub off0: (f32, f32),
     pub moved: bool,
     pub last_at: (f32, f32),
-    pub last_time: Instant,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -136,9 +135,7 @@ pub struct Reader {
 
     pub vim: Vim,
     pub drag: Option<Drag>,
-    pub inertia: Option<InertialScroll>,
-    pub velocity_tracker: VelocityTracker,
-    pub last_motion_time: Option<Instant>,
+    pub kinetic: KineticScroll,
     /// Where `''` jumps back to.
     pub back_page: Option<usize>,
     pub show_info: bool,
@@ -175,9 +172,7 @@ impl Reader {
             error: None,
             vim: Vim::new(),
             drag: None,
-            inertia: None,
-            velocity_tracker: VelocityTracker::new(),
-            last_motion_time: None,
+            kinetic: KineticScroll::new(),
             back_page: None,
             show_info: false,
             show_help: false,
@@ -424,7 +419,7 @@ impl Reader {
         }
         if !self.animate {
             self.cancel_transition();
-            self.inertia = None;
+            self.kinetic.cancel_inertia();
             self.off = self.scroll_target;
             return false;
         }
@@ -448,24 +443,17 @@ impl Reader {
         }
 
         let mut motion_active = false;
-        if self.inertia.is_none()
-            && let Some(last_time) = self.last_motion_time
+        if self
+            .kinetic
+            .check_stillness_timeout(Instant::now(), self.animate)
         {
-            let elapsed = Instant::now().duration_since(last_time);
-            if elapsed >= Duration::from_millis(35) {
-                self.last_motion_time = None;
-                if self.animate {
-                    let velocity = self.velocity_tracker.velocity();
-                    self.inertia = InertialScroll::new(velocity);
-                }
-            } else {
-                motion_active = true;
-            }
+            // Started inertia from stillness
+        } else if self.kinetic.is_awaiting_release() {
+            motion_active = true;
         }
 
         let mut moving = false;
-        if let Some(mut inertia) = self.inertia.take() {
-            let ((dx, dy), still) = inertia.step(dt);
+        if let Some((dx, dy)) = self.kinetic.step(dt) {
             let (max_w, max_h) = if self.continuous {
                 let doc_height = self.continuous_total_height(vp);
                 let w = (self.viewport.width * self.zoom - vp.width).max(0.0);
@@ -480,24 +468,16 @@ impl Reader {
             let next_x = (self.off.0 + dx).clamp(0.0, max_w);
             let next_y = (self.off.1 + dy).clamp(0.0, max_h);
 
-            if next_x == 0.0 || next_x == max_w {
-                inertia.velocity.0 = 0.0;
-            }
-            if next_y == 0.0 || next_y == max_h {
-                inertia.velocity.1 = 0.0;
-            }
+            self.kinetic.clamp_velocity(
+                next_x == 0.0 || next_x == max_w,
+                next_y == 0.0 || next_y == max_h,
+            );
 
             self.off = (next_x, next_y);
             self.scroll_target = self.off;
 
-            let speed = (inertia.velocity.0 * inertia.velocity.0
-                + inertia.velocity.1 * inertia.velocity.1)
-                .sqrt();
-            if still && speed >= motion::INERTIA_STOP_VELOCITY {
-                self.inertia = Some(inertia);
+            if self.kinetic.has_active_inertia() {
                 moving = true;
-            } else {
-                self.inertia = None;
             }
         } else {
             let (off, is_moving) = motion::step_scroll(self.off, self.scroll_target, dt);
