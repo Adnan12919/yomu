@@ -3895,6 +3895,12 @@ impl Yomu {
         let card_h = thumb_size.card_height();
         let border_px = self.border_px();
         let rounding_lg = self.radius_lg_px();
+        let inner_radius = if border_px > 0.0 {
+            (rounding_lg - border_px).max(0.0)
+        } else {
+            rounding_lg
+        };
+
         div()
             .id(SharedString::from(format!("folder-{}", group.key)))
             .w(px(card_w))
@@ -3925,15 +3931,17 @@ impl Yomu {
             .child(
                 div()
                     .relative()
-                    .w(px(card_w))
+                    .w_full()
                     .h(px(card_h))
+                    .flex_none()
                     .overflow_hidden()
-                    .rounded(px(rounding_lg))
+                    .rounded_t(px(inner_radius))
                     .bg(self.widget_surface(self.colors.surface))
                     .child(
                         img(self.dirs.cover_for_size(&first.id, thumb_size))
                             .w_full()
                             .h_full()
+                            .rounded_t(px(inner_radius))
                             .object_fit(ObjectFit::Cover),
                     )
                     .child(
@@ -3945,14 +3953,35 @@ impl Yomu {
                     ),
             )
             .child(
-                div().flex_1().flex().flex_col().p_3().child(
-                    div()
-                        .min_h(px(46.))
-                        .text_sm()
-                        .font_weight(FontWeight::MEDIUM)
-                        .text_color(self.colors.foreground)
-                        .child(group.name.clone()),
-                ),
+                div()
+                    .flex_1()
+                    .flex()
+                    .flex_col()
+                    .justify_between()
+                    .gap_2()
+                    .p_3()
+                    .child(
+                        div()
+                            .h(px(40.))
+                            .line_clamp(2)
+                            .text_sm()
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(self.colors.foreground)
+                            .child(group.name.clone()),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .child(div().h(px(4.)))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(self.colors.muted)
+                                    .child(format!("{} volumes", books.len())),
+                            ),
+                    ),
             )
             .into_any_element()
     }
@@ -3980,30 +4009,30 @@ impl Yomu {
         let selected = self.selection.contains(&book.id);
         let border_px = self.border_px();
         let rounding_lg = self.radius_lg_px();
+        let card_border = if selected {
+            border_px.max(2.0)
+        } else {
+            border_px
+        };
+        let inner_radius = if card_border > 0.0 {
+            (rounding_lg - card_border).max(0.0)
+        } else {
+            rounding_lg
+        };
+
         let cover = div()
             .relative()
-            .w(px(card_w))
+            .w_full()
             .h(px(card_h))
             .flex_none()
-            .rounded(px(rounding_lg))
+            .rounded_t(px(inner_radius))
             .overflow_hidden()
             .bg(self.widget_surface(self.colors.surface))
-            .when(border_px > 0.0 || selected, |this| {
-                this.border(px(if selected {
-                    border_px.max(2.0)
-                } else {
-                    border_px
-                }))
-                .border_color(if selected {
-                    self.colors.accent
-                } else {
-                    self.colors.surface
-                })
-            })
             .child(
                 img(self.dirs.cover_for_size(&book.id, thumb_size))
                     .w_full()
                     .h_full()
+                    .rounded_t(px(inner_radius))
                     .object_fit(ObjectFit::Cover),
             )
             .children(selected.then(|| {
@@ -4013,6 +4042,7 @@ impl Yomu {
                     .top_0()
                     .left_0()
                     .size_full()
+                    .rounded_t(px(inner_radius))
                     .bg(with_alpha(self.colors.accent, 0.22))
             }));
 
@@ -4028,8 +4058,8 @@ impl Yomu {
             .flex()
             .flex_col()
             .rounded(px(rounding_lg))
-            .when(border_px > 0.0, |this| {
-                this.border(px(border_px)).border_color(if selected {
+            .when(card_border > 0.0, |this| {
+                this.border(px(card_border)).border_color(if selected {
                     self.colors.accent
                 } else {
                     self.colors.border
@@ -4040,7 +4070,7 @@ impl Yomu {
             .cursor_pointer()
             .when(self.overlay.is_none(), |card| {
                 card.hover(|style| {
-                    let style = if border_px > 0.0 {
+                    let style = if card_border > 0.0 && !selected {
                         style.border_color(self.colors.accent)
                     } else {
                         style
@@ -4083,7 +4113,8 @@ impl Yomu {
                     .p_3()
                     .child(
                         div()
-                            .min_h(px(46.))
+                            .h(px(40.))
+                            .line_clamp(2)
                             .text_sm()
                             .font_weight(FontWeight::MEDIUM)
                             .text_color(self.colors.foreground)
