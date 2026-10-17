@@ -51,7 +51,28 @@ struct CachedArchive {
     archive: zip::ZipArchive<BufReader<File>>,
 }
 
-static ARCHIVE_CACHE: Mutex<Vec<CachedArchive>> = Mutex::new(Vec::new());
+static ARCHIVE_POOL: Mutex<Vec<CachedArchive>> = Mutex::new(Vec::new());
+
+fn checkout_archive(path: &Path) -> Result<zip::ZipArchive<BufReader<File>>> {
+    if let Ok(mut pool) = ARCHIVE_POOL.lock() {
+        if let Some(idx) = pool.iter().position(|c| c.path == path) {
+            return Ok(pool.swap_remove(idx).archive);
+        }
+    }
+    let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let reader = BufReader::with_capacity(64 * 1024, file);
+    zip::ZipArchive::new(reader)
+        .with_context(|| format!("{} is not a valid zip/cbz", path.display()))
+}
+
+fn checkin_archive(path: PathBuf, archive: zip::ZipArchive<BufReader<File>>) {
+    if let Ok(mut pool) = ARCHIVE_POOL.lock() {
+        if pool.len() >= 8 {
+            pool.remove(0);
+        }
+        pool.push(CachedArchive { path, archive });
+    }
+}
 
 /// Names of every page in reading order.
 pub fn list_pages(path: &Path, kind: SourceKind) -> Result<Vec<String>> {
@@ -93,12 +114,13 @@ fn walk_folder(root: &Path, dir: &Path, depth: usize, out: &mut Vec<String>) -> 
         } else if is_image_name(&name) {
             let relative = entry.path();
             let relative = relative.strip_prefix(root).unwrap_or(&relative);
-            let joined = relative
-                .components()
-                .map(|c| c.as_os_str().to_string_lossy().into_owned())
-                .collect::<Vec<_>>()
-                .join("/");
-            out.push(joined);
+            let s = relative.to_string_lossy();
+            let normalized = if s.contains('\\') {
+                s.replace('\\', "/")
+            } else {
+                s.into_owned()
+            };
+            out.push(normalized);
         }
     }
     Ok(())
@@ -120,16 +142,7 @@ pub fn folder_has_images(dir: &Path) -> bool {
 pub fn read_page(path: &Path, kind: SourceKind, name: &str) -> Result<Vec<u8>> {
     match kind {
         SourceKind::Archive => {
-            let mut cache = ARCHIVE_CACHE.lock().unwrap_or_else(|e| e.into_inner());
-            let mut archive = if let Some(idx) = cache.iter().position(|c| c.path == path) {
-                cache.remove(idx).archive
-            } else {
-                let file =
-                    File::open(path).with_context(|| format!("opening {}", path.display()))?;
-                let reader = BufReader::with_capacity(64 * 1024, file);
-                zip::ZipArchive::new(reader)
-                    .with_context(|| format!("{} is not a valid zip/cbz", path.display()))?
-            };
+            let mut archive = checkout_archive(path)?;
 
             let read_res = (|| -> Result<Vec<u8>> {
                 let entry = archive
@@ -143,14 +156,7 @@ pub fn read_page(path: &Path, kind: SourceKind, name: &str) -> Result<Vec<u8>> {
                 Ok(buf)
             })();
 
-            // Retain up to 4 most recently used archives in memory.
-            if cache.len() >= 4 {
-                cache.remove(0);
-            }
-            cache.push(CachedArchive {
-                path: path.to_path_buf(),
-                archive,
-            });
+            checkin_archive(path.to_path_buf(), archive);
 
             read_res
         }
@@ -203,6 +209,31 @@ mod tests {
         // Second read uses cached archive handle
         let p2 = read_page(&tmp, SourceKind::Archive, "002.jpg").unwrap();
         assert_eq!(p2, b"page2content");
+
+        let _ = fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn concurrent_archive_reads() {
+        let tmp = std::env::temp_dir().join(format!(
+            "yomu_test_concurrent_{}.cbz",
+            crate::util::now_secs()
+        ));
+        let file = File::create(&tmp).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default();
+        zip.start_file("001.jpg", options).unwrap();
+        zip.write_all(b"page1content").unwrap();
+        zip.start_file("002.jpg", options).unwrap();
+        zip.write_all(b"page2content").unwrap();
+        zip.finish().unwrap();
+
+        std::thread::scope(|s| {
+            let t1 = s.spawn(|| read_page(&tmp, SourceKind::Archive, "001.jpg").unwrap());
+            let t2 = s.spawn(|| read_page(&tmp, SourceKind::Archive, "002.jpg").unwrap());
+            assert_eq!(t1.join().unwrap(), b"page1content");
+            assert_eq!(t2.join().unwrap(), b"page2content");
+        });
 
         let _ = fs::remove_file(&tmp);
     }

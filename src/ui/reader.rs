@@ -130,6 +130,7 @@ pub struct Reader {
 
     pub images: HashMap<usize, Page>,
     pub pending: HashSet<usize>,
+    pub cancellations: HashMap<usize, Arc<std::sync::atomic::AtomicBool>>,
     pub failed: HashMap<usize, String>,
     pub error: Option<String>,
 
@@ -169,6 +170,7 @@ impl Reader {
             released: Vec::new(),
             images: HashMap::new(),
             pending: HashSet::new(),
+            cancellations: HashMap::new(),
             failed: HashMap::new(),
             error: None,
             vim: Vim::new(),

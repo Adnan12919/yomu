@@ -25,7 +25,7 @@ GPUI Kit window / Yomu (src/main.rs)
 | `layout.rs` | Fit modes, zoom bounds/steps, viewport geometry, pan offsets, decode tiers | Pure math. Page indices and geometry do not depend on reading direction except arrival placement. |
 | `vim.rs` | Turn key tokens and command-line input into reader actions | Knows no UI. The UI consumes `Action` values and performs side effects. |
 | `motion.rs` | Frame-time based scroll easing, page-turn transitions, reduced-motion detection | Pure calculations/state machines; avoid tying animation duration to frame count. |
-| `pagecache.rs` | Prefetch order and eviction planning | Pure policy. Current page is preserved even if that alone exceeds the budget. Current constants: 3 ahead, 1 prefetched behind, keep 2 behind/3 ahead, 320 MiB decoded-page budget. |
+| `pagecache.rs` | Prefetch order and eviction planning | Pure policy. Current page is preserved even if that alone exceeds the budget. Current constants: 5 ahead, 3 prefetched behind, keep 4 behind/5 ahead, adaptive 1.0–3.0 GiB decoded-page budget. |
 | `selection.rs` | Library multi-selection and range anchor semantics | Pure state; return selected IDs in library order at the call site for stable batch operations. |
 | `search.rs` | Case-insensitive title/source-path/series substring matching | Pure helper; query state is transient in the UI and search never changes library ordering or stored books. |
 | `menu.rs` | Context menu actions, navigation, confirmations, properties rows | Pure menu rules; UI decides how entries are drawn and dispatched. |
@@ -41,7 +41,7 @@ GPUI Kit window / Yomu (src/main.rs)
 
 The UI gets the selected `Book`, enumerates its pages with `archive::list_pages`, clamps/restores its saved zero-based page index, and requests bytes and image processing in background work. `imaging::decode_fit_bgra` returns pixels scaled to an appropriate device-pixel tier chosen using layout/zoom. gpui image objects are then used by rendering. Page index updates and progress persistence happen on navigation; direction changes which control means forward/backward but does not change the index model.
 
-`pagecache` determines what should be loaded and retained. A cache change should preserve the current page, bound decoded buffers, and account for image dimensions/bytes. The policy's 320 MiB is a decoded image budget, not a hard bound on all process memory: GPU textures, source bytes, allocator overhead, and transient decode buffers can add to RSS.
+`pagecache` determines what should be loaded and retained. A cache change should preserve the current page, bound decoded buffers, and account for image dimensions/bytes. The policy's adaptive budget (1.0 GiB default, scaling up to 3.0 GiB depending on available host RAM) is a decoded image budget, not a hard bound on all process memory: GPU textures, source bytes, allocator overhead, and transient decode buffers can add to RSS.
 
 ### Persistence
 

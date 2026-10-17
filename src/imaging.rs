@@ -7,6 +7,9 @@ use fast_image_resize::{
     images::Image as FirImage,
 };
 use image::{DynamicImage, ExtendedColorType, RgbImage, RgbaImage};
+use zune_core::colorspace::ColorSpace;
+use zune_core::options::DecoderOptions;
+use zune_jpeg::JpegDecoder;
 
 thread_local! {
     /// Reusable thread-local resizer to avoid reallocating internal SIMD scratch buffers.
@@ -59,6 +62,41 @@ fn rgb_to_bgra(rgb: &[u8], nw: u32, nh: u32) -> Result<RgbaImage> {
     RgbaImage::from_raw(nw, nh, bgra).context("failed to create bgra buffer from raw bytes")
 }
 
+fn decode_jpeg_fit_bgra(bytes: &[u8], max_w: u32, max_h: u32) -> Result<Decoded> {
+    let options = DecoderOptions::default().jpeg_set_out_colorspace(ColorSpace::BGRA);
+    let mut decoder = JpegDecoder::new_with_options(Cursor::new(bytes), options);
+    decoder
+        .decode_headers()
+        .map_err(|e| anyhow::anyhow!("failed to decode JPEG headers: {e:?}"))?;
+    let (w, h) = decoder.dimensions().context("missing JPEG dimensions")?;
+    let (w, h) = (w as u32, h as u32);
+    if u64::from(w) * u64::from(h) > MAX_PIXELS {
+        bail!("image is too large ({w}x{h})");
+    }
+    let scale = (max_w as f32 / w as f32).min(max_h as f32 / h as f32);
+    let pixels = decoder
+        .decode()
+        .map_err(|e| anyhow::anyhow!("JPEG decode error: {e:?}"))?;
+
+    let image = if scale < 1.0 {
+        let nw = ((w as f32 * scale).round() as u32).max(1);
+        let nh = ((h as f32 * scale).round() as u32).max(1);
+        let src = FirImage::from_vec_u8(w, h, pixels, PixelType::U8x4)?;
+        let mut dst = FirImage::new(nw, nh, PixelType::U8x4);
+        let resize_options =
+            ResizeOptions::new().resize_alg(ResizeAlg::Convolution(ResizeFilter::CatmullRom));
+        RESIZER.with(|resizer| resizer.borrow_mut().resize(&src, &mut dst, &resize_options))?;
+        RgbaImage::from_raw(nw, nh, dst.into_vec()).context("resized buffer has the wrong size")?
+    } else {
+        RgbaImage::from_raw(w, h, pixels).context("raw JPEG buffer has the wrong size")?
+    };
+
+    Ok(Decoded {
+        image,
+        orig: (w, h),
+    })
+}
+
 /// Decode a page and scale it down (never up) so it fits inside `max_w` x `max_h`.
 ///
 /// Pre-scaling on the CPU with a good filter looks much sharper than letting the GPU
@@ -66,6 +104,12 @@ fn rgb_to_bgra(rgb: &[u8], nw: u32, nh: u32) -> Result<RgbaImage> {
 ///
 /// The returned buffer is already **BGRA**, the channel order gpui expects.
 pub fn decode_fit_bgra(bytes: &[u8], max_w: u32, max_h: u32) -> Result<Decoded> {
+    if bytes.starts_with(&[0xff, 0xd8]) {
+        if let Ok(decoded) = decode_jpeg_fit_bgra(bytes, max_w, max_h) {
+            return Ok(decoded);
+        }
+    }
+
     let img = decode(bytes)?;
     let (w, h) = (img.width(), img.height());
     let alpha = img.color().has_alpha();
@@ -130,8 +174,52 @@ fn resize_rgb(rgb: RgbImage, nw: u32, nh: u32, filter: ResizeFilter) -> Result<R
     RgbImage::from_raw(nw, nh, dst.into_vec()).context("resized rgb buffer has the wrong size")
 }
 
+fn make_jpeg_cover(bytes: &[u8], max_w: u32, max_h: u32) -> Result<Vec<u8>> {
+    let options = DecoderOptions::default().jpeg_set_out_colorspace(ColorSpace::RGB);
+    let mut decoder = JpegDecoder::new_with_options(Cursor::new(bytes), options);
+    decoder
+        .decode_headers()
+        .map_err(|e| anyhow::anyhow!("failed to decode JPEG headers: {e:?}"))?;
+    let (w, h) = decoder.dimensions().context("missing JPEG dimensions")?;
+    let (w, h) = (w as u32, h as u32);
+    if u64::from(w) * u64::from(h) > MAX_PIXELS {
+        bail!("image is too large ({w}x{h})");
+    }
+    let scale = (max_w as f32 / w as f32)
+        .min(max_h as f32 / h as f32)
+        .min(1.0);
+    let nw = ((w as f32 * scale).round() as u32).max(1);
+    let nh = ((h as f32 * scale).round() as u32).max(1);
+    let pixels = decoder
+        .decode()
+        .map_err(|e| anyhow::anyhow!("JPEG decode error: {e:?}"))?;
+
+    let rgb = if (nw, nh) == (w, h) {
+        RgbImage::from_raw(w, h, pixels).context("invalid rgb buffer size")?
+    } else {
+        let src = FirImage::from_vec_u8(w, h, pixels, PixelType::U8x3)?;
+        let mut dst = FirImage::new(nw, nh, PixelType::U8x3);
+        let options =
+            ResizeOptions::new().resize_alg(ResizeAlg::Convolution(ResizeFilter::Lanczos3));
+        RESIZER.with(|resizer| resizer.borrow_mut().resize(&src, &mut dst, &options))?;
+        RgbImage::from_raw(nw, nh, dst.into_vec())
+            .context("resized rgb buffer has the wrong size")?
+    };
+
+    let mut out = Vec::new();
+    let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 88);
+    encoder.encode(&rgb, nw, nh, ExtendedColorType::Rgb8)?;
+    Ok(out)
+}
+
 /// Encode a JPEG thumbnail that fits inside `max_w` x `max_h`, keeping the aspect ratio.
 pub fn make_cover_jpeg(bytes: &[u8], max_w: u32, max_h: u32) -> Result<Vec<u8>> {
+    if bytes.starts_with(&[0xff, 0xd8]) {
+        if let Ok(cover) = make_jpeg_cover(bytes, max_w, max_h) {
+            return Ok(cover);
+        }
+    }
+
     let img = decode(bytes)?;
     let (w, h) = (img.width(), img.height());
     let alpha = img.color().has_alpha();
@@ -297,5 +385,68 @@ mod tests {
         assert!((i32::from(px[0]) - 30).abs() <= 5, "B: {}", px[0]);
         assert!((i32::from(px[1]) - 20).abs() <= 5, "G: {}", px[1]);
         assert!((i32::from(px[2]) - 10).abs() <= 5, "R: {}", px[2]);
+    }
+
+    #[test]
+    fn test_zune_api() {
+        use std::io::Cursor;
+        use zune_core::colorspace::ColorSpace;
+        use zune_core::options::DecoderOptions;
+        use zune_jpeg::JpegDecoder;
+
+        let bytes = rgb_bytes(10, 10, image::Rgb([10, 20, 30]));
+        let options = DecoderOptions::default().jpeg_set_out_colorspace(ColorSpace::BGRA);
+        let mut decoder = JpegDecoder::new_with_options(Cursor::new(&bytes[..]), options);
+        decoder.decode_headers().unwrap();
+        let (w, h) = decoder.dimensions().unwrap();
+        assert_eq!((w, h), (10, 10));
+        let pixels = decoder.decode().unwrap();
+        assert_eq!(pixels.len(), 10 * 10 * 4);
+        assert!((i32::from(pixels[0]) - 30).abs() <= 5, "B: {}", pixels[0]);
+        assert!((i32::from(pixels[1]) - 20).abs() <= 5, "G: {}", pixels[1]);
+        assert!((i32::from(pixels[2]) - 10).abs() <= 5, "R: {}", pixels[2]);
+        assert_eq!(pixels[3], 255);
+    }
+
+    #[test]
+    fn test_zune_resize_bgra() {
+        use std::io::Cursor;
+        use zune_core::colorspace::ColorSpace;
+        use zune_core::options::DecoderOptions;
+        use zune_jpeg::JpegDecoder;
+
+        let bytes = rgb_bytes(100, 100, image::Rgb([10, 20, 30]));
+        let options = DecoderOptions::default().jpeg_set_out_colorspace(ColorSpace::BGRA);
+        let mut decoder = JpegDecoder::new_with_options(Cursor::new(&bytes[..]), options);
+        decoder.decode_headers().unwrap();
+        let (w, h) = decoder.dimensions().unwrap();
+        let pixels = decoder.decode().unwrap();
+
+        let src = FirImage::from_vec_u8(w as u32, h as u32, pixels, PixelType::U8x4).unwrap();
+        let mut dst = FirImage::new(50, 50, PixelType::U8x4);
+        let options =
+            ResizeOptions::new().resize_alg(ResizeAlg::Convolution(ResizeFilter::CatmullRom));
+        RESIZER
+            .with(|resizer| resizer.borrow_mut().resize(&src, &mut dst, &options))
+            .unwrap();
+
+        let resized_pixels = dst.into_vec();
+        assert_eq!(resized_pixels.len(), 50 * 50 * 4);
+        assert!(
+            (i32::from(resized_pixels[0]) - 30).abs() <= 5,
+            "B: {}",
+            resized_pixels[0]
+        );
+        assert!(
+            (i32::from(resized_pixels[1]) - 20).abs() <= 5,
+            "G: {}",
+            resized_pixels[1]
+        );
+        assert!(
+            (i32::from(resized_pixels[2]) - 10).abs() <= 5,
+            "R: {}",
+            resized_pixels[2]
+        );
+        assert_eq!(resized_pixels[3], 255);
     }
 }

@@ -8575,10 +8575,13 @@ dependencies = [
  "fast_image_resize",
  "gpui-kit",
  "image",
+ "memmap2",
  "serde",
  "serde_json",
  "toml 0.8.23",
  "zip",
+ "zune-core 0.5.3",
+ "zune-jpeg 0.5.15",
 ]
 
 [[package]]

@@ -26,6 +26,9 @@ dirs = "6"
 fast_image_resize = { version = "6", default-features = false, features = ["std"] }
 # Pure-Rust decoders only: no C libraries get linked for image or archive handling.
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif"] }
+zune-jpeg = { version = "0.5", default-features = false, features = ["x86", "std"] }
+zune-core = { version = "0.5", default-features = false, features = ["std"] }
+memmap2 = "0.9"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
@@ -35,12 +38,20 @@ lto = "thin"
 codegen-units = 4
 strip = true
 
+[profile.dev]
+debug = 1
+
+[profile.test]
+debug = 1
+
 # Image decoding is painfully slow at opt-level 0, so optimise just those crates in dev builds.
 [profile.dev.package.yomu]
 opt-level = 2
 [profile.dev.package.image]
 opt-level = 3
 [profile.dev.package.zune-jpeg]
+opt-level = 3
+[profile.dev.package.zune-core]
 opt-level = 3
 [profile.dev.package.png]
 opt-level = 3
@@ -51,5 +62,7 @@ opt-level = 3
 [profile.dev.package.flate2]
 opt-level = 3
 [profile.dev.package.image-webp]
+opt-level = 3
+[profile.dev.package.fast_image_resize]
 opt-level = 3
 

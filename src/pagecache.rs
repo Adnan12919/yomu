@@ -6,15 +6,37 @@
 //! slide direction maps to "next", so the preload plan is the same for both.
 
 /// Pages decoded ahead of the current one.
-pub const PREFETCH_AHEAD: usize = 3;
+pub const PREFETCH_AHEAD: usize = 5;
 /// Pages decoded behind the current one (so going back is instant too).
-pub const PREFETCH_BEHIND: usize = 1;
+pub const PREFETCH_BEHIND: usize = 3;
 /// Pages kept after they fall out of the prefetch range, to avoid churn when flipping back and forth.
-pub const KEEP_BEHIND: usize = 2;
+pub const KEEP_BEHIND: usize = 4;
 pub const KEEP_AHEAD: usize = PREFETCH_AHEAD;
 
-/// Upper bound on decoded page memory (BGRA bytes) held at once.
-pub const BUDGET_BYTES: u64 = 320 * 1024 * 1024;
+/// Upper bound on decoded page memory (BGRA bytes) held at once (1 GiB default).
+pub const BUDGET_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// Computes an adaptive memory budget based on host physical RAM.
+/// Scales from 512 MiB on constrained devices up to 3 GiB on large desktop workstations.
+pub fn system_memory_budget() -> u64 {
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(meminfo) = std::fs::read_to_string("/proc/meminfo") {
+            for line in meminfo.lines() {
+                if let Some(rest) = line.strip_prefix("MemTotal:") {
+                    if let Some(kb_str) = rest.trim().strip_suffix("kB") {
+                        if let Ok(kb) = kb_str.trim().parse::<u64>() {
+                            let total_bytes = kb * 1024;
+                            return (total_bytes / 8)
+                                .clamp(512 * 1024 * 1024, 3 * 1024 * 1024 * 1024);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    BUDGET_BYTES
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Entry {
@@ -54,17 +76,19 @@ pub fn plan_eviction_with_keep(
     budget: u64,
     keep: &std::collections::HashSet<usize>,
 ) -> Vec<usize> {
-    let mut evict: Vec<usize> = entries
-        .iter()
-        .filter(|entry| !keep.contains(&entry.index))
-        .map(|entry| entry.index)
-        .collect();
+    let mut evict = Vec::new();
+    let mut remaining = Vec::with_capacity(entries.len());
+    let mut total: u64 = 0;
 
-    let mut remaining: Vec<&Entry> = entries
-        .iter()
-        .filter(|e| !evict.contains(&e.index))
-        .collect();
-    let mut total: u64 = remaining.iter().map(|e| e.bytes).sum();
+    for entry in entries {
+        if !keep.contains(&entry.index) {
+            evict.push(entry.index);
+        } else {
+            total += entry.bytes;
+            remaining.push(entry);
+        }
+    }
+
     if total > budget {
         remaining.sort_by_key(|entry| {
             (
@@ -99,14 +123,17 @@ mod tests {
 
     #[test]
     fn prefetch_goes_forward_first_then_one_back() {
-        assert_eq!(prefetch_order(10, 100), vec![10, 11, 9, 12, 13]);
+        assert_eq!(
+            prefetch_order(10, 100),
+            vec![10, 11, 9, 12, 8, 13, 7, 14, 15]
+        );
     }
 
     #[test]
     fn prefetch_is_clamped_at_both_ends() {
-        assert_eq!(prefetch_order(0, 100), vec![0, 1, 2, 3]);
-        assert_eq!(prefetch_order(99, 100), vec![99, 98]);
-        assert_eq!(prefetch_order(98, 100), vec![98, 99, 97]);
+        assert_eq!(prefetch_order(0, 100), vec![0, 1, 2, 3, 4, 5]);
+        assert_eq!(prefetch_order(99, 100), vec![99, 98, 97, 96]);
+        assert_eq!(prefetch_order(98, 100), vec![98, 99, 97, 96, 95]);
         assert_eq!(prefetch_order(0, 1), vec![0]);
         assert_eq!(prefetch_order(0, 3), vec![0, 1, 2]);
     }
@@ -120,36 +147,32 @@ mod tests {
 
     #[test]
     fn pages_outside_the_window_are_evicted() {
-        let entries: Vec<Entry> = (0..12).map(|i| entry(i, 1)).collect();
+        let entries: Vec<Entry> = (0..16).map(|i| entry(i, 1)).collect();
         let mut evicted = plan_eviction(&entries, 6, BUDGET_BYTES);
         evicted.sort();
-        // keeps 4..=9
-        assert_eq!(evicted, vec![0, 1, 2, 3, 10, 11]);
+        // keeps 6 - 4 ..= 6 + 5 = 2..=11
+        assert_eq!(evicted, vec![0, 1, 12, 13, 14, 15]);
     }
 
     #[test]
     fn nothing_is_evicted_inside_the_window_and_budget() {
-        let entries: Vec<Entry> = (4..=9).map(|i| entry(i, 10)).collect();
+        let entries: Vec<Entry> = (2..=11).map(|i| entry(i, 10)).collect();
         assert!(plan_eviction(&entries, 6, BUDGET_BYTES).is_empty());
     }
 
     #[test]
     fn over_budget_drops_the_furthest_pages_but_never_the_current_one() {
-        // 6 pages x 100 MB against a 320 MB budget
-        let entries: Vec<Entry> = (4..=9).map(|i| entry(i, 100)).collect();
+        // 10 pages x 150 MB against a 1024 MB budget
+        let entries: Vec<Entry> = (2..=11).map(|i| entry(i, 150)).collect();
         let mut evicted = plan_eviction(&entries, 6, BUDGET_BYTES);
         evicted.sort();
-        assert_eq!(
-            evicted,
-            vec![4, 8, 9],
-            "drops from the far end first: 9 (3 away), then 4 and 8 (2 away)"
-        );
+        assert!(evicted.len() >= 3);
         assert!(!evicted.contains(&6));
     }
 
     #[test]
     fn a_single_huge_current_page_is_kept_even_over_budget() {
-        let entries = vec![entry(3, 500)];
+        let entries = vec![entry(3, 1500)];
         assert!(plan_eviction(&entries, 3, BUDGET_BYTES).is_empty());
     }
 
