@@ -901,6 +901,177 @@ fn group_view_scroll_is_independent_from_library_grid_scroll(cx: &mut TestAppCon
     );
 }
 
+fn multi_group_fixture(tag: &str) -> (Fixture, String, String) {
+    static FIXTURE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = FIXTURE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let root = std::env::temp_dir().join(format!("yomu-ui-{tag}-{}-{seq}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).unwrap();
+    let dirs = DataDirs::at(root.join("data")).unwrap();
+
+    let dir1 = root.join("manga_one");
+    let dir2 = root.join("manga_two");
+    fs::create_dir_all(&dir1).unwrap();
+    fs::create_dir_all(&dir2).unwrap();
+
+    let mut files = Vec::new();
+    for (dir, names) in [(&dir1, &["A1", "A2"][..]), (&dir2, &["B1", "B2"][..])] {
+        for name in names {
+            let path = dir.join(format!("{name}.cbz"));
+            let mut zip = zip::ZipWriter::new(fs::File::create(&path).unwrap());
+            let options = zip::write::SimpleFileOptions::default();
+            for page in 1..=5 {
+                zip.start_file(format!("{page}.png"), options).unwrap();
+                zip.write_all(&png_bytes()).unwrap();
+            }
+            zip.finish().unwrap();
+            files.push(path);
+        }
+    }
+
+    let report = library::import_paths(&files, &dirs, &HashSet::new());
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    let mut library = Library::default();
+    library.settings_mut().group_series = true;
+    for book in report.added {
+        library.add(book);
+    }
+    library.save(&dirs).unwrap();
+    let ids = library.books().iter().map(|b| b.id.clone()).collect();
+    let key1 = format!("directory:{}", dir1.display());
+    let key2 = format!("directory:{}", dir2.display());
+    (Fixture { files, dirs, ids }, key1, key2)
+}
+
+#[gpui_kit::test]
+fn select_all_inside_group_only_selects_and_removes_from_that_group(cx: &mut TestAppContext) {
+    let (fx, key1, key2) = multi_group_fixture("selgrp");
+    let (view, cx) = launch(&fx, cx);
+
+    view.update(cx, |this, _| {
+        this.library.settings_mut().group_series = true;
+    });
+
+    assert_eq!(book_count(&view, cx), 4);
+
+    // Enter Group 1
+    view.update(cx, |this, cx| {
+        this.enter_group(key1.clone(), cx);
+    });
+    cx.run_until_parked();
+
+    // Select all inside Group 1 using Ctrl+A
+    cx.simulate_keystrokes("ctrl-a");
+    let sel = selected(&view, cx);
+    assert_eq!(sel.len(), 2, "only the 2 books in group 1 are selected");
+
+    let group1_books = view.read_with(cx, |this, _| {
+        let groups = directory_groups(this.library.books());
+        let g1 = groups.into_iter().find(|g| g.key == key1).unwrap();
+        g1.books.iter().map(|b| b.id.clone()).collect::<Vec<_>>()
+    });
+    assert_eq!(sel, group1_books);
+
+    // Remove the selected books
+    cx.simulate_keystrokes("delete");
+    cx.run_until_parked();
+
+    // Group 1's books are removed; Group 2's books are untouched
+    assert_eq!(book_count(&view, cx), 2);
+    let remaining_ids: Vec<String> = view.read_with(cx, |this, _| {
+        this.library.books().iter().map(|b| b.id.clone()).collect()
+    });
+    let group2_books = view.read_with(cx, |this, _| {
+        let groups = directory_groups(this.library.books());
+        let g2 = groups.into_iter().find(|g| g.key == key2).unwrap();
+        g2.books.iter().map(|b| b.id.clone()).collect::<Vec<_>>()
+    });
+    assert_eq!(remaining_ids, group2_books);
+
+    // Group 1 no longer exists, so open_group was automatically exited to None
+    assert_eq!(view.read_with(cx, |this, _| this.open_group.clone()), None);
+
+    // Persisted data on disk also only has Group 2's 2 books
+    let on_disk = Library::load(&fx.dirs).unwrap();
+    assert_eq!(on_disk.books().len(), 2);
+}
+
+#[gpui_kit::test]
+fn select_all_button_in_group_header_only_selects_current_group(cx: &mut TestAppContext) {
+    let (fx, key1, _key2) = multi_group_fixture("btnselgrp");
+    let (view, cx) = launch(&fx, cx);
+
+    view.update(cx, |this, _| {
+        this.library.settings_mut().group_series = true;
+    });
+
+    let first_id = fx.ids[0].clone();
+
+    // Enter Group 1
+    view.update(cx, |this, cx| {
+        this.enter_group(key1.clone(), cx);
+    });
+    cx.run_until_parked();
+
+    // Select first book via select_click
+    view.update(cx, |this, cx| {
+        this.select_click(&first_id, true, false, cx);
+    });
+    cx.run_until_parked();
+    assert_eq!(selected(&view, cx).len(), 1);
+
+    // The header offers "Select all"
+    let select_all = cx
+        .debug_bounds("select-all")
+        .expect("header offers Select all for group");
+    click(cx, select_all.center(), MouseButton::Left);
+    cx.run_until_parked();
+
+    // Only the 2 books in group 1 are selected
+    assert_eq!(selected(&view, cx).len(), 2);
+
+    // Remove via the header Remove button
+    let remove_btn = cx
+        .debug_bounds("select-remove")
+        .expect("header offers Remove");
+    click(cx, remove_btn.center(), MouseButton::Left);
+    cx.run_until_parked();
+
+    // Group 1 is gone, Group 2 books remain
+    assert_eq!(book_count(&view, cx), 2);
+    assert_eq!(view.read_with(cx, |this, _| this.open_group.clone()), None);
+}
+
+#[gpui_kit::test]
+fn entering_and_exiting_group_clears_selection(cx: &mut TestAppContext) {
+    let (fx, key1, key2) = multi_group_fixture("clrenterexit");
+    let (view, cx) = launch(&fx, cx);
+
+    view.update(cx, |this, _| {
+        this.library.settings_mut().group_series = true;
+    });
+
+    // Enter Group 1 and select all
+    view.update(cx, |this, cx| {
+        this.enter_group(key1.clone(), cx);
+    });
+    cx.run_until_parked();
+    cx.simulate_keystrokes("ctrl-a");
+    assert_eq!(selected(&view, cx).len(), 2);
+
+    // Exiting Group 1 clears selection
+    view.update(cx, |this, cx| {
+        this.exit_group(cx);
+    });
+    assert!(selected(&view, cx).is_empty());
+
+    // Entering Group 2 starts with empty selection
+    view.update(cx, |this, cx| {
+        this.enter_group(key2.clone(), cx);
+    });
+    assert!(selected(&view, cx).is_empty());
+}
+
 #[gpui_kit::test]
 fn delete_removes_the_selection_at_once_when_nothing_is_lost(cx: &mut TestAppContext) {
     let fx = fixture("bulkdelete");

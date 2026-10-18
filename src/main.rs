@@ -738,6 +738,7 @@ impl Yomu {
         let value = dialog.input.read(cx).value().to_string();
         let series = (!value.trim().is_empty()).then_some(value);
         self.library.set_series(&dialog.book_ids, series.clone());
+        self.prune_open_group();
         self.save_library();
         let message = match (series, count) {
             (Some(name), 1) => format!("Added to series “{name}”"),
@@ -1206,6 +1207,7 @@ impl Yomu {
             2 => self.open_settings_window(_window, cx),
             3 => {
                 self.library.settings_mut().group_series = !self.library.settings().group_series;
+                self.selection.clear();
                 self.open_group = None;
                 self.group_scroll.reset();
                 self.save_library();
@@ -1325,6 +1327,7 @@ impl Yomu {
         };
         self.library.remove(id, &self.dirs);
         self.prune_selection();
+        self.prune_open_group();
         self.save_library();
         self.show_toast(format!("Removed “{title}” from the library"), cx);
     }
@@ -1342,8 +1345,36 @@ impl Yomu {
             .collect()
     }
 
+    /// Book ids in the currently viewed scope (the open group, or the full library).
+    fn current_view_order(&self) -> Vec<String> {
+        if self.library.settings().group_series
+            && let Some(open_key) = self.open_group.as_deref()
+        {
+            let groups = directory_groups(self.library.books());
+            if let Some(group) = groups.into_iter().find(|g| g.key == open_key) {
+                return group.books.iter().map(|book| book.id.clone()).collect();
+            }
+        }
+        self.library_order()
+    }
+
+    fn prune_open_group(&mut self) {
+        if self.open_group.is_some() {
+            let still_exists = self.library.settings().group_series
+                && self.open_group.as_deref().is_some_and(|open_key| {
+                    directory_groups(self.library.books())
+                        .iter()
+                        .any(|g| g.key == open_key)
+                });
+            if !still_exists {
+                self.open_group = None;
+                self.group_scroll.reset();
+            }
+        }
+    }
+
     fn selected_ids(&self) -> Vec<String> {
-        self.selection.in_order(&self.library_order())
+        self.selection.in_order(&self.current_view_order())
     }
 
     fn prune_selection(&mut self) {
@@ -1354,7 +1385,7 @@ impl Yomu {
     /// A click on a book card with the given modifiers. Returns `false` if it is a plain click
     /// that should open the book instead.
     fn select_click(&mut self, id: &str, ctrl: bool, shift: bool, cx: &mut Context<Self>) -> bool {
-        let order = self.library_order();
+        let order = self.current_view_order();
         let handled = self.selection.click(&order, id, ctrl, shift);
         if handled {
             cx.notify();
@@ -1371,8 +1402,9 @@ impl Yomu {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let entries = if self.selection.contains(id) && self.selection.len() > 1 {
-            menu::selection_menu(self.selection.len())
+        let selected_ids = self.selected_ids();
+        let entries = if selected_ids.contains(&id.to_string()) && selected_ids.len() > 1 {
+            menu::selection_menu(selected_ids.len())
         } else {
             self.selection.clear();
             let Some(book) = self.library.get(id) else {
@@ -1431,6 +1463,7 @@ impl Yomu {
             self.library.remove(id, &self.dirs);
         }
         self.selection.clear();
+        self.prune_open_group();
         self.save_library();
         let message = if ids.len() == 1 {
             "Removed 1 book from the library".to_string()
@@ -1477,7 +1510,7 @@ impl Yomu {
         }
         match token {
             "C-a" => {
-                let order = self.library_order();
+                let order = self.current_view_order();
                 self.selection.select_all(&order);
                 cx.notify();
             }
@@ -1495,6 +1528,7 @@ impl Yomu {
     }
 
     fn enter_group(&mut self, key: String, cx: &mut Context<Self>) {
+        self.selection.clear();
         self.open_group = Some(key);
         self.group_scroll.handle.set_offset(Point::default());
         self.group_scroll.reset();
@@ -1502,6 +1536,7 @@ impl Yomu {
     }
 
     fn exit_group(&mut self, cx: &mut Context<Self>) {
+        self.selection.clear();
         self.open_group = None;
         self.group_scroll.reset();
         cx.notify();
@@ -3400,6 +3435,7 @@ impl Yomu {
                         move |&checked, _window, cx| {
                             yomu.update(cx, |this, cx| {
                                 this.library.settings_mut().group_series = checked;
+                                this.selection.clear();
                                 this.open_group = None;
                                 this.group_scroll.reset();
                                 this.save_library();
@@ -3786,7 +3822,9 @@ impl Yomu {
             self.toast.clone()
         };
 
-        let selected = self.selection.len();
+        let view_order = self.current_view_order();
+        let view_count = view_order.len();
+        let selected = self.selected_ids().len();
         let rounding_md = self.radius_px();
         let is_search_focused = self.search_active;
 
@@ -3823,7 +3861,7 @@ impl Yomu {
 
         let selection_controls = if selected > 0 {
             let controls = div().flex().flex_row().items_center().gap_2();
-            let controls = if selected < count {
+            let controls = if selected < view_count {
                 controls.child(panel_button(
                     "select-all",
                     "Select all",
@@ -3831,7 +3869,7 @@ impl Yomu {
                     self.colors,
                     true,
                     cx.listener(|this, _: &ClickEvent, _, cx| {
-                        let order = this.library_order();
+                        let order = this.current_view_order();
                         this.selection.select_all(&order);
                         cx.notify();
                     }),
@@ -4020,10 +4058,19 @@ impl Yomu {
                     .collect()
             };
             if let Some(open_key) = self.open_group.as_deref()
-                && let Some((group, members)) = visible_groups
-                    .iter()
-                    .find(|(group, _)| group.key == open_key)
+                && let Some(group) = groups.iter().find(|group| group.key == open_key)
             {
+                let members: Vec<_> = if self.search_query.trim().is_empty() {
+                    group.books.clone()
+                } else {
+                    let visible_ids: HashSet<&str> = books.iter().map(|b| b.id.as_str()).collect();
+                    group
+                        .books
+                        .iter()
+                        .copied()
+                        .filter(|book| visible_ids.contains(book.id.as_str()))
+                        .collect()
+                };
                 let mut content = div().flex().flex_col().gap_4().child(
                     div().flex().items_center().gap_3().child(
                         div()
@@ -4033,12 +4080,37 @@ impl Yomu {
                             .child(format!("{} · {}", group.name, members.len())),
                     ),
                 );
-                content = content.child(make_grid(
-                    members
-                        .iter()
-                        .map(|book| self.book_card(book, cx))
-                        .collect(),
-                ));
+                let grid_or_empty = if members.is_empty() {
+                    div()
+                        .py_12()
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .justify_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .text_lg()
+                                .text_color(self.colors.foreground)
+                                .child("No matching books in this group"),
+                        )
+                        .child(
+                            div()
+                                .text_sm()
+                                .text_color(self.colors.muted)
+                                .child("Try another title or source path."),
+                        )
+                        .into_any_element()
+                } else {
+                    make_grid(
+                        members
+                            .iter()
+                            .map(|book| self.book_card(book, cx))
+                            .collect(),
+                    )
+                    .into_any_element()
+                };
+                content = content.child(grid_or_empty);
                 div()
                     .id("group-grid")
                     .track_scroll(&self.group_scroll.handle)
@@ -5079,7 +5151,47 @@ fn icon_button(
     }
 }
 
+fn app_icon() -> Option<Arc<image::RgbaImage>> {
+    let bytes = include_bytes!("../assets/logo.png");
+    let img = image::load_from_memory(bytes).ok()?.to_rgba8();
+    let resized = image::imageops::resize(&img, 128, 128, image::imageops::FilterType::Lanczos3);
+    Some(Arc::new(resized))
+}
+
+fn ensure_desktop_icon() {
+    if let Some(data_dir) = dirs::data_dir() {
+        let icon_bytes = include_bytes!("../assets/logo.png");
+        let hicolor_icon = data_dir.join("icons/hicolor/512x512/apps/yomu.png");
+        if !hicolor_icon.exists() {
+            if let Some(parent) = hicolor_icon.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = std::fs::write(&hicolor_icon, icon_bytes);
+        }
+        let pixmap_icon = data_dir.join("pixmaps/yomu.png");
+        if !pixmap_icon.exists() {
+            if let Some(parent) = pixmap_icon.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = std::fs::write(&pixmap_icon, icon_bytes);
+        }
+        let desktop_file = data_dir.join("applications/yomu.desktop");
+        let desktop_content = include_str!("../packaging/yomu.desktop");
+        if !desktop_file.exists() {
+            if let Some(parent) = desktop_file.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = std::fs::write(&desktop_file, desktop_content);
+        } else if let Ok(existing) = std::fs::read_to_string(&desktop_file)
+            && !existing.contains("Icon=")
+        {
+            let _ = std::fs::write(&desktop_file, desktop_content);
+        }
+    }
+}
+
 fn main() {
+    ensure_desktop_icon();
     application()
         // GPUI Kit icons are SVG asset paths. Without registering this source,
         // custom-rendered toolbar and context-menu icons resolve to empty images.
@@ -5123,6 +5235,7 @@ fn main() {
                     // Compositors match window rules (Niri, Hyprland, Sway…) on the app id.
                     app_id: Some("yomu".into()),
                     window_min_size: Some(size(px(480.), px(360.))),
+                    icon: app_icon(),
                     ..Default::default()
                 },
                 |window, cx| {

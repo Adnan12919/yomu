@@ -3,6 +3,7 @@ Type=Application
 Name=yomu
 Comment=Minimal manga reader with a library
 Exec=yomu
+Icon=yomu
 Categories=Graphics;Viewer;
 StartupWMClass=yomu
 Terminal=false

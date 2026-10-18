@@ -53,6 +53,7 @@ rustPlatform.buildRustPackage {
       ../src
       ../vendor
       ../packaging
+      ../assets
     ];
   };
 
@@ -70,6 +71,8 @@ rustPlatform.buildRustPackage {
 
   postInstall = ''
     install -Dm644 packaging/yomu.desktop $out/share/applications/yomu.desktop
+    install -Dm644 assets/logo.png $out/share/icons/hicolor/512x512/apps/yomu.png
+    install -Dm644 assets/logo.png $out/share/pixmaps/yomu.png
   '';
 
   # Without this, gpui cannot find libwayland / libvulkan at runtime on NixOS.
