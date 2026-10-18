@@ -1,21 +1,50 @@
+<div align="center">
+
+<img src="assets/yomu-banner.png" alt="Yomu — a minimal manga reader" width="720" />
+
 # yomu
 
-A minimal manga reader written entirely in Rust. It is built on [GPUI Kit](https://gpui-kit.com/), so
-rendering is GPU-accelerated, and it talks to Wayland directly (no webview, no Tauri, no GTK/Qt).
+**A minimal, keyboard-first manga reader built entirely in Rust.**
 
-- Library grid with cover art and a reading-progress bar per book; centered search and a compact top-right action menu
-- Import CBZ/ZIP archives or folders of images (files, folders, or drag and drop)
-- Chrome-free reader: one page, a 2 px progress line at the bottom edge, nothing else until you ask
-- Right-click menu on books (resume, mark read/unread, reset progress, open file location, properties, remove)
-- Multiple selection (Ctrl/Shift-click, Ctrl+A) for removing many books at once
-- Settings panel with theme selection, library/reader preferences, and keyboard shortcuts table (`Ctrl+,`)
-- Fit page / width / height / original size, zoom in and out, pan by dragging
-- Continuous vertical reading mode and gapless webcomics strip mode; single-page mode remains available
-- Touchpad and touchscreen kinetic momentum scrolling: closed-form exponential friction decay with instant touch-catch interruption
-- Vim motions (counts, `gg`, `G`, marks, `:` commands) next to the normal keys
-- A short slide between pages and a smooth scroll glide, frame-rate independent, switchable (`:animate off`)
-- Progress is saved on every page turn and restored when you reopen a book
-- Pages are decoded on background threads at the resolution the current zoom needs, with the next pages prefetched
+GPU-accelerated rendering with [GPUI Kit](https://gpui-kit.com/) and direct Wayland integration — no webview, Tauri, GTK, or Qt.
+
+[![Rust](https://img.shields.io/badge/Rust-1.92%2B-orange?logo=rust&logoColor=white)](https://www.rust-lang.org/)
+[![Platform](https://img.shields.io/badge/Platform-Wayland-informational?logo=linux&logoColor=white)](https://wayland.freedesktop.org/)
+[![UI](https://img.shields.io/badge/UI-GPUI%20Kit-7c3aed)](https://gpui-kit.com/)
+[![Build](https://img.shields.io/badge/Build-Cargo%20%7C%20Nix-5277C3?logo=nixos&logoColor=white)](https://nixos.org/)
+
+</div>
+
+---
+
+## ✨ Highlights
+
+- 📚 **Personal library** — cover grid, reading-progress bars, centered search, and directory/series grouping.
+- 📂 **Flexible imports** — open CBZ/ZIP archives or image folders; add files by browsing or drag and drop.
+- 🖼️ **Distraction-free reader** — clean single-page view with a slim progress line and controls that stay out of the way.
+- 🖱️ **Fast library actions** — context menus, multi-select, bulk removal, read/unread status, and progress reset.
+- 🔎 **Powerful navigation** — Vim-style motions, counts, marks, a command prompt, and familiar keyboard shortcuts.
+- 🔍 **Flexible viewing** — fit page/width/height, original size, zoom, drag-to-pan, continuous scrolling, and gapless webcomics mode.
+- 🌀 **Smooth input** — kinetic touchpad/touchscreen scrolling and frame-rate-independent page transitions.
+- 💾 **Persistent progress** — page position and marks are saved and restored when you return to a book.
+- ⚡ **Responsive decoding** — pages are decoded and scaled on background threads, with nearby pages prefetched.
+- 🎨 **Personalized appearance** — built-in and custom themes, opacity controls, and reduced-motion support.
+
+## 📑 Contents
+
+- [Build and run](#build-and-run-nixos)
+- [Install on NixOS](#installing-yomu-on-nixos)
+- [Keyboard shortcuts](#keys)
+- [Selecting several books](#selecting-several-books)
+- [Searching and grouping](#searching-and-grouping-the-library)
+- [Context menu](#context-menu)
+- [Settings and themes](#settings)
+- [Performance](#page-turns-scrolling-and-performance)
+- [Data storage](#where-data-lives)
+- [Dependencies and development](#dependencies)
+- [Roadmap / not done yet](#not-done-yet)
+
+---
 
 ## Build and run (NixOS)
 
