@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="assets/yomu-banner.png" alt="Yomu — a minimal manga reader" width="720" />
+<img src="assets/yomu-banner.png" alt="Yomu — a minimal manga reader" width="300" />
 
 # yomu
 
