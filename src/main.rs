@@ -3147,6 +3147,11 @@ impl Yomu {
         let rounding_xl = self.radius_xl_px();
         let rounding_md = self.radius_px();
         let adw_group = move |title: &'static str, rows: Vec<AnyElement>| {
+            let section_slug = title
+                .chars()
+                .map(|c| if c.is_alphanumeric() { c.to_ascii_lowercase() } else { '-' })
+                .collect::<String>();
+            let section_id = SharedString::from(format!("settings-section-{section_slug}"));
             div()
                 .flex()
                 .flex_col()
@@ -3161,9 +3166,11 @@ impl Yomu {
                 )
                 .child(
                     div()
+                        .id(section_id)
                         .flex()
                         .flex_col()
                         .rounded(px(rounding_xl))
+                        .overflow_hidden()
                         .when(border_px > 0.0, |this| {
                             this.border(px(border_px)).border_color(self.colors.border)
                         })
@@ -3637,8 +3644,10 @@ impl Yomu {
                                 .child(*description),
                         );
 
+                        let key_id = SharedString::from(format!("shortcut-key-{section_idx}-{keys}"));
                         let key_cell = TableCell::new().text_right().child(
                             div()
+                                .id(key_id)
                                 .px_2()
                                 .py_0p5()
                                 .rounded(px(rounding_md))
@@ -3689,9 +3698,11 @@ impl Yomu {
                     )
                     .child(
                         div()
+                            .id("settings-shortcuts-card")
                             .flex()
                             .flex_col()
                             .rounded(px(rounding_xl))
+                            .overflow_hidden()
                             .when(border_px > 0.0, |this| {
                                 this.border(px(border_px)).border_color(self.colors.border)
                             })
@@ -3830,6 +3841,7 @@ impl Yomu {
 
         let search_field: AnyElement = if let Some(input) = &self.search_input {
             div()
+                .id("library-search-wrapper")
                 .w(px(360.))
                 .rounded(px(rounding_md))
                 .border_1()
