@@ -2480,6 +2480,27 @@ fn perf_per_frame_animation_math() {
 }
 
 #[gpui_kit::test]
+fn built_in_themes_cycle_and_persist(cx: &mut TestAppContext) {
+    let fx = fixture("theme-cycle");
+    let (view, cx) = launch(&fx, cx);
+
+    let initial_theme = view.read_with(cx, |this, _| this.library.settings().theme_name.clone());
+    assert_eq!(initial_theme, "Catppuccin Mocha");
+
+    view.update_in(cx, |this, _, cx| {
+        this.cycle_theme(1, cx);
+    });
+    let next_theme = view.read_with(cx, |this, _| this.library.settings().theme_name.clone());
+    assert_ne!(next_theme, "Catppuccin Mocha");
+
+    view.update_in(cx, |this, _, cx| {
+        this.cycle_theme(-1, cx);
+    });
+    let restored_theme = view.read_with(cx, |this, _| this.library.settings().theme_name.clone());
+    assert_eq!(restored_theme, "Catppuccin Mocha");
+}
+
+#[gpui_kit::test]
 #[ignore = "prints timings"]
 fn perf_frames_during_a_slide(cx: &mut TestAppContext) {
     let fx = fixture("perf");

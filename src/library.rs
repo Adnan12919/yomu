@@ -384,7 +384,7 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            theme_name: "Default Dark".to_string(),
+            theme_name: "Catppuccin Mocha".to_string(),
             fit: FitMode::Page,
             animate: true,
             continuous: false,
@@ -413,7 +413,12 @@ impl Settings {
         if let Some(theme_name) = object.get("theme_name").and_then(|v| v.as_str())
             && !theme_name.trim().is_empty()
         {
-            settings.theme_name = theme_name.to_string();
+            let name = match theme_name.trim() {
+                "Default Dark" | "Soft Plum" => "Catppuccin Mocha",
+                "Default Light" => "Catppuccin Latte",
+                other => other,
+            };
+            settings.theme_name = name.to_string();
         }
         if let Some(animate) = object.get("animate").and_then(|v| v.as_bool()) {
             settings.animate = animate;
@@ -1137,5 +1142,32 @@ mod tests {
         let loaded = Library::load(&dirs).unwrap();
         assert_eq!(loaded.settings().border_size, BorderSize::Thin);
         assert_eq!(loaded.settings().corner_rounding, CornerRounding::Medium);
+    }
+
+    #[test]
+    fn legacy_theme_names_are_migrated() {
+        let tmp = temp_dir("legacy-themes");
+        let dirs = DataDirs::at(tmp.join("data")).unwrap();
+
+        let json_dark = r#"{"books":[],"settings":{"theme_name":"Default Dark"}}"#;
+        fs::write(dirs.library_file(), json_dark).unwrap();
+        assert_eq!(
+            Library::load(&dirs).unwrap().settings().theme_name,
+            "Catppuccin Mocha"
+        );
+
+        let json_light = r#"{"books":[],"settings":{"theme_name":"Default Light"}}"#;
+        fs::write(dirs.library_file(), json_light).unwrap();
+        assert_eq!(
+            Library::load(&dirs).unwrap().settings().theme_name,
+            "Catppuccin Latte"
+        );
+
+        let json_plum = r#"{"books":[],"settings":{"theme_name":"Soft Plum"}}"#;
+        fs::write(dirs.library_file(), json_plum).unwrap();
+        assert_eq!(
+            Library::load(&dirs).unwrap().settings().theme_name,
+            "Catppuccin Mocha"
+        );
     }
 }

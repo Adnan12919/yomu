@@ -23,7 +23,7 @@ use gpui_kit::component::switch::Switch;
 use gpui_kit::component::tab::{Tab, TabBar};
 use gpui_kit::component::table::{Table, TableBody, TableCell, TableHead, TableHeader, TableRow};
 use gpui_kit::component::tag::Tag;
-use gpui_kit::component::{Theme as KitTheme, ThemeConfig, ThemeRegistry};
+use gpui_kit::component::{Theme as KitTheme, ThemeConfig};
 #[allow(unused_imports)]
 use gpui_kit::popup::{PopupAnchor, PopupConstraintAdjustment, PopupGravity, PopupOptions};
 #[allow(unused_imports)]
@@ -73,8 +73,8 @@ use ui::reader::{Drag, Page, Reader, ReaderSyncOutcome, WheelParams, viewport_of
 #[allow(unused_imports)]
 use ui::theme::custom_theme_fingerprint;
 use ui::theme::{
-    UiColors, built_in_theme_names, custom_theme_path, ensure_custom_theme_file,
-    load_custom_themes, parse_custom_themes,
+    BUILT_IN_THEMES, DEFAULT_THEME_NAME, UiColors, built_in_theme, built_in_theme_names,
+    custom_theme_path, ensure_custom_theme_file, load_custom_themes, parse_custom_themes,
 };
 
 /// How far `j`/`k`/`h`/`l` scroll, in logical pixels.
@@ -338,20 +338,18 @@ impl Yomu {
             Err(error) => theme_status = Some(format!("Custom theme file: {error:#}")),
         }
         let selected_theme = library.settings().theme_name.as_str();
-        let selected_config = custom_themes.get(selected_theme).cloned().or_else(|| {
-            cx.try_global::<ThemeRegistry>()
-                .and_then(|registry| registry.themes().get(selected_theme).cloned())
-        });
+        let selected_config = custom_themes
+            .get(selected_theme)
+            .cloned()
+            .or_else(|| built_in_theme(selected_theme));
         if let Some(config) = selected_config {
             KitTheme::update(cx, |theme| theme.apply_config(&config));
-        } else if selected_theme != "Default Dark"
-            && let Some(config) = cx
-                .try_global::<ThemeRegistry>()
-                .and_then(|registry| registry.themes().get("Default Dark").cloned())
+        } else if selected_theme != DEFAULT_THEME_NAME
+            && let Some(config) = built_in_theme(DEFAULT_THEME_NAME)
         {
             KitTheme::update(cx, |theme| theme.apply_config(&config));
             theme_status.get_or_insert_with(|| {
-                format!("Theme “{selected_theme}” was unavailable; using Default Dark")
+                format!("Theme “{selected_theme}” was unavailable; using {DEFAULT_THEME_NAME}")
             });
         }
         Self::apply_corner_rounding(library.settings().corner_rounding, cx);
@@ -1032,10 +1030,11 @@ impl Yomu {
     }
 
     fn apply_theme(&mut self, name: &str, cx: &mut Context<Self>) {
-        let config = self.custom_themes.get(name).cloned().or_else(|| {
-            cx.try_global::<ThemeRegistry>()
-                .and_then(|registry| registry.themes().get(name).cloned())
-        });
+        let config = self
+            .custom_themes
+            .get(name)
+            .cloned()
+            .or_else(|| built_in_theme(name));
         let Some(config) = config else {
             self.show_toast(format!("Theme “{name}” is unavailable"), cx);
             return;
@@ -1050,16 +1049,7 @@ impl Yomu {
     }
 
     fn cycle_theme(&mut self, delta: isize, cx: &mut Context<Self>) {
-        let mut names: Vec<String> = cx
-            .try_global::<ThemeRegistry>()
-            .map(|registry| {
-                registry
-                    .sorted_themes()
-                    .iter()
-                    .map(|theme| theme.name.to_string())
-                    .collect()
-            })
-            .unwrap_or_default();
+        let mut names: Vec<String> = BUILT_IN_THEMES.keys().cloned().collect();
         names.extend(self.custom_themes.keys().cloned());
         names.sort_by_key(|name| name.to_lowercase());
         if names.is_empty() {
@@ -1098,7 +1088,7 @@ impl Yomu {
             self.colors = UiColors::from_app(cx);
             self.colors.widget_opacity = self.library.settings().opacity;
         } else if was_custom {
-            self.apply_theme("Default Dark", cx);
+            self.apply_theme(DEFAULT_THEME_NAME, cx);
         }
         cx.notify();
     }
@@ -3154,7 +3144,13 @@ impl Yomu {
         let adw_group = move |title: &'static str, rows: Vec<AnyElement>| {
             let section_slug = title
                 .chars()
-                .map(|c| if c.is_alphanumeric() { c.to_ascii_lowercase() } else { '-' })
+                .map(|c| {
+                    if c.is_alphanumeric() {
+                        c.to_ascii_lowercase()
+                    } else {
+                        '-'
+                    }
+                })
                 .collect::<String>();
             let section_id = SharedString::from(format!("settings-section-{section_slug}"));
             div()
@@ -3667,7 +3663,8 @@ impl Yomu {
                                 .child(*description),
                         );
 
-                        let key_id = SharedString::from(format!("shortcut-key-{section_idx}-{keys}"));
+                        let key_id =
+                            SharedString::from(format!("shortcut-key-{section_idx}-{keys}"));
                         let key_cell = TableCell::new().text_right().child(
                             div()
                                 .id(key_id)

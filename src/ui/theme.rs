@@ -6,14 +6,17 @@ use std::{
     hash::{Hash, Hasher},
     path::{Path, PathBuf},
     rc::Rc,
+    sync::LazyLock,
 };
 
 use anyhow::{Result, anyhow};
 use gpui_kit::App;
 use gpui_kit::component::ColorTokens;
-use gpui_kit::component::{Theme as KitTheme, ThemeConfig, ThemeRegistry};
+use gpui_kit::component::{Theme as KitTheme, ThemeConfig};
 use serde::Deserialize;
 use yomu::library::DataDirs;
+
+pub const DEFAULT_THEME_NAME: &str = "Catppuccin Mocha";
 
 #[derive(Clone, Copy)]
 pub struct UiColors {
@@ -261,10 +264,43 @@ pub fn ensure_custom_theme_file(path: &Path) -> Result<()> {
     Ok(())
 }
 
-pub fn built_in_theme_names(cx: &App) -> HashSet<String> {
-    cx.try_global::<ThemeRegistry>()
-        .map(|registry| registry.themes().keys().map(ToString::to_string).collect())
-        .unwrap_or_default()
+fn parse_theme_file(contents: &str) -> Result<HashMap<String, std::sync::Arc<ThemeConfig>>> {
+    let file: CustomThemeFile =
+        toml::from_str(contents).map_err(|error| anyhow!("parsing themes: {error}"))?;
+    let mut themes = HashMap::new();
+    for definition in file.themes {
+        let name = definition.name.trim();
+        let config_value = serde_json::json!({
+            "name": name,
+            "mode": definition.mode,
+            "colors": definition.colors,
+            "font.size": definition.font_size,
+            "font.family": definition.font_family,
+            "mono_font.size": definition.mono_font_size,
+            "mono_font.family": definition.mono_font_family,
+            "radius": definition.radius,
+            "radius.lg": definition.radius_lg,
+            "shadow": definition.shadow,
+        });
+        let config: ThemeConfig = serde_json::from_value(config_value)
+            .map_err(|error| anyhow!("invalid theme “{name}”: {error}"))?;
+        themes.insert(name.to_string(), std::sync::Arc::new(config));
+    }
+    Ok(themes)
+}
+
+pub static BUILT_IN_THEMES: LazyLock<HashMap<String, std::sync::Arc<ThemeConfig>>> =
+    LazyLock::new(|| {
+        parse_theme_file(include_str!("builtin_themes.toml"))
+            .expect("failed to parse built-in themes")
+    });
+
+pub fn built_in_theme(name: &str) -> Option<Rc<ThemeConfig>> {
+    BUILT_IN_THEMES.get(name).map(|c| Rc::new((**c).clone()))
+}
+
+pub fn built_in_theme_names(_cx: &App) -> HashSet<String> {
+    BUILT_IN_THEMES.keys().cloned().collect()
 }
 
 pub fn load_custom_themes(path: &Path, cx: &App) -> Result<HashMap<String, Rc<ThemeConfig>>> {
@@ -272,4 +308,46 @@ pub fn load_custom_themes(path: &Path, cx: &App) -> Result<HashMap<String, Rc<Th
         fs::read_to_string(path).map_err(|error| anyhow!("reading {}: {error}", path.display()))?;
     let built_in_names = built_in_theme_names(cx);
     parse_custom_themes(&contents, &built_in_names)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn built_in_themes_contain_catppuccin_and_gruvbox() {
+        let themes = &*BUILT_IN_THEMES;
+        assert_eq!(DEFAULT_THEME_NAME, "Catppuccin Mocha");
+        assert!(themes.contains_key("Catppuccin Mocha"));
+        assert!(themes.contains_key("Catppuccin Macchiato"));
+        assert!(themes.contains_key("Catppuccin Frappé"));
+        assert!(themes.contains_key("Catppuccin Latte"));
+        assert!(themes.contains_key("Gruvbox Dark"));
+        assert!(themes.contains_key("Gruvbox Light"));
+
+        // Ensure old default themes are completely gone
+        assert!(!themes.contains_key("Default Dark"));
+        assert!(!themes.contains_key("Default Light"));
+        assert!(!themes.contains_key("Soft Plum"));
+    }
+
+    #[test]
+    fn built_in_themes_have_valid_tokens() {
+        for (name, config) in BUILT_IN_THEMES.iter() {
+            assert!(
+                config.mode == gpui_kit::component::ThemeMode::Dark
+                    || config.mode == gpui_kit::component::ThemeMode::Light,
+                "Theme {name} has unexpected mode {:?}",
+                config.mode
+            );
+            assert!(
+                config.colors.background.is_some(),
+                "Theme {name} missing background color"
+            );
+            assert!(
+                config.colors.foreground.is_some(),
+                "Theme {name} missing foreground color"
+            );
+        }
+    }
 }
