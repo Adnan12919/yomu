@@ -5193,13 +5193,19 @@ fn app_icon() -> Option<Arc<image::RgbaImage>> {
 fn ensure_desktop_icon() {
     #[cfg(target_os = "linux")]
     if let Some(data_dir) = dirs::data_dir() {
+        let mut updated = false;
         let logo_bytes = include_bytes!("../assets/logo.png");
         let pixmap_icon = data_dir.join("pixmaps/yomu.png");
-        if !pixmap_icon.exists() {
+        let pixmap_needs_update = std::fs::read(&pixmap_icon)
+            .map(|existing| existing != logo_bytes)
+            .unwrap_or(true);
+        if pixmap_needs_update {
             if let Some(parent) = pixmap_icon.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
-            let _ = std::fs::write(&pixmap_icon, logo_bytes);
+            if std::fs::write(&pixmap_icon, logo_bytes).is_ok() {
+                updated = true;
+            }
         }
 
         let sizes: &[(&str, &[u8])] = &[
@@ -5213,10 +5219,12 @@ fn ensure_desktop_icon() {
             ("512x512", include_bytes!("../assets/icons/512x512.png")),
         ];
 
-        let mut updated = false;
         for (sz, bytes) in sizes {
             let path = data_dir.join(format!("icons/hicolor/{sz}/apps/yomu.png"));
-            if !path.exists() {
+            let icon_needs_update = std::fs::read(&path)
+                .map(|existing| existing != *bytes)
+                .unwrap_or(true);
+            if icon_needs_update {
                 if let Some(parent) = path.parent() {
                     let _ = std::fs::create_dir_all(parent);
                 }
