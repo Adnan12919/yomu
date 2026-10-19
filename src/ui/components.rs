@@ -91,6 +91,8 @@ pub fn panel_button(
         .rounded(ButtonRounded::Medium)
         .small()
         .disabled(!enabled)
+        .when(enabled, |btn| btn.cursor_pointer())
+        .when(!enabled, |btn| btn.cursor_not_allowed())
         .on_click(on_click);
     let button = match kind {
         ButtonKind::Normal => button

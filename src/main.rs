@@ -3120,27 +3120,32 @@ impl Yomu {
             .child(
                 Tab::new()
                     .label("Appearance")
-                    .prefix(Icon::new(IconName::Palette)),
+                    .prefix(Icon::new(IconName::Palette))
+                    .cursor_pointer(),
             )
             .child(
                 Tab::new()
                     .label("Library")
-                    .prefix(Icon::new(IconName::Library)),
+                    .prefix(Icon::new(IconName::Library))
+                    .cursor_pointer(),
             )
             .child(
                 Tab::new()
                     .label("Reader")
-                    .prefix(Icon::new(IconName::BookOpen)),
+                    .prefix(Icon::new(IconName::BookOpen))
+                    .cursor_pointer(),
             )
             .child(
                 Tab::new()
                     .label("Storage")
-                    .prefix(Icon::new(IconName::HardDrive)),
+                    .prefix(Icon::new(IconName::HardDrive))
+                    .cursor_pointer(),
             )
             .child(
                 Tab::new()
                     .label("Shortcuts")
-                    .prefix(Icon::new(IconName::Keyboard)),
+                    .prefix(Icon::new(IconName::Keyboard))
+                    .cursor_pointer(),
             );
 
         let border_px = self.border_px();
@@ -3240,6 +3245,16 @@ impl Yomu {
             .into_any_element()
         };
 
+        fn dropdown_item(
+            opt_label: &'static str,
+            is_current: bool,
+            on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+        ) -> PopupMenuItem {
+            PopupMenuItem::element(move |_, _| div().cursor_pointer().flex_1().child(opt_label))
+                .checked(is_current)
+                .on_click(on_click)
+        }
+
         let yomu = cx.entity();
         let body = match self.settings_tab {
             SettingsTab::Appearance => {
@@ -3295,21 +3310,22 @@ impl Yomu {
                     .outline()
                     .bg(self.colors.surface)
                     .border_color(self.colors.border)
+                    .cursor_pointer()
                     .dropdown_menu_with_anchor(Anchor::TopRight, {
                         let yomu = yomu.clone();
                         move |mut menu, _window, _cx| {
                             for &(val, opt_label) in BORDER_OPTIONS {
                                 let yomu = yomu.clone();
                                 let is_current = val == border_size;
-                                menu = menu.item(
-                                    PopupMenuItem::new(opt_label).checked(is_current).on_click(
-                                        move |_, _window, cx| {
-                                            yomu.update(cx, |this, cx| {
-                                                this.set_border_size(val, cx);
-                                            });
-                                        },
-                                    ),
-                                );
+                                menu = menu.item(dropdown_item(
+                                    opt_label,
+                                    is_current,
+                                    move |_, _window, cx| {
+                                        yomu.update(cx, |this, cx| {
+                                            this.set_border_size(val, cx);
+                                        });
+                                    },
+                                ));
                             }
                             menu
                         }
@@ -3336,21 +3352,22 @@ impl Yomu {
                     .outline()
                     .bg(self.colors.surface)
                     .border_color(self.colors.border)
+                    .cursor_pointer()
                     .dropdown_menu_with_anchor(Anchor::TopRight, {
                         let yomu = yomu.clone();
                         move |mut menu, _window, _cx| {
                             for &(val, opt_label) in ROUNDING_OPTIONS {
                                 let yomu = yomu.clone();
                                 let is_current = val == corner_rounding;
-                                menu = menu.item(
-                                    PopupMenuItem::new(opt_label).checked(is_current).on_click(
-                                        move |_, _window, cx| {
-                                            yomu.update(cx, |this, cx| {
-                                                this.set_corner_rounding(val, cx);
-                                            });
-                                        },
-                                    ),
-                                );
+                                menu = menu.item(dropdown_item(
+                                    opt_label,
+                                    is_current,
+                                    move |_, _window, cx| {
+                                        yomu.update(cx, |this, cx| {
+                                            this.set_corner_rounding(val, cx);
+                                        });
+                                    },
+                                ));
                             }
                             menu
                         }
@@ -3408,21 +3425,22 @@ impl Yomu {
                     .outline()
                     .bg(self.colors.surface)
                     .border_color(self.colors.border)
+                    .cursor_pointer()
                     .dropdown_menu_with_anchor(Anchor::TopRight, {
                         let yomu = yomu.clone();
                         move |mut menu, _window, _cx| {
                             for &(val, opt_label) in THUMB_OPTIONS {
                                 let yomu = yomu.clone();
                                 let is_current = val == thumb_size;
-                                menu = menu.item(
-                                    PopupMenuItem::new(opt_label).checked(is_current).on_click(
-                                        move |_, _window, cx| {
-                                            yomu.update(cx, |this, cx| {
-                                                this.set_thumbnail_size(val, cx);
-                                            });
-                                        },
-                                    ),
-                                );
+                                menu = menu.item(dropdown_item(
+                                    opt_label,
+                                    is_current,
+                                    move |_, _window, cx| {
+                                        yomu.update(cx, |this, cx| {
+                                            this.set_thumbnail_size(val, cx);
+                                        });
+                                    },
+                                ));
                             }
                             menu
                         }
@@ -3437,6 +3455,7 @@ impl Yomu {
                 let group_switch = Switch::new("settings-group-series")
                     .checked(grouped)
                     .small()
+                    .cursor_pointer()
                     .on_click({
                         let yomu = yomu.clone();
                         move |&checked, _window, cx| {
@@ -3475,21 +3494,22 @@ impl Yomu {
                     .outline()
                     .bg(self.colors.surface)
                     .border_color(self.colors.border)
+                    .cursor_pointer()
                     .dropdown_menu_with_anchor(Anchor::TopRight, {
                         let yomu = yomu.clone();
                         move |mut menu, _window, _cx| {
                             for &(mode, opt_label) in FIT_OPTIONS {
                                 let yomu = yomu.clone();
                                 let is_current = mode == fit;
-                                menu = menu.item(
-                                    PopupMenuItem::new(opt_label).checked(is_current).on_click(
-                                        move |_, _window, cx| {
-                                            yomu.update(cx, |this, cx| {
-                                                this.set_fit(mode, cx);
-                                            });
-                                        },
-                                    ),
-                                );
+                                menu = menu.item(dropdown_item(
+                                    opt_label,
+                                    is_current,
+                                    move |_, _window, cx| {
+                                        yomu.update(cx, |this, cx| {
+                                            this.set_fit(mode, cx);
+                                        });
+                                    },
+                                ));
                             }
                             menu
                         }
@@ -3504,6 +3524,7 @@ impl Yomu {
                 let anim_switch = Switch::new("settings-animations")
                     .checked(animate)
                     .small()
+                    .cursor_pointer()
                     .on_click({
                         let yomu = yomu.clone();
                         move |&checked, _window, cx| {
@@ -3522,6 +3543,7 @@ impl Yomu {
                 let cont_switch = Switch::new("settings-continuous")
                     .checked(continuous)
                     .small()
+                    .cursor_pointer()
                     .on_click({
                         let yomu = yomu.clone();
                         move |&checked, _window, cx| {
@@ -3540,6 +3562,7 @@ impl Yomu {
                 let webc_switch = Switch::new("settings-webcomics")
                     .checked(webcomics)
                     .small()
+                    .cursor_pointer()
                     .on_click({
                         let yomu = yomu.clone();
                         move |&checked, _window, cx| {
@@ -5140,6 +5163,7 @@ fn icon_button(
             colors.foreground
         })
         .bg(colors.surface)
+        .cursor_pointer()
         // Render the bundled SVG directly so its theme color is explicit. The
         // Button icon convenience path inherits a color from Kit's component
         // theme, which can be transparent against custom/translucent surfaces.
