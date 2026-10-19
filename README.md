@@ -233,7 +233,7 @@ Counts work on motions: `5j` scrolls five steps, `3J` skips three pages. Marks a
 | `+` / `=`, `zi` | Zoom in |
 | `-`, `zo` | Zoom out |
 | `0`, `z0` | Reset zoom to the fit size |
-| `Ctrl` + wheel | Zoom at the pointer || `Ctrl` + wheel, Pinch | Zoom at the pointer / pinch center |
+| `Ctrl` + wheel, Pinch | Zoom at the pointer / pinch center |
 | `zt` `zz` `zb` | Scroll to the top / middle / bottom of the page |
 | `v` | Toggle continuous vertical scrolling |
 | `w` | Toggle gapless webcomics mode (forces continuous scrolling) |
