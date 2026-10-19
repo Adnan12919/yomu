@@ -1,15 +1,16 @@
 <div align="center">
 
-<img src="assets/yomu-banner.png" alt="Yomu — a minimal manga reader" width="300" />
+<img src="assets/yomu-banner.png" alt="Yomu — a minimal comic & manga reader" width="300" />
 
-# yomu
+# Yomu
 
-**A minimal, keyboard-first manga reader built entirely in Rust.**
+**A minimal, keyboard-first comic & manga reader built entirely in Rust.**
 
 GPU-accelerated rendering with [GPUI Kit](https://gpui-kit.com/) and direct Wayland integration — no webview, Tauri, GTK, or Qt.
 
 [![Rust](https://img.shields.io/badge/Rust-1.92%2B-orange?logo=rust&logoColor=white)](https://www.rust-lang.org/)
-[![Platform](https://img.shields.io/badge/Platform-Wayland-informational?logo=linux&logoColor=white)](https://wayland.freedesktop.org/)
+![Platform](https://img.shields.io/badge/Platform--informational?style=flat&logo=outline&logoColor=white) [![Windows](https://img.shields.io/badge/Windows-0078D4?style=flat&logo=windows&logoColor=white)](#) [![macOS](https://img.shields.io/badge/macOS-000000?style=flat&logo=apple&logoColor=white)](#) [![Linux](https://img.shields.io/badge/Linux-FCC624?style=flat&logo=linux&logoColor=black)](#)
+
 [![UI](https://img.shields.io/badge/UI-GPUI%20Kit-7c3aed)](https://gpui-kit.com/)
 [![Build](https://img.shields.io/badge/Build-Cargo%20%7C%20Nix-5277C3?logo=nixos&logoColor=white)](https://nixos.org/)
 
@@ -20,19 +21,23 @@ GPU-accelerated rendering with [GPUI Kit](https://gpui-kit.com/) and direct Wayl
 ## ✨ Highlights
 
 - 📚 **Personal library** — cover grid, reading-progress bars, centered search, and directory/series grouping.
-- 📂 **Flexible imports** — open CBZ/CBR/ZIP/RAR archives or image folders; add files by browsing or drag and drop.
+- 📂 **Flexible imports** — open CBZ/ZIP archives or image folders; add files by browsing or drag and drop.
 - 🖼️ **Distraction-free reader** — clean single-page view with a slim progress line and controls that stay out of the way.
 - 🖱️ **Fast library actions** — context menus, multi-select, bulk removal, read/unread status, and progress reset.
 - 🔎 **Powerful navigation** — Vim-style motions, counts, marks, a command prompt, and familiar keyboard shortcuts.
 - 🔍 **Flexible viewing** — fit page/width/height, original size, zoom, drag-to-pan, continuous scrolling, and gapless webcomics mode.
-- 🌀 **Smooth input** — kinetic touchpad/touchscreen scrolling, pinch-to-zoom at gesture anchor, and frame-rate-independent page transitions.
+- 🌀 **Smooth input** — kinetic touchpad/touchscreen scrolling and frame-rate-independent page transitions.
 - 💾 **Persistent progress** — page position and marks are saved and restored when you return to a book.
 - ⚡ **Responsive decoding** — pages are decoded and scaled on background threads, with nearby pages prefetched.
 - 🎨 **Personalized appearance** — built-in and custom themes, opacity controls, and reduced-motion support.
 
 ## 📑 Contents
 
-- [Build and run](#build-and-run-nixos)
+- [UI preview](#ui-preview)
+- [Importing manga](#importing-manga)
+- [Build from source on Windows](#build-from-source-on-windows)
+- [Build from source on macOS](#build-from-source-on-macos)
+- [Build and run on NixOS](#build-and-run-nixos)
 - [Install on NixOS](#installing-yomu-on-nixos)
 - [Keyboard shortcuts](#keys)
 - [Selecting several books](#selecting-several-books)
@@ -45,6 +50,82 @@ GPU-accelerated rendering with [GPUI Kit](https://gpui-kit.com/) and direct Wayl
 - [Roadmap / not done yet](#not-done-yet)
 
 ---
+
+## 🖥️ UI preview
+
+Yomu's interface supports distinct visual themes, including bold, diagonal color bands and contrasting light/dark panels. The screenshot below shows the empty-library state: the centered message explains how to get started, while the search field and menu remain accessible at the top. Once you import manga, the library displays cover cards in the same themed interface.
+
+<div align="center">
+
+<img src="assets/yomu-library.png" alt="Yomu library showing manga cover cards in its theme" width="100%" />
+
+<sub>Yomu's themed empty-library view. Add CBZ files or folders to populate the library</sub>
+
+</div>
+
+## 📂 Importing manga
+
+You can add manga to your library in several ways:
+
+1. **Open the file picker:** press `Ctrl+O` to add files, or `Ctrl+Shift+O` to add a folder. You can also use the library's menu actions for **Add files** or **Add folder**.
+2. **Drag and drop:** drag supported files or folders into the app.
+3. **Supported sources:** import **CBZ/ZIP archives** or **folders of images**. Yomu scans and adds volumes in the background, so completed volumes can appear while the remaining items are still being processed.
+4. **Start reading:** select a book card to open it. Yomu saves reading progress and restores it when you reopen the book.
+
+Importing adds entries to Yomu's library; it does **not** copy, move, or modify your original comic files. See [Where data lives](#where-data-lives) for details about the library metadata and generated cover thumbnails.
+
+---
+
+## Build from source on Windows
+
+> **Requirements:** A Rust **nightly/unstable toolchain** is required. A stable-only toolchain may fail to compile this project.
+
+### Prerequisites
+
+- [Rustup](https://rustup.rs/) for installing and managing Rust toolchains.
+- [Visual Studio Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/) with **Desktop development with C++** and a Windows SDK.
+- Git, if you are cloning the repository.
+
+### Build and run
+
+Open **PowerShell** in the repository directory and run:
+
+```powershell
+rustup toolchain install nightly
+rustup default nightly
+rustup show
+cargo run --release
+```
+
+To use nightly for this project without changing your global default, use `cargo +nightly run --release` instead of the last command. Run tests with `cargo +nightly test`.
+
+If compilation fails while building native dependencies, verify that the Visual Studio C++ workload and Windows SDK are installed, then retry from a new terminal.
+
+## Build from source on macOS
+
+> **Requirements:** A Rust **nightly/unstable toolchain** is required. A stable-only toolchain may fail to compile this project.
+
+### Prerequisites
+
+- [Rustup](https://rustup.rs/) for installing and managing Rust toolchains.
+- Xcode Command Line Tools, installed with `xcode-select --install`.
+- Git, if you are cloning the repository.
+
+### Build and run
+
+Open Terminal in the repository directory and run:
+
+```sh
+xcode-select --install
+rustup toolchain install nightly
+rustup default nightly
+rustup show
+cargo run --release
+```
+
+To use nightly only for this project without changing your global default, run `cargo +nightly run --release`. Run tests with `cargo +nightly test`.
+
+If a native dependency reports missing Apple SDK or compiler tools, complete the Xcode Command Line Tools installation and retry. These instructions cover building from source; they do not imply that prebuilt Windows or macOS installers are published.
 
 ## Build and run (NixOS)
 
@@ -135,7 +216,6 @@ Ctrl+wheel) work too. Press `?` in the reader for a cheat sheet.
 | `ma`, `'a`, `''` | Set mark `a`, jump to it, jump back to where you were |
 | Click left / right third of the window | Turn the page toward that side |
 | Mouse wheel / Touchpad | Scroll; touchpad two-finger flicks launch natural inertial momentum scrolling |
-| Touchpad / Touchscreen Pinch | Smoothly zoom in or out anchored at the pointer/pinch focal center |
 | Drag | Pan a zoomed page or continuous strip; drag flicks launch inertial momentum |
 
 Counts work on motions: `5j` scrolls five steps, `3J` skips three pages. Marks are saved with the book.
@@ -152,7 +232,7 @@ Counts work on motions: `5j` scrolls five steps, `3J` skips three pages. Marks a
 | `+` / `=`, `zi` | Zoom in |
 | `-`, `zo` | Zoom out |
 | `0`, `z0` | Reset zoom to the fit size |
-| `Ctrl` + wheel, Pinch | Zoom at the pointer / pinch center |
+| `Ctrl` + wheel | Zoom at the pointer |
 | `zt` `zz` `zb` | Scroll to the top / middle / bottom of the page |
 | `v` | Toggle continuous vertical scrolling |
 | `w` | Toggle gapless webcomics mode (forces continuous scrolling) |
@@ -363,7 +443,7 @@ cargo test       # core logic plus UI tests that drive the real views with simul
 
 The code is split so that everything except the window lives in the library crate:
 
-- `src/archive.rs` lists and reads pages from CBZ, CBR, ZIP, and RAR archives and image folders
+- `src/archive.rs` lists and reads pages from CBZ files and folders
 - `src/imaging.rs` decodes and resizes pages, and builds cover thumbnails
 - `src/layout.rs` is the fit-mode, zoom and pan math
 - `src/vim.rs` turns keys into actions: counts, `gg`/`zw`/`ma` sequences and the `:` command line
@@ -375,9 +455,6 @@ The code is split so that everything except the window lives in the library crat
 
 ## Not done yet
 
-- CB7 (needs a 7z archive reader)
-- Double-page spreads
+- CBR/CB7 (needs a pure-Rust RAR/7z reader; CBR files are rejected with a clear message)
+- Double-page spreads, pinch zoom
 - Sorting options
-- A clear Noctalia Launcher-style hover and active-selection color across menus and settings, including pointer hover
-  and keyboard navigation. Use the theme's primary/accent color so the current item is easy to identify.
-- Inertial scrolling (very low priority roadmap item)
