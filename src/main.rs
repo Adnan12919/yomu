@@ -4859,7 +4859,6 @@ impl Render for Yomu {
             .key_context(if reading { "Reader" } else { "Library" })
             .track_focus(&self.focus_handle)
             .size_full()
-            .rounded_lg()
             .overflow_hidden()
             .bg(root_bg)
             .text_color(self.colors.foreground)
