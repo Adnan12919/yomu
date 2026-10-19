@@ -31,10 +31,10 @@ use gpui_kit::{
     Anchor, Animation, AnimationExt, AnyElement, AnyWindowHandle, App, Bounds, ClickEvent, Context,
     Entity, ExternalPaths, FocusHandle, Focusable, FontWeight, KeyBinding, KeyDownEvent,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit, PathPromptOptions,
-    Pixels, Point, RenderImage, Rgba, ScrollDelta, ScrollHandle, ScrollWheelEvent, SharedString,
-    Styled, Subscription, TitlebarOptions, TouchPhase, Window, WindowBackgroundAppearance,
-    WindowBounds, WindowKind, WindowOptions, actions, anchored, application, canvas, deferred, div,
-    ease_out_quint, img, point, prelude::*, px, relative, size,
+    PinchEvent, Pixels, Point, RenderImage, Rgba, ScrollDelta, ScrollHandle, ScrollWheelEvent,
+    SharedString, Styled, Subscription, TitlebarOptions, TouchPhase, Window,
+    WindowBackgroundAppearance, WindowBounds, WindowKind, WindowOptions, actions, anchored,
+    application, canvas, deferred, div, ease_out_quint, img, point, prelude::*, px, relative, size,
 };
 use image::Frame;
 use yomu::{
@@ -299,6 +299,8 @@ struct Yomu {
     group_scroll: UiScrollController,
     shortcuts_scroll: UiScrollController,
     scroll_caught_at: Option<Instant>,
+    library_pinch_accum: f32,
+    cursor_pos: Option<(f32, f32)>,
     save_seq: u64,
     last_saved_seq: Arc<Mutex<u64>>,
     save_pending: bool,
@@ -391,6 +393,8 @@ impl Yomu {
             group_scroll: UiScrollController::new(),
             shortcuts_scroll: UiScrollController::new(),
             scroll_caught_at: None,
+            library_pinch_accum: 0.0,
+            cursor_pos: None,
             save_seq: 0,
             last_saved_seq: Arc::new(Mutex::new(0)),
             save_pending: false,
@@ -1635,6 +1639,7 @@ impl Yomu {
         }
         self.last_frame = None;
         self.hud = None;
+        self.cursor_pos = None;
         window.set_window_title("yomu");
         window.focus(&self.focus_handle, cx);
         self.save_library();
@@ -1813,22 +1818,36 @@ impl Yomu {
                 return;
             };
             if reader.continuous {
+                let old_zoom = reader.zoom;
                 let old_doc = reader.continuous_total_height(&vp);
-                let old_y = reader.scroll_target.1;
                 let zoom = layout::clamp_zoom(zoom);
                 reader.zoom = zoom;
                 let new_doc = reader.continuous_total_height(&vp);
-                reader.scroll_target.1 = if old_doc > vp.height {
-                    old_y / (old_doc - vp.height) * (new_doc - vp.height).max(0.0)
+
+                if old_zoom > 1e-4 {
+                    let zoom_ratio = zoom / old_zoom;
+                    let target_y = (reader.off.1 + anchor.1) * zoom_ratio - anchor.1;
+                    let max_y = (new_doc - vp.height).max(0.0);
+                    reader.scroll_target.1 = target_y.clamp(0.0, max_y);
+                } else if old_doc > vp.height {
+                    reader.scroll_target.1 = reader.scroll_target.1 / (old_doc - vp.height)
+                        * (new_doc - vp.height).max(0.0);
                 } else {
-                    0.0
-                };
-                let ratio = if old_display.0 > 0.0 {
-                    (reader.scroll_target.0 + anchor.0) / old_display.0
+                    reader.scroll_target.1 = 0.0;
+                }
+
+                let new_width = vp.width * zoom;
+                let max_x = (new_width - vp.width).max(0.0);
+                if max_x > 0.0 && old_display.0 > 0.0 {
+                    let old_left = (vp.width - old_display.0) / 2.0 - reader.off.0;
+                    let fraction_x = (anchor.0 - old_left) / old_display.0;
+                    let new_left = anchor.0 - fraction_x * new_width;
+                    let target_x = (vp.width - new_width) / 2.0 - new_left;
+                    reader.scroll_target.0 = target_x.clamp(0.0, max_x);
                 } else {
-                    0.5
-                };
-                reader.scroll_target.0 = (ratio * vp.width * zoom - anchor.0).max(0.0);
+                    reader.scroll_target.0 = 0.0;
+                }
+
                 reader.off = reader.scroll_target;
                 reader.cancel_transition();
                 format!("continuous · {}%", (zoom * 100.0).round() as i32)
@@ -2035,6 +2054,76 @@ impl Yomu {
         cx.notify();
     }
 
+    fn on_pinch(
+        &mut self,
+        at: (f32, f32),
+        delta: f32,
+        phase: TouchPhase,
+        vp: Viewport,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(reader) = self.reader.as_mut() else {
+            return;
+        };
+
+        if phase == TouchPhase::Started || phase == TouchPhase::Cancelled {
+            reader.kinetic.reset();
+            return;
+        }
+
+        if phase == TouchPhase::Ended {
+            return;
+        }
+
+        if delta.abs() > 1e-5 {
+            reader.kinetic.cancel_inertia();
+            let factor = (1.0 + delta).clamp(0.2, 5.0);
+            self.zoom_by(factor, at, vp, cx);
+        }
+    }
+
+    fn on_library_pinch(&mut self, delta: f32, phase: TouchPhase, cx: &mut Context<Self>) {
+        if phase == TouchPhase::Started || phase == TouchPhase::Cancelled {
+            self.library_pinch_accum = 0.0;
+            return;
+        }
+        if phase == TouchPhase::Ended {
+            self.library_pinch_accum = 0.0;
+            return;
+        }
+        self.library_pinch_accum += delta;
+        let current = self.library.settings().thumbnail_size;
+        if self.library_pinch_accum > 0.35 {
+            self.library_pinch_accum = 0.0;
+            let next = match current {
+                ThumbnailSize::Small => Some(ThumbnailSize::Medium),
+                ThumbnailSize::Medium => Some(ThumbnailSize::Large),
+                ThumbnailSize::Large => Some(ThumbnailSize::ExtraLarge),
+                ThumbnailSize::ExtraLarge => None,
+            };
+            if let Some(new_size) = next {
+                self.library.settings_mut().thumbnail_size = new_size;
+                self.save_library();
+                self.show_toast(format!("Thumbnails: {}", new_size.label()), cx);
+                cx.notify();
+            }
+        } else if self.library_pinch_accum < -0.35 {
+            self.library_pinch_accum = 0.0;
+            let prev = match current {
+                ThumbnailSize::ExtraLarge => Some(ThumbnailSize::Large),
+                ThumbnailSize::Large => Some(ThumbnailSize::Medium),
+                ThumbnailSize::Medium => Some(ThumbnailSize::Small),
+                ThumbnailSize::Small => None,
+            };
+            if let Some(new_size) = prev {
+                self.library.settings_mut().thumbnail_size = new_size;
+                self.save_library();
+                self.show_toast(format!("Thumbnails: {}", new_size.label()), cx);
+                cx.notify();
+            }
+        }
+    }
+
     fn drag_start(&mut self, at: (f32, f32)) {
         if let Some(reader) = self.reader.as_mut() {
             reader.kinetic.reset();
@@ -2199,6 +2288,7 @@ impl Yomu {
 
     fn apply(&mut self, action: Action, vp: Viewport, window: &mut Window, cx: &mut Context<Self>) {
         let center = (vp.width / 2.0, vp.height / 2.0);
+        let anchor = self.cursor_pos.unwrap_or(center);
         match action {
             Action::Scroll { dir, amount, count } => self.scroll(dir, amount, count, vp, cx),
             Action::NextPage(n) => self.turn_by(true, n, Arrive::Start, cx),
@@ -2207,13 +2297,13 @@ impl Yomu {
             Action::FirstPage => self.jump_to(0, cx),
             Action::LastPage => self.jump_to(usize::MAX, cx),
             Action::ZoomIn(n) => {
-                self.zoom_by(layout::ZOOM_STEP.powi(n.min(64) as i32), center, vp, cx)
+                self.zoom_by(layout::ZOOM_STEP.powi(n.min(64) as i32), anchor, vp, cx)
             }
             Action::ZoomOut(n) => {
-                self.zoom_by(layout::ZOOM_STEP.powi(-(n.min(64) as i32)), center, vp, cx)
+                self.zoom_by(layout::ZOOM_STEP.powi(-(n.min(64) as i32)), anchor, vp, cx)
             }
-            Action::ZoomReset => self.zoom_to(1.0, center, vp, cx),
-            Action::ZoomSet(zoom) => self.zoom_to(zoom, center, vp, cx),
+            Action::ZoomReset => self.zoom_to(1.0, anchor, vp, cx),
+            Action::ZoomSet(zoom) => self.zoom_to(zoom, anchor, vp, cx),
             Action::Fit(mode) => self.set_fit(mode, cx),
             Action::CycleFit => {
                 if let Some(next) = self.reader.as_ref().map(|r| r.fit.next()) {
@@ -2652,7 +2742,11 @@ impl Yomu {
 
     fn render_library_menu(&self, menu: &LibraryMenu, cx: &mut Context<Self>) -> AnyElement {
         let entries = [
-            (IconName::FilePlus, "Add files", "Import CBZ and ZIP comics"),
+            (
+                IconName::FilePlus,
+                "Add files",
+                "Import CBZ, CBR and ZIP comics",
+            ),
             (
                 IconName::FolderPlus,
                 "Add folder",
@@ -4041,7 +4135,7 @@ impl Yomu {
                         .child("Your library is empty"),
                 )
                 .child(div().text_sm().text_color(self.colors.muted).child(
-                    "Drop CBZ files or folders onto this window, or use Add files (Ctrl+O).",
+                    "Drop comic archives (CBZ, CBR) or folders onto this window, or use Add files (Ctrl+O).",
                 ))
                 .into_any_element()
         } else if books.is_empty() {
@@ -4235,6 +4329,9 @@ impl Yomu {
             .relative()
             .flex()
             .flex_col()
+            .on_pinch(cx.listener(|this, event: &PinchEvent, _, cx| {
+                this.on_library_pinch(event.delta, event.phase, cx);
+            }))
             .child(header)
             .child(body)
             .children(status.map(|text| {
@@ -4758,6 +4855,7 @@ impl Yomu {
             )
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
                 let at = (f32::from(event.position.x), f32::from(event.position.y));
+                this.cursor_pos = Some(at);
                 let pressed = event.pressed_button == Some(MouseButton::Left);
                 this.drag_move(at, pressed, viewport_of(window), cx);
             }))
@@ -4782,6 +4880,10 @@ impl Yomu {
                     ),
                     cx,
                 );
+            }))
+            .on_pinch(cx.listener(|this, event: &PinchEvent, window, cx| {
+                let at = (f32::from(event.position.x), f32::from(event.position.y));
+                this.on_pinch(at, event.delta, event.phase, viewport_of(window), cx);
             }))
             .children(content)
             .child(progress_line)
@@ -4967,7 +5069,7 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
             ("Tab", "Cycle through available fit modes."),
             ("+ / - / 0 / zi / zo", "Zoom in, zoom out, or reset zoom."),
             (
-                "Ctrl+Wheel / Drag",
+                "Ctrl+Wheel / Pinch / Drag",
                 "Zoom at cursor position, or drag to pan.",
             ),
             ("zt / zz / zb", "Align view to top, center, or bottom."),

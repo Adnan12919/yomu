@@ -763,7 +763,7 @@ fn collect(
             out.push(Candidate::Archive(path));
         } else if explicit {
             errors.push(format!(
-                "{name}: unsupported file type (CBZ/ZIP archives and image folders only)"
+                "{name}: unsupported file type (CBZ/CBR/ZIP/RAR archives and image folders only)"
             ));
         }
     } else if path.is_dir() {
@@ -1115,12 +1115,33 @@ mod tests {
     fn unsupported_file_reports_error() {
         let tmp = temp_dir("bad");
         let dirs = DataDirs::at(tmp.join("data")).unwrap();
-        let rar = tmp.join("book.cbr");
-        fs::write(&rar, b"Rar!").unwrap();
-        let report = import_paths(&[rar], &dirs, &HashSet::new());
+        let pdf = tmp.join("book.pdf");
+        fs::write(&pdf, b"%PDF-1.4").unwrap();
+        let report = import_paths(&[pdf], &dirs, &HashSet::new());
         assert!(report.added.is_empty());
         assert_eq!(report.errors.len(), 1);
         assert!(report.errors[0].contains("unsupported"));
+    }
+
+    #[test]
+    fn imports_cbr_archive() {
+        let tmp = temp_dir("cbr");
+        let dirs = DataDirs::at(tmp.join("data")).unwrap();
+        let cbr = tmp.join("Sample_Manga.cbr");
+        let file = fs::File::create(&cbr).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        zip.start_file("001.png", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        zip.write_all(&png(64, 96)).unwrap();
+        zip.finish().unwrap();
+
+        let report = import_paths(std::slice::from_ref(&cbr), &dirs, &HashSet::new());
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(report.added.len(), 1);
+        let book = &report.added[0];
+        assert_eq!(book.title, "Sample Manga");
+        assert_eq!(book.page_count, 1);
+        assert!(dirs.cover(&book.id).exists());
     }
 
     #[test]

@@ -20,12 +20,12 @@ GPU-accelerated rendering with [GPUI Kit](https://gpui-kit.com/) and direct Wayl
 ## ✨ Highlights
 
 - 📚 **Personal library** — cover grid, reading-progress bars, centered search, and directory/series grouping.
-- 📂 **Flexible imports** — open CBZ/ZIP archives or image folders; add files by browsing or drag and drop.
+- 📂 **Flexible imports** — open CBZ/CBR/ZIP/RAR archives or image folders; add files by browsing or drag and drop.
 - 🖼️ **Distraction-free reader** — clean single-page view with a slim progress line and controls that stay out of the way.
 - 🖱️ **Fast library actions** — context menus, multi-select, bulk removal, read/unread status, and progress reset.
 - 🔎 **Powerful navigation** — Vim-style motions, counts, marks, a command prompt, and familiar keyboard shortcuts.
 - 🔍 **Flexible viewing** — fit page/width/height, original size, zoom, drag-to-pan, continuous scrolling, and gapless webcomics mode.
-- 🌀 **Smooth input** — kinetic touchpad/touchscreen scrolling and frame-rate-independent page transitions.
+- 🌀 **Smooth input** — kinetic touchpad/touchscreen scrolling, pinch-to-zoom at gesture anchor, and frame-rate-independent page transitions.
 - 💾 **Persistent progress** — page position and marks are saved and restored when you return to a book.
 - ⚡ **Responsive decoding** — pages are decoded and scaled on background threads, with nearby pages prefetched.
 - 🎨 **Personalized appearance** — built-in and custom themes, opacity controls, and reduced-motion support.
@@ -135,6 +135,7 @@ Ctrl+wheel) work too. Press `?` in the reader for a cheat sheet.
 | `ma`, `'a`, `''` | Set mark `a`, jump to it, jump back to where you were |
 | Click left / right third of the window | Turn the page toward that side |
 | Mouse wheel / Touchpad | Scroll; touchpad two-finger flicks launch natural inertial momentum scrolling |
+| Touchpad / Touchscreen Pinch | Smoothly zoom in or out anchored at the pointer/pinch focal center |
 | Drag | Pan a zoomed page or continuous strip; drag flicks launch inertial momentum |
 
 Counts work on motions: `5j` scrolls five steps, `3J` skips three pages. Marks are saved with the book.
@@ -151,7 +152,7 @@ Counts work on motions: `5j` scrolls five steps, `3J` skips three pages. Marks a
 | `+` / `=`, `zi` | Zoom in |
 | `-`, `zo` | Zoom out |
 | `0`, `z0` | Reset zoom to the fit size |
-| `Ctrl` + wheel | Zoom at the pointer |
+| `Ctrl` + wheel, Pinch | Zoom at the pointer / pinch center |
 | `zt` `zz` `zb` | Scroll to the top / middle / bottom of the page |
 | `v` | Toggle continuous vertical scrolling |
 | `w` | Toggle gapless webcomics mode (forces continuous scrolling) |
@@ -362,7 +363,7 @@ cargo test       # core logic plus UI tests that drive the real views with simul
 
 The code is split so that everything except the window lives in the library crate:
 
-- `src/archive.rs` lists and reads pages from CBZ files and folders
+- `src/archive.rs` lists and reads pages from CBZ, CBR, ZIP, and RAR archives and image folders
 - `src/imaging.rs` decodes and resizes pages, and builds cover thumbnails
 - `src/layout.rs` is the fit-mode, zoom and pan math
 - `src/vim.rs` turns keys into actions: counts, `gg`/`zw`/`ma` sequences and the `:` command line
@@ -374,8 +375,8 @@ The code is split so that everything except the window lives in the library crat
 
 ## Not done yet
 
-- CBR/CB7 (needs a pure-Rust RAR/7z reader; CBR files are rejected with a clear message)
-- Double-page spreads, pinch zoom
+- CB7 (needs a 7z archive reader)
+- Double-page spreads
 - Sorting options
 - A clear Noctalia Launcher-style hover and active-selection color across menus and settings, including pointer hover
   and keyboard navigation. Use the theme's primary/accent color so the current item is easy to identify.

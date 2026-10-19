@@ -33,6 +33,7 @@ zune-jpeg = { version = "0.5", default-features = false, features = ["x86", "std
 zune-core = { version = "0.5", default-features = false, features = ["std"] }
 memmap2 = "0.9"
 zip = { version = "2", default-features = false, features = ["deflate"] }
+unrar = "0.5.8"
 
 [dev-dependencies]
 

@@ -12,7 +12,7 @@ Folder grouping, progressive folder imports, opacity-aware widget surfaces, clic
 
 ## Implemented behavior
 
-- **Import and library:** CBZ/ZIP archives and image folders are imported by reference. Background import sends each completed book to the UI; it is added and persisted immediately in scan order. Covers and library metadata are stored under XDG data storage. Search matches title, source path, and series, and does not mutate library ordering or selection scope.
+- **Import and library:** CBZ, CBR, ZIP, and RAR archives and image folders are imported by reference. Background import sends each completed book to the UI; it is added and persisted immediately in scan order. Covers and library metadata are stored under XDG data storage. Search matches title, source path, and series, and does not mutate library ordering or selection scope.
 - **Search:** click the centered toolbar search, press `/`, or use `Ctrl+F`; `Escape` leaves search. Query state is transient.
 - **Grouping:** directory grouping is on by default. Two or more books with the same parent directory form a folder card; the first imported member supplies its cover, and opening it displays the group's books in a second view. A manual `Book.series` assignment overrides directory membership; clearing the assignment restores automatic directory grouping. The persisted `group_series` preference switches between folder cards and individual volumes. Group folders and their contents retain library/import order.
 - **Reader:** single-page remains the default. Continuous vertical reading is persisted and can be toggled with `v` or `:continuous [on|off]`. Webcomics mode is separately persisted, forces continuous layout and a zero page gap, and restores the saved normal layout when disabled; use `w` or `:webcomics [on|off]`.
@@ -209,6 +209,20 @@ Settings uses active Kit themes rather than a Yomu palette. Tabs are open to fut
 - **Cooperative Decode Task Cancellation (`src/ui/reader.rs`, `src/main.rs`):** Added `cancellations` atomic token map to `Reader`. Background tasks check tokens before I/O, before decompression, and before texture creation. Rapid page navigation and book closures cancel obsolete tasks immediately.
 - **Test Suite Modularization (`src/tests.rs`):** Extracted 2,129 lines of GPUI interaction test fixtures from `src/main.rs` into `src/tests.rs`, reducing `src/main.rs` from 6,903 to 4,775 lines and substantially speeding up IDE analysis and link times.
 - **Cross-Platform Input Parity:** Added macOS Command key awareness in `main.rs` (`Cmd+F` search, `Cmd+O`, `Cmd+,`, `Cmd+Q`, Cmd-click multi-select, and Cmd-wheel zoom) while preserving native Control shortcuts on Linux and Windows.
+
+### 15. CBR / RAR Archive Decoding & Native Pinch Zoom Gesture Support
+- **CBR & RAR Archive Decompression (`src/archive.rs`):**
+  - Integrated `unrar = "0.5.8"` for listing and in-memory extraction of comic book RAR archives (`.cbr`, `.rar`).
+  - Added magic-byte inspection (`PK\x03\x04` / `PK\x05\x06` for ZIP vs `Rar!\x1a\x07` for RAR) with extension fallback (`detect_archive_format`), enabling automatic decoding even when archives are mislabeled.
+  - Implemented bidirectional fallback: if an archive labeled ZIP fails, it falls back to RAR decompression; if RAR fails, it falls back to ZIP decompression.
+  - Natural sorting of RAR archive file paths, Windows backslash normalization, entry directory filtering, and bounded decompression with `MAX_PAGE_BYTES` (256MB).
+  - Updated unsupported format message to `(CBZ/CBR/ZIP/RAR archives and image folders only)`.
+  - Added format labels `"CBR archive"` and `"RAR archive"` in properties dialog (`src/menu.rs`).
+- **Touchpad & Touchscreen Pinch Zoom (`src/main.rs`):**
+  - Added native `.on_pinch` handler using GPUI Kit's `PinchEvent` (`Point<Pixels>`, `delta`, `TouchPhase`) on both reader container and library root container.
+  - **Reader Zoom:** Clamps scale multiplier `(1.0 + delta).clamp(0.2, 5.0)` and anchors zoom dynamically at `(event.position.x, event.position.y)` via `zoom_by(factor, at, vp, cx)`. Cancels running kinetic inertia on active pinch movement and resets on `TouchPhase::Started`.
+  - **Library Thumbnail Zoom:** Smoothly accumulates pinch deltas (`library_pinch_accum`) across gestures; crossing threshold `|accum| > 0.35` steps thumbnail size up or down (`Small` <-> `Medium` <-> `Large` <-> `ExtraLarge`), notifies user with toast, and persists preference. Resets accumulator on gesture start/end.
+  - Added full test coverage in `src/archive.rs`, `src/library.rs`, `src/menu.rs`, and `src/tests.rs`.
 
 ## Build and verification
 

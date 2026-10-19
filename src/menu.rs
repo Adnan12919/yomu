@@ -247,6 +247,10 @@ pub fn properties(book: &Book) -> Vec<(String, String)> {
             let lower = book.path.to_string_lossy().to_ascii_lowercase();
             if lower.ends_with(".zip") {
                 "ZIP archive"
+            } else if lower.ends_with(".cbr") {
+                "CBR archive"
+            } else if lower.ends_with(".rar") {
+                "RAR archive"
             } else {
                 "CBZ archive"
             }
@@ -536,5 +540,11 @@ mod tests {
         assert_eq!(get("Progress").as_deref(), Some("Page 8 of 20 (40%)"));
         assert_eq!(get("Marks").as_deref(), Some("a: p. 3"));
         assert!(get("Last read").is_some());
+
+        let mut cbr_book = book(ReadStatus::Unread);
+        cbr_book.path = std::path::PathBuf::from("/comics/naruto.cbr");
+        let rows = properties(&cbr_book);
+        let get_cbr = |name: &str| rows.iter().find(|(k, _)| k == name).map(|(_, v)| v.clone());
+        assert_eq!(get_cbr("Format").as_deref(), Some("CBR archive"));
     }
 }

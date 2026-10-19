@@ -2178,6 +2178,131 @@ fn touch_down_mid_inertia_cancels_immediately(cx: &mut TestAppContext) {
     });
 }
 
+#[gpui_kit::test]
+fn reader_pinch_zoom_smoothly_scales_and_cancels_inertia(cx: &mut TestAppContext) {
+    let fx = fixture("pinch");
+    let (view, cx) = launch(&fx, cx);
+    open_book_by_index(&fx, &view, cx, 0);
+
+    view.update_in(cx, |this, window, cx| {
+        let vp = viewport_of(window);
+        let center = (vp.width / 2.0, vp.height / 2.0);
+
+        let initial_zoom = this.reader.as_ref().unwrap().zoom;
+
+        // Pinch start resets kinetic
+        this.on_pinch(center, 0.0, TouchPhase::Started, vp, cx);
+        assert_eq!(this.reader.as_ref().unwrap().zoom, initial_zoom);
+
+        // Pinch zoom in (delta > 0)
+        this.on_pinch(center, 0.25, TouchPhase::Moved, vp, cx);
+        let zoomed_in = this.reader.as_ref().unwrap().zoom;
+        assert!(
+            zoomed_in > initial_zoom,
+            "zoom increases on positive pinch delta"
+        );
+        assert!(this.reader.as_ref().unwrap().kinetic.inertia.is_none());
+
+        // Pinch zoom out (delta < 0)
+        this.on_pinch(center, -0.2, TouchPhase::Moved, vp, cx);
+        let zoomed_out = this.reader.as_ref().unwrap().zoom;
+        assert!(
+            zoomed_out < zoomed_in,
+            "zoom decreases on negative pinch delta"
+        );
+
+        // Pinch ended leaves zoom stable
+        this.on_pinch(center, 0.0, TouchPhase::Ended, vp, cx);
+        assert_eq!(this.reader.as_ref().unwrap().zoom, zoomed_out);
+    });
+}
+
+#[gpui_kit::test]
+fn cursor_position_anchors_keyboard_and_continuous_zoom(cx: &mut TestAppContext) {
+    let fx = fixture("cursor-zoom");
+    let (view, cx) = launch(&fx, cx);
+    open_book_by_index(&fx, &view, cx, 0);
+
+    // 1. Single-page mode: cursor position is used by keyboard actions when set
+    view.update_in(cx, |this, window, cx| {
+        let vp = viewport_of(window);
+        this.cursor_pos = Some((vp.width * 0.75, vp.height * 0.75));
+        this.apply(Action::ZoomIn(2), vp, window, cx);
+        assert!(this.reader.as_ref().unwrap().zoom > 1.0);
+    });
+
+    // 2. Continuous mode: zoom anchors around cursor position
+    view.update_in(cx, |this, window, cx| {
+        let vp = viewport_of(window);
+        this.set_continuous(Some(true), cx);
+        let cursor = (vp.width * 0.5, 200.0);
+        let initial_off = this.reader.as_ref().unwrap().off;
+        this.zoom_to(2.0, cursor, vp, cx);
+        let new_off = this.reader.as_ref().unwrap().off;
+        let expected_y = (initial_off.1 + 200.0) * 2.0 - 200.0;
+        assert!(
+            (new_off.1 - expected_y).abs() < 1e-2,
+            "continuous zoom anchors at cursor Y: got {}, expected {}",
+            new_off.1,
+            expected_y
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn library_pinch_adjusts_thumbnail_size(cx: &mut TestAppContext) {
+    let fx = fixture("lib-pinch");
+    let (view, cx) = launch(&fx, cx);
+
+    view.update_in(cx, |this, _, cx| {
+        assert_eq!(
+            this.library.settings().thumbnail_size,
+            ThumbnailSize::Medium
+        );
+
+        // TouchPhase::Started resets accumulator
+        this.on_library_pinch(0.0, TouchPhase::Started, cx);
+        assert_eq!(this.library_pinch_accum, 0.0);
+
+        // Accumulate positive pinch until threshold (> 0.35)
+        this.on_library_pinch(0.2, TouchPhase::Moved, cx);
+        assert_eq!(
+            this.library.settings().thumbnail_size,
+            ThumbnailSize::Medium
+        );
+        this.on_library_pinch(0.2, TouchPhase::Moved, cx);
+        assert_eq!(this.library.settings().thumbnail_size, ThumbnailSize::Large);
+
+        // Step up again to ExtraLarge
+        this.on_library_pinch(0.4, TouchPhase::Moved, cx);
+        assert_eq!(
+            this.library.settings().thumbnail_size,
+            ThumbnailSize::ExtraLarge
+        );
+
+        // Step down towards Large (< -0.35)
+        this.on_library_pinch(-0.4, TouchPhase::Moved, cx);
+        assert_eq!(this.library.settings().thumbnail_size, ThumbnailSize::Large);
+
+        // Step down towards Medium
+        this.on_library_pinch(-0.4, TouchPhase::Moved, cx);
+        assert_eq!(
+            this.library.settings().thumbnail_size,
+            ThumbnailSize::Medium
+        );
+
+        // Step down towards Small
+        this.on_library_pinch(-0.4, TouchPhase::Moved, cx);
+        assert_eq!(this.library.settings().thumbnail_size, ThumbnailSize::Small);
+
+        // Pinch ended clears accumulator
+        this.on_library_pinch(0.1, TouchPhase::Moved, cx);
+        assert_ne!(this.library_pinch_accum, 0.0);
+        this.on_library_pinch(0.0, TouchPhase::Ended, cx);
+        assert_eq!(this.library_pinch_accum, 0.0);
+    });
+}
+
 #[test]
 fn ui_scroll_controller_flick_inertia_and_touch_catch() {
     let mut controller = UiScrollController::new();
