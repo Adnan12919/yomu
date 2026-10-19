@@ -5159,22 +5159,41 @@ fn app_icon() -> Option<Arc<image::RgbaImage>> {
 }
 
 fn ensure_desktop_icon() {
+    #[cfg(target_os = "linux")]
     if let Some(data_dir) = dirs::data_dir() {
-        let icon_bytes = include_bytes!("../assets/logo.png");
-        let hicolor_icon = data_dir.join("icons/hicolor/512x512/apps/yomu.png");
-        if !hicolor_icon.exists() {
-            if let Some(parent) = hicolor_icon.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            let _ = std::fs::write(&hicolor_icon, icon_bytes);
-        }
+        let logo_bytes = include_bytes!("../assets/logo.png");
         let pixmap_icon = data_dir.join("pixmaps/yomu.png");
         if !pixmap_icon.exists() {
             if let Some(parent) = pixmap_icon.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
-            let _ = std::fs::write(&pixmap_icon, icon_bytes);
+            let _ = std::fs::write(&pixmap_icon, logo_bytes);
         }
+
+        let sizes: &[(&str, &[u8])] = &[
+            ("16x16", include_bytes!("../assets/icons/16x16.png")),
+            ("24x24", include_bytes!("../assets/icons/24x24.png")),
+            ("32x32", include_bytes!("../assets/icons/32x32.png")),
+            ("48x48", include_bytes!("../assets/icons/48x48.png")),
+            ("64x64", include_bytes!("../assets/icons/64x64.png")),
+            ("128x128", include_bytes!("../assets/icons/128x128.png")),
+            ("256x256", include_bytes!("../assets/icons/256x256.png")),
+            ("512x512", include_bytes!("../assets/icons/512x512.png")),
+        ];
+
+        let mut updated = false;
+        for (sz, bytes) in sizes {
+            let path = data_dir.join(format!("icons/hicolor/{sz}/apps/yomu.png"));
+            if !path.exists() {
+                if let Some(parent) = path.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                if std::fs::write(&path, bytes).is_ok() {
+                    updated = true;
+                }
+            }
+        }
+
         let desktop_file = data_dir.join("applications/yomu.desktop");
         let desktop_content = include_str!("../packaging/yomu.desktop");
         if !desktop_file.exists() {
@@ -5182,10 +5201,21 @@ fn ensure_desktop_icon() {
                 let _ = std::fs::create_dir_all(parent);
             }
             let _ = std::fs::write(&desktop_file, desktop_content);
+            updated = true;
         } else if let Ok(existing) = std::fs::read_to_string(&desktop_file)
             && !existing.contains("Icon=")
         {
             let _ = std::fs::write(&desktop_file, desktop_content);
+            updated = true;
+        }
+
+        if updated {
+            let hicolor_dir = data_dir.join("icons/hicolor");
+            let _ = std::process::Command::new("gtk-update-icon-cache")
+                .arg("-f")
+                .arg("-t")
+                .arg(hicolor_dir)
+                .output();
         }
     }
 }

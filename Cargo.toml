@@ -14,6 +14,9 @@ path = "src/lib.rs"
 name = "yomu"
 path = "src/main.rs"
 
+[build-dependencies]
+embed-resource = "3"
+
 [dependencies]
 gpui-kit = { version = "=0.7.3", features = ["test-support"] }
 anyhow = "1"

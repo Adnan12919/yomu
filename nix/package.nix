@@ -54,6 +54,8 @@ rustPlatform.buildRustPackage {
       ../vendor
       ../packaging
       ../assets
+      ../resources
+      ../build.rs
     ];
   };
 
@@ -71,7 +73,11 @@ rustPlatform.buildRustPackage {
 
   postInstall = ''
     install -Dm644 packaging/yomu.desktop $out/share/applications/yomu.desktop
-    install -Dm644 assets/logo.png $out/share/icons/hicolor/512x512/apps/yomu.png
+    for sz in 16x16 24x24 32x32 48x48 64x64 128x128 256x256 512x512; do
+      if [ -f "assets/icons/$sz.png" ]; then
+        install -Dm644 "assets/icons/$sz.png" "$out/share/icons/hicolor/$sz/apps/yomu.png"
+      fi
+    done
     install -Dm644 assets/logo.png $out/share/pixmaps/yomu.png
   '';
 
